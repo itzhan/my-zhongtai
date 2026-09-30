@@ -1,0 +1,17 @@
+{
+  "name": "ops-center-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "import:zhongtai": "node scripts/import-zhongtai.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "exceljs": "^4.4.0"
+  },
+  "description": "运维中台后端（由客户中台迁移）"
+}

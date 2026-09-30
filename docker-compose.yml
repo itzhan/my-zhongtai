@@ -1,0 +1,30 @@
+# 运维中台：前端对外 3190（沿用原客户中台端口），后端只在容器网络内可见
+# 用法：服务器上 cp server/.env.example server/.env 并填写，然后 ./deploy.sh
+services:
+  ops-server:
+    build: ./server
+    image: ops-center-server:latest
+    container_name: ops-server
+    restart: unless-stopped
+    env_file: ./server/.env
+    volumes:
+      - ${OPS_DATA_DIR:-./data}:/app/data
+    networks:
+      - default
+      - sub2api
+  ops-web:
+    build:
+      context: ./web
+      args:
+        OPS_API_URL: http://ops-server:3400
+    image: ops-center-web:latest
+    container_name: ops-web
+    restart: unless-stopped
+    depends_on:
+      - ops-server
+    ports:
+      - "3190:3000"
+networks:
+  sub2api:
+    external: true
+    name: sub2api-deploy-8082_sub2api-network
