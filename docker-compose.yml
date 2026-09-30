@@ -1,4 +1,5 @@
-# 运维中台：前端对外 3190（沿用原客户中台端口），后端只在容器网络内可见
+# 运维中台：前端对外 3190（沿用原客户中台端口），后端不对外暴露端口
+# 两个容器都只加入 sub2api 的 Docker 网络（服务器上已无可用网段，不再新建网络）
 # 用法：服务器上 cp server/.env.example server/.env 并填写，然后 ./deploy.sh
 services:
   ops-server:
@@ -10,7 +11,6 @@ services:
     volumes:
       - ${OPS_DATA_DIR:-./data}:/app/data
     networks:
-      - default
       - sub2api
   ops-web:
     build:
@@ -24,6 +24,8 @@ services:
       - ops-server
     ports:
       - "3190:3000"
+    networks:
+      - sub2api
 networks:
   sub2api:
     external: true
