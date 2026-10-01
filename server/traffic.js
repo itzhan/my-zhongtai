@@ -71,6 +71,16 @@ export function registerTraffic({ app, wrap, httpError, dataDir, readonly, mainK
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    -- 每个分组的检测设置（测试模型、定时自动测试），换浏览器 / 电脑也保持一致
+    CREATE TABLE IF NOT EXISTS traffic_group_settings (
+      site_id INTEGER NOT NULL,
+      group_id INTEGER NOT NULL,
+      test_model TEXT NOT NULL DEFAULT '',
+      auto_test INTEGER NOT NULL DEFAULT 0,
+      interval_min INTEGER NOT NULL DEFAULT 5,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (site_id, group_id)
+    );
   `);
   const q = {
     all: db.prepare("SELECT * FROM traffic_sites ORDER BY is_default DESC, id"),
@@ -191,6 +201,7 @@ export function registerTraffic({ app, wrap, httpError, dataDir, readonly, mainK
     wrap(async (req) => {
       const s = mustSite(req.params.id);
       db.prepare("DELETE FROM traffic_sites WHERE id = ?").run(s.id);
+      db.prepare("DELETE FROM traffic_group_settings WHERE site_id = ?").run(s.id);
       // 删掉的是默认服务器：把剩下的第一台设为默认
       if (s.is_default) db.prepare("UPDATE traffic_sites SET is_default = 1 WHERE id = (SELECT min(id) FROM traffic_sites)").run();
       bust(s.id);
@@ -214,6 +225,35 @@ export function registerTraffic({ app, wrap, httpError, dataDir, readonly, mainK
       const t0 = Date.now();
       const d = await call(s, "GET", "/admin/dashboard/stats");
       return { ok: true, latency_ms: Date.now() - t0, rpm: d?.rpm ?? 0, tpm: d?.tpm ?? 0 };
+    }),
+  );
+
+  // ---------- 分组检测设置 ----------
+  app.get(
+    "/api/traffic/:siteId/group-settings",
+    wrap(async (req) => {
+      const s = mustSite(req.params.siteId);
+      const rows = db.prepare("SELECT group_id, test_model, auto_test, interval_min FROM traffic_group_settings WHERE site_id = ?").all(s.id);
+      return Object.fromEntries(rows.map((r) => [r.group_id, { model: r.test_model, auto: !!r.auto_test, interval_min: r.interval_min }]));
+    }),
+  );
+  app.put(
+    "/api/traffic/:siteId/group-settings/:groupId",
+    wrap(async (req) => {
+      const s = mustSite(req.params.siteId);
+      const groupId = parseInt(req.params.groupId);
+      if (!groupId) throw httpError(400, "分组无效");
+      const b = req.body || {};
+      const cur = db.prepare("SELECT * FROM traffic_group_settings WHERE site_id = ? AND group_id = ?").get(s.id, groupId);
+      const model = "model" in b ? str(b.model, 100) : (cur?.test_model ?? "");
+      const auto = "auto" in b ? (b.auto ? 1 : 0) : (cur?.auto_test ?? 0);
+      const interval = "interval_min" in b ? Math.max(1, Math.min(1440, parseInt(b.interval_min) || 5)) : (cur?.interval_min ?? 5);
+      db.prepare(
+        `INSERT INTO traffic_group_settings (site_id, group_id, test_model, auto_test, interval_min, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(site_id, group_id) DO UPDATE SET test_model = excluded.test_model, auto_test = excluded.auto_test,
+             interval_min = excluded.interval_min, updated_at = excluded.updated_at`,
+      ).run(s.id, groupId, model, auto, interval, nowIso());
+      return { model, auto: !!auto, interval_min: interval };
     }),
   );
 

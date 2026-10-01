@@ -203,6 +203,16 @@ export const useRealtime = (siteId: number | null) =>
     retry: false,
   });
 
+// 每个分组的检测设置（测试模型、定时自动测试），存在后端，换浏览器也一致
+export type TGroupSetting = { model: string; auto: boolean; interval_min: number };
+export const useGroupSettings = (siteId: number | null) =>
+  useQuery({
+    queryKey: tk(siteId, "group-settings"),
+    queryFn: () => get<Record<string, TGroupSetting>>(`/traffic/${siteId}/group-settings`),
+    enabled: siteId != null,
+    staleTime: 60_000,
+  });
+
 export const useErrorRanking = (siteId: number | null, range: string) =>
   useQuery({
     queryKey: tk(siteId, "errors", range),

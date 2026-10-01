@@ -19,10 +19,19 @@ import { cn } from "@/lib/utils";
 import { get, post, put } from "../api";
 import { CLAUDE_MODELS, OPENAI_MODELS, ms, num, readErr, yuan } from "../format";
 import { useInvalidate } from "../hooks";
-import { type TChannel, type TGroup, type TGroupUsage, type TRealtime, type TTodayStats } from "../traffic";
+import {
+  type TChannel,
+  type TGroup,
+  type TGroupUsage,
+  type TRealtime,
+  type TTodayStats,
+  type TGroupSetting,
+  useGroupSettings,
+} from "../traffic";
 
 import { Tag } from "./badges";
 import { Pager, ResponsiveDialog, usePaged } from "./shared";
+import { ChannelSettingsDialog } from "./traffic-dispatch";
 
 const DEFAULT_TEST_MODEL = "claude-sonnet-4-6";
 const barColor = (pct: number) => (pct >= 90 ? "bg-danger" : pct >= 70 ? "bg-warning" : "bg-primary");
@@ -63,12 +72,13 @@ function TestChip({ r }: { r?: TestResult }) {
   );
 }
 
-// ---------- 测试设置（同 bill-manage 的「分组可用性自动检测」）：测试模型 + 定时自动测试，按服务器 + 分组记在浏览器里 ----------
+// ---------- 测试设置（同 bill-manage 的「分组可用性自动检测」）：测试模型 + 定时自动测试，按服务器 + 分组存在后端 ----------
 type TestCfg = { model: string; auto: boolean; intervalMin: number };
 const defaultTestModel = (platform: string) =>
   platform === "openai" ? "gpt-5.5" : platform === "anthropic" ? "claude-opus-4-6" : "";
 const testCfgKey = (siteId: number, groupId: number) => `ops.traffic.test.${siteId}.${groupId}`;
-function loadTestCfg(siteId: number, g: TGroup): TestCfg {
+// 后端没存过的分组：沿用以前存在这个浏览器里的设置，再没有就按平台给默认模型
+function localTestCfg(siteId: number, g: TGroup): TestCfg {
   const d: TestCfg = { model: defaultTestModel(g.platform), auto: false, intervalMin: 5 };
   try {
     const v = JSON.parse(localStorage.getItem(testCfgKey(siteId, g.id)) ?? "null") as Partial<TestCfg> | null;
@@ -160,7 +170,7 @@ function TestSettingsDialog({
 }
 
 // ---------- 一个分组：并发占用、渠道列表（按今日消费排序）、批量操作、一键测试 ----------
-// 默认看「调度中」的渠道；切到「未调度」可以把停用 / 未调度的渠道测一遍，再一键启用测试通过的
+// 列表只显示调度中的渠道；「渠道设置」弹窗里看分组下全部账号，一键检测、启用停用 / 未调度的
 function GroupCard({
   siteId,
   group,
@@ -169,48 +179,59 @@ function GroupCard({
   rt,
   stats,
   todayCost,
+  setting,
   onEdit,
 }: {
   siteId: number;
   group: TGroup;
   channels: TChannel[];
   idle: TChannel[];
+  setting: TGroupSetting | undefined;
   rt: TRealtime | undefined;
   stats: TTodayStats | undefined;
   todayCost: number;
   onEdit: (a: TChannel) => void;
 }) {
   const invalidate = useInvalidate();
-  const [mode, setMode] = useState<"live" | "idle">("live");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [sel, setSel] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState(false);
   const [tests, setTests] = useState<Record<number, TestResult>>({});
   const [testing, setTesting] = useState(false);
-  const [cfg, setCfg] = useState<TestCfg>(() => loadTestCfg(siteId, group));
+  const cfg: TestCfg = setting
+    ? { model: setting.model, auto: setting.auto, intervalMin: setting.interval_min }
+    : localTestCfg(siteId, group);
+  const saveCfg = async (c: Partial<TestCfg>) => {
+    const next = { ...cfg, ...c };
+    try {
+      await put(`/traffic/${siteId}/group-settings/${group.id}`, {
+        model: next.model,
+        auto: next.auto,
+        interval_min: next.intervalMin,
+      });
+      invalidate("traffic");
+    } catch (e) {
+      toast.error(readErr(e));
+    }
+  };
   const [cfgOpen, setCfgOpen] = useState(false);
   const inUse = (id: number) => rt?.account[id]?.current_in_use ?? 0;
   const inFlight = channels.reduce((s, a) => s + inUse(a.id), 0);
   const capacity = channels.reduce((s, a) => s + (a.concurrency || 0), 0);
-  const list = mode === "live" ? channels : idle;
 
   const sorted = useMemo(() => {
     const kw = search.trim().toLowerCase();
-    return list
+    return channels
       .filter((a) => !kw || a.name.toLowerCase().includes(kw))
       .sort(
         (a, b) =>
           (stats?.[b.id]?.user_cost ?? 0) - (stats?.[a.id]?.user_cost ?? 0) ||
           (rt?.account[b.id]?.current_in_use ?? 0) - (rt?.account[a.id]?.current_in_use ?? 0),
       );
-  }, [list, stats, rt, search]);
-  const { rows, pager } = usePaged(sorted, `${mode}|${search}`);
+  }, [channels, stats, rt, search]);
+  const { rows, pager } = usePaged(sorted, search);
   const changed = () => invalidate("traffic");
-  const switchMode = (m: "live" | "idle") => {
-    setMode(m);
-    setSel(new Set());
-    setTests({});
-  };
 
   const run = async (fn: () => Promise<unknown>, ok: string) => {
     setBusy(true);
@@ -271,7 +292,7 @@ function GroupCard({
     setTesting(false);
   };
 
-  // 定时自动测试（只测「调度中」的渠道；页面在后台或正在测试时跳过）
+  // 定时自动测试（页面在后台或正在测试时跳过）
   const testRef = useRef(testAll);
   useEffect(() => {
     testRef.current = testAll;
@@ -281,33 +302,18 @@ function GroupCard({
     busyRef.current = testing;
   }, [testing]);
   useEffect(() => {
-    if (!cfg.auto || mode !== "live") return;
+    if (!cfg.auto) return;
     const tick = () => {
       if (!document.hidden && !busyRef.current) void testRef.current();
     };
     tick();
     const t = setInterval(tick, Math.max(1, cfg.intervalMin) * 60_000);
     return () => clearInterval(t);
-  }, [cfg.auto, cfg.intervalMin, mode]);
+  }, [cfg.auto, cfg.intervalMin]);
 
   const results = Object.values(tests);
   const okN = results.filter((r) => r.kind === "ok").length;
   const failN = results.filter((r) => r.kind === "fail").length;
-  const okIdle = mode === "idle" ? sorted.filter((a) => tests[a.id]?.kind === "ok") : [];
-  const enableOk = async () => {
-    if (
-      await run(
-        () =>
-          post(`/traffic/${siteId}/channels/bulk-update`, {
-            account_ids: okIdle.map((a) => a.id),
-            status: "active",
-            schedulable: true,
-          }),
-        `已启用 ${okIdle.length} 个测试通过的渠道并加入调度`,
-      )
-    )
-      setTests({});
-  };
   const pageAllSel = rows.length > 0 && rows.every((a) => sel.has(a.id));
 
   return (
@@ -328,18 +334,17 @@ function GroupCard({
               </>
             ) : null}
           </span>
-          {idle.length ? (
-            <button
-              type="button"
-              onClick={() => switchMode(mode === "live" ? "idle" : "live")}
-              className={cn(
-                "rounded-md px-1.5 text-[11px] font-medium",
-                mode === "idle" ? "bg-warning/15 text-warning" : "bg-muted text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {mode === "idle" ? "回到调度中" : `未调度 ${idle.length}`}
-            </button>
-          ) : null}
+          <button
+            type="button"
+            onClick={() => setSettingsOpen(true)}
+            className={cn(
+              "rounded-md px-1.5 text-[11px] font-medium",
+              idle.length ? "bg-warning/15 text-warning" : "bg-muted text-muted-foreground hover:text-foreground",
+            )}
+            title="看分组下全部账号，一键检测并启用未调度的"
+          >
+            渠道设置{idle.length ? `（${idle.length} 个未调度）` : ""}
+          </button>
         </CardDescription>
         <CardAction className="flex items-center gap-1">
           <Button size="sm" variant="outline" disabled={testing || !sorted.length} onClick={testAll}>
@@ -357,18 +362,12 @@ function GroupCard({
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-2">
-        {mode === "live" ? (
-          <div className="flex items-center gap-3">
-            <LoadBar value={inFlight} max={capacity} />
-            <span className="font-mono text-xs">
-              {inFlight} / {capacity || "∞"}
-            </span>
-          </div>
-        ) : (
-          <p className="text-warning text-xs">
-            正在看未调度 / 已停用的渠道：先「一键测试」，再把测试通过的一键启用并加入调度
-          </p>
-        )}
+        <div className="flex items-center gap-3">
+          <LoadBar value={inFlight} max={capacity} />
+          <span className="font-mono text-xs">
+            {inFlight} / {capacity || "∞"}
+          </span>
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <Input
             className="h-8 w-48"
@@ -379,18 +378,11 @@ function GroupCard({
           <span className="text-muted-foreground font-mono text-[11px]" title="在右上角齿轮里修改">
             模型：{cfg.model || "默认"}
           </span>
-          {cfg.auto && mode === "live" ? (
-            <span className="text-success text-[11px]">自动测试 · 每 {cfg.intervalMin} 分钟</span>
-          ) : null}
+          {cfg.auto ? <span className="text-success text-[11px]">自动测试 · 每 {cfg.intervalMin} 分钟</span> : null}
           {okN || failN ? (
             <span className="text-muted-foreground text-xs">
               测试：{okN} 通过{failN ? <span className="text-danger"> · {failN} 失败</span> : null}
             </span>
-          ) : null}
-          {okIdle.length && !testing ? (
-            <Button size="sm" className="h-7" disabled={busy} onClick={enableOk}>
-              启用可用的（{okIdle.length}）
-            </Button>
           ) : null}
         </div>
         {sel.size ? (
@@ -461,8 +453,6 @@ function GroupCard({
                     <span className="text-muted-foreground shrink-0 text-[10px] font-normal">P{a.priority}</span>
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5 leading-tight">
-                    {a.status === "inactive" ? <span className="text-muted-foreground text-[10px]">已停用</span> : null}
-                    {!a.schedulable ? <span className="text-warning text-[10px]">未调度</span> : null}
                     <TestChip r={tests[a.id]} />
                     {a.notes ? (
                       <span className="text-muted-foreground truncate text-[10px]" title={a.notes}>
@@ -505,19 +495,21 @@ function GroupCard({
         </div>
         <Pager {...pager} />
       </CardContent>
+      <ChannelSettingsDialog
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+        siteId={siteId}
+        group={group}
+        accounts={[...channels, ...idle]}
+        model={cfg.model}
+        onSaveModel={(m) => void saveCfg({ model: m })}
+      />
       <TestSettingsDialog
         open={cfgOpen}
         onOpenChange={setCfgOpen}
         group={group}
         cfg={cfg}
-        onSave={(c) => {
-          setCfg(c);
-          try {
-            localStorage.setItem(testCfgKey(siteId, group.id), JSON.stringify(c));
-          } catch {
-            // 存不下只影响下次打开时的默认值
-          }
-        }}
+        onSave={(c) => void saveCfg(c)}
       />
     </Card>
   );
@@ -849,6 +841,7 @@ export function TrafficChannels({
   const [editing, setEditing] = useState<TChannel | null>(null);
   const [newOpen, setNewOpen] = useState(false);
   const [showIdleGroups, setShowIdleGroups] = useState(false);
+  const groupSettings = useGroupSettings(siteId);
   // 默认只显示启用且开启调度的渠道（出错的仍算启用，需要在这里清错）；停用 / 未调度的收在分组卡片的「未调度」里
   const all = useMemo(() => {
     if (!structure) return [];
@@ -907,6 +900,7 @@ export function TrafficChannels({
               rt={rt}
               stats={stats}
               todayCost={cost}
+              setting={groupSettings.data?.[g.id]}
               onEdit={setEditing}
             />
           ))}
