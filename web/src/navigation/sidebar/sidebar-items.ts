@@ -1,4 +1,4 @@
-import { Activity, Gauge, Users, Layers, Server, Workflow, Receipt, Truck, Radar, type LucideIcon } from "lucide-react";
+import { Activity, Server, Settings, Truck, Users, type LucideIcon } from "lucide-react";
 
 export interface NavSubItem {
   title: string;
@@ -29,28 +29,20 @@ export const sidebarItems: NavGroup[] = [
   {
     id: 1,
     label: "监控",
-    items: [
-      { title: "监控大盘", url: "/dashboard/monitor", icon: Activity },
-      { title: "流量监控", url: "/dashboard/traffic", icon: Gauge },
-    ],
+    items: [{ title: "监控大盘", url: "/dashboard/monitor", icon: Activity }],
   },
   {
     id: 2,
-    label: "客户与渠道",
+    label: "运营",
     items: [
+      { title: "渠道配置", url: "/dashboard/channels", icon: Server },
       { title: "客户", url: "/dashboard/customers", icon: Users },
-      { title: "分组", url: "/dashboard/groups", icon: Layers },
-      { title: "账号", url: "/dashboard/accounts", icon: Server },
-      { title: "智能调度", url: "/dashboard/sched", icon: Workflow },
-      { title: "账单", url: "/dashboard/billing", icon: Receipt },
+      { title: "供应商", url: "/dashboard/suppliers", icon: Truck },
     ],
   },
   {
     id: 3,
-    label: "供应商",
-    items: [
-      { title: "供应商管理", url: "/dashboard/suppliers", icon: Truck },
-      { title: "接口监测", url: "/dashboard/suppliers/monitor", icon: Radar },
-    ],
+    label: "系统",
+    items: [{ title: "设置", url: "/dashboard/settings", icon: Settings }],
   },
 ];

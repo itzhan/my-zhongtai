@@ -23,6 +23,12 @@ const nextConfig = {
         destination: "/dashboard/monitor",
         permanent: false,
       },
+      // 菜单合并后的旧地址
+      { source: "/dashboard/traffic", destination: "/dashboard/monitor", permanent: false },
+      { source: "/dashboard/accounts", destination: "/dashboard/channels?tab=accounts", permanent: false },
+      { source: "/dashboard/groups", destination: "/dashboard/channels?tab=sched", permanent: false },
+      { source: "/dashboard/sched", destination: "/dashboard/channels?tab=sched", permanent: false },
+      { source: "/dashboard/suppliers/monitor", destination: "/dashboard/suppliers?tab=monitor", permanent: false },
     ];
   },
   async rewrites() {

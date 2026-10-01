@@ -1,5 +1,5 @@
 // 流量监控（移植自 bill-manage 的 /scheduling）：可配置多台 sub2api 服务器（URL + Admin Key），
-// 看实时 RPM / TPM / 用户并发、渠道调度（按分组看渠道并发与今日消费，可改渠道）、分组使用、错误排行。
+// 看实时 RPM / TPM、渠道调度（按分组看渠道并发与今日消费，可改渠道）、分组使用、错误排行。
 // 所有对 sub2api 的请求都在后端发出，Admin Key 不下发前端；改渠道 / 测试渠道受只读保护（READONLY）。
 // 存储：DATA_DIR/ops.db 的 traffic_sites 表。
 import path from "node:path";
@@ -225,35 +225,24 @@ export function registerTraffic({ app, wrap, httpError, dataDir, readonly }) {
     }),
   );
 
-  // 实时：RPM / TPM + 账号并发 + 用户并发，一次请求拿全（前端每 2 秒拉一次）
+  // 实时：RPM / TPM + 各渠道并发，一次请求拿全（前端每 2 秒拉一次）
   app.get(
     "/api/traffic/:siteId/realtime",
     wrap(async (req) => {
       const s = site(req);
       return cached(`${s.id}:realtime`, 1500, async () => {
-        const [stats, conc, users] = await Promise.all([
+        const [stats, conc] = await Promise.all([
           call(s, "GET", "/admin/dashboard/stats").catch(() => null),
           call(s, "GET", "/admin/ops/concurrency").catch(() => null),
-          call(s, "GET", "/admin/ops/user-concurrency").catch(() => null),
         ]);
-        if (!stats && !conc && !users) await call(s, "GET", "/admin/dashboard/stats"); // 全失败：抛出真实原因
+        if (!stats && !conc) await call(s, "GET", "/admin/dashboard/stats"); // 全失败：抛出真实原因
         const account = {};
         for (const [k, v] of Object.entries(conc?.account ?? {}))
           account[k] = { current_in_use: v.current_in_use ?? 0, max_capacity: v.max_capacity ?? 0, waiting_in_queue: v.waiting_in_queue ?? 0 };
-        const user = {};
-        for (const [k, v] of Object.entries(users?.user ?? {}))
-          user[k] = {
-            user_id: v.user_id,
-            name: v.username || v.user_email || `用户 #${v.user_id}`,
-            current_in_use: v.current_in_use ?? 0,
-            max_capacity: v.max_capacity ?? 0,
-          };
         return {
           rpm: stats?.rpm ?? null,
           tpm: stats?.tpm ?? null,
           account,
-          user_monitoring: users ? users.enabled !== false : null,
-          user,
           at: nowIso(),
         };
       });
@@ -316,21 +305,6 @@ export function registerTraffic({ app, wrap, httpError, dataDir, readonly }) {
         });
         return { today, groups: rows };
       });
-    }),
-  );
-
-  // 用户近 1 分钟 RPM（按分组），用户实时并发面板用
-  app.get(
-    "/api/traffic/:siteId/user-rpm",
-    wrap(async (req) => {
-      const s = site(req);
-      const userIds = ids(req.query.ids, 20);
-      const out = {};
-      await runWithLimit(userIds, 10, async (uid) => {
-        const r = await call(s, "GET", `/admin/users/${uid}/rpm-status`).catch(() => null);
-        if (r) out[uid] = { used: r.user_rpm_used ?? 0, limit: r.user_rpm_limit ?? 0, per_group: r.per_group ?? [] };
-      });
-      return out;
     }),
   );
 
@@ -519,9 +493,12 @@ export function registerTraffic({ app, wrap, httpError, dataDir, readonly }) {
       const s = site(req);
       const accountIds = ids(req.body?.account_ids);
       if (!accountIds.length) throw httpError(400, "account_ids 必填");
-      const status = req.body?.status === "active" ? "active" : req.body?.status === "inactive" ? "inactive" : null;
-      if (!status) throw httpError(400, "status 只能是 active / inactive");
-      await call(s, "POST", "/admin/accounts/bulk-update", { account_ids: accountIds, status });
+      // 可改：status（active / inactive）、schedulable（是否参与调度），至少一项
+      const body = { account_ids: accountIds };
+      if (req.body?.status === "active" || req.body?.status === "inactive") body.status = req.body.status;
+      if (typeof req.body?.schedulable === "boolean") body.schedulable = req.body.schedulable;
+      if (Object.keys(body).length === 1) throw httpError(400, "需要 status（active / inactive）或 schedulable（true / false）");
+      await call(s, "POST", "/admin/accounts/bulk-update", body);
       afterWrite(s);
       return { ok: true };
     }),

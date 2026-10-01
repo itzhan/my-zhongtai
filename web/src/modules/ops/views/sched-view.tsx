@@ -2,8 +2,6 @@
 
 import { useEffect, useState } from "react";
 
-import Link from "next/link";
-
 import { useQuery } from "@tanstack/react-query";
 import { Play, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
@@ -19,7 +17,7 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { get, post, put } from "@/modules/ops/api";
 import { Tag, type Tone } from "@/modules/ops/components/badges";
-import { GroupSwitches, type SchedGroupRow } from "@/modules/ops/components/group-switches";
+import { type SchedGroupRow } from "@/modules/ops/components/group-switches";
 import { PageHeader, Pager, useConfirm, usePaged } from "@/modules/ops/components/shared";
 import { ago, readErr, time } from "@/modules/ops/format";
 import { qk } from "@/modules/ops/hooks";
@@ -74,7 +72,7 @@ const LV: Record<string, [Tone, string]> = {
 };
 const ALL = "all";
 
-export default function SchedPage() {
+export function SchedView() {
   const ov = useQuery({ queryKey: qk.schedOverview, queryFn: () => get<Overview>("/sched/overview") });
   const audit = useQuery({ queryKey: qk.audit, queryFn: () => get<AuditRow[]>("/sched/audit?limit=300") });
   const [confirm, confirmEl] = useConfirm();
@@ -95,7 +93,6 @@ export default function SchedPage() {
     ov.refetch();
     audit.refetch();
   };
-  const { rows: on, pager: onPager } = usePaged((d?.groups ?? []).filter((g) => g.enrolled_count));
   const logs = (audit.data ?? []).filter((e) => lv === ALL || e.level === lv);
   const { rows, pager: logPager } = usePaged(logs, lv);
   if (!d) return <Skeleton className="h-96" />;
@@ -188,74 +185,24 @@ export default function SchedPage() {
           </span>
         </CardContent>
       </Card>
-      <div className="grid gap-4 xl:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>已关联的分组</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {on.length ? (
-              <div className="overflow-x-auto rounded-md border">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>分组</TableHead>
-                      <TableHead className="text-right">已关联</TableHead>
-                      <TableHead>存活 / 最少</TableHead>
-                      <TableHead>智能调度</TableHead>
-                      <TableHead>自动路由</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {on.map((g) => (
-                      <TableRow key={g.id}>
-                        <TableCell>
-                          <Link prefetch={false} href={`/dashboard/groups/${g.id}`} className="hover:underline">
-                            {g.name}
-                          </Link>
-                        </TableCell>
-                        <TableCell className="text-right">{g.enrolled_count}</TableCell>
-                        <TableCell>
-                          <Tag tone={(g.alive ?? 0) >= g.min_alive ? "ok" : "bad"}>
-                            {g.alive} / {g.min_alive}
-                          </Tag>
-                        </TableCell>
-                        <GroupSwitches g={g} onChanged={reload} />
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-                <Pager {...onPager} className="mt-3" />
+      {/* 已关联分组的开关在上方分组列表里，这里只留报警 */}
+      <Card>
+        <CardHeader>
+          <CardTitle>当前报警（{d.alerts.length}）</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {d.alerts.length ? (
+            d.alerts.map((a, i) => (
+              <div key={i} className="flex items-start gap-2 text-sm">
+                <Tag tone={a.level === "critical" ? "bad" : "warn"}>{a.level === "critical" ? "紧急" : "警告"}</Tag>
+                {a.msg}
               </div>
-            ) : (
-              <p className="text-muted-foreground text-sm">
-                还没有关联任何账号。去{" "}
-                <Link prefetch={false} href="/dashboard/groups" className="text-primary hover:underline">
-                  分组
-                </Link>{" "}
-                进入某个分组，打开账号的「关联」开关。
-              </p>
-            )}
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>当前报警（{d.alerts.length}）</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            {d.alerts.length ? (
-              d.alerts.map((a, i) => (
-                <div key={i} className="flex items-start gap-2 text-sm">
-                  <Tag tone={a.level === "critical" ? "bad" : "warn"}>{a.level === "critical" ? "紧急" : "警告"}</Tag>
-                  {a.msg}
-                </div>
-              ))
-            ) : (
-              <span className="text-muted-foreground text-sm">无</span>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+            ))
+          ) : (
+            <span className="text-muted-foreground text-sm">无</span>
+          )}
+        </CardContent>
+      </Card>
       <Collapsible className="bg-card rounded-xl border">
         <CollapsibleTrigger className="w-full px-6 py-4 text-left">
           <b>参数设置</b>{" "}

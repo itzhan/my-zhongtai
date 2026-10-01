@@ -5,7 +5,7 @@ import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
-import { Plus, Search } from "lucide-react";
+import { Plus, Receipt, Search } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -70,6 +70,12 @@ export default function CustomersPage() {
               <Search className="text-muted-foreground absolute top-1/2 left-3 size-4 -translate-y-1/2" />
               <Input placeholder="搜索客户 / 邮箱" value={q} onChange={(e) => setQ(e.target.value)} className="pl-9" />
             </div>
+            <Button variant="outline" asChild>
+              <Link href="/dashboard/billing">
+                <Receipt />
+                出账单
+              </Link>
+            </Button>
             <Button
               onClick={() => {
                 setEditing(null);

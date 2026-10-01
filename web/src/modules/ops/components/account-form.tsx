@@ -434,7 +434,11 @@ export function AccountForm({ account: a, presetGroup }: { account: AccountFull 
           <Link
             prefetch={false}
             href={
-              creating ? (pg ? `/dashboard/groups/${pg.id}` : "/dashboard/accounts") : `/dashboard/accounts/${a.id}`
+              creating
+                ? pg
+                  ? `/dashboard/groups/${pg.id}`
+                  : "/dashboard/channels?tab=accounts"
+                : `/dashboard/accounts/${a.id}`
             }
           >
             取消

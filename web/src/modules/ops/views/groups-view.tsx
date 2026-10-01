@@ -13,7 +13,7 @@ import { GroupSwitches, type SchedGroupRow } from "@/modules/ops/components/grou
 import { PageHeader, Pager, usePaged } from "@/modules/ops/components/shared";
 import { qk } from "@/modules/ops/hooks";
 
-export default function GroupsPage() {
+export function GroupsView() {
   const { data, refetch } = useQuery({
     queryKey: qk.schedOverview,
     queryFn: () => get<{ enabled: boolean; groups: SchedGroupRow[] }>("/sched/overview"),

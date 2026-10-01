@@ -360,7 +360,7 @@ export default function AccountPage({ params }: { params: Promise<{ id: string }
     try {
       await del(`/accounts/${id}`);
       toast.success("已删除");
-      router.push("/dashboard/accounts");
+      router.push("/dashboard/channels?tab=accounts");
       removeTab(`/dashboard/accounts/${id}`); // 已删除的详情页不再留在标签栏
     } catch (e) {
       toast.error(readErr(e));
@@ -373,7 +373,7 @@ export default function AccountPage({ params }: { params: Promise<{ id: string }
         back={
           <Link
             prefetch={false}
-            href="/dashboard/accounts"
+            href="/dashboard/channels?tab=accounts"
             className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 text-sm"
           >
             <ArrowLeft className="size-4" />

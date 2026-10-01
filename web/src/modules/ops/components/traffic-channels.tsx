@@ -1,8 +1,8 @@
 "use client";
 
-import { type ComponentProps, useEffect, useMemo, useState } from "react";
+import { type ComponentProps, useEffect, useMemo, useRef, useState } from "react";
 
-import { Loader2, Plus, TestTube2, X } from "lucide-react";
+import { Loader2, Plus, Settings2, TestTube2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -17,9 +17,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
 import { get, post, put } from "../api";
-import { ms, num, readErr, yuan } from "../format";
+import { CLAUDE_MODELS, OPENAI_MODELS, ms, num, readErr, yuan } from "../format";
 import { useInvalidate } from "../hooks";
-import { type TChannel, type TGroup, type TGroupUsage, type TRealtime, type TTodayStats, useUserRpm } from "../traffic";
+import { type TChannel, type TGroup, type TGroupUsage, type TRealtime, type TTodayStats } from "../traffic";
 
 import { Tag } from "./badges";
 import { Pager, ResponsiveDialog, usePaged } from "./shared";
@@ -35,96 +35,6 @@ function LoadBar({ value, max, className }: { value: number; max: number; classN
     <div className={cn("bg-muted h-2 flex-1 overflow-hidden rounded-full", className)}>
       <div className={cn("h-full transition-all", barColor(pct))} style={{ width: `${pct}%` }} />
     </div>
-  );
-}
-
-// ---------- 用户实时并发：当前并发最高的前 N 个用户，及各自近 1 分钟在哪些分组发请求 ----------
-function TopUsers({ siteId, rt }: { siteId: number; rt: TRealtime | undefined }) {
-  const [topN, setTopN] = useState(6);
-  const top = useMemo(
-    () =>
-      Object.values(rt?.user ?? {})
-        .filter((u) => u.current_in_use > 0)
-        .sort((a, b) => b.current_in_use - a.current_in_use)
-        .slice(0, topN),
-    [rt, topN],
-  );
-  const rpm = useUserRpm(
-    siteId,
-    top.map((u) => u.user_id),
-  );
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>用户实时并发</CardTitle>
-        <CardDescription>每 2 秒刷新；分组用量为近 1 分钟请求数 / 限额</CardDescription>
-        <CardAction className="text-muted-foreground flex items-center gap-1.5 text-xs">
-          显示前
-          <Input
-            type="number"
-            min={1}
-            max={20}
-            value={topN}
-            onChange={(e) => setTopN(Math.max(1, Math.min(20, Number(e.target.value) || 1)))}
-            className="h-7 w-16"
-          />
-          个
-        </CardAction>
-      </CardHeader>
-      <CardContent>
-        {!rt ? (
-          <Skeleton className="h-20" />
-        ) : rt.user_monitoring === false ? (
-          <p className="text-muted-foreground text-sm">
-            这台 sub2api 没有开启实时监控（在 sub2api 设置里打开 realtime monitoring 后才有用户并发）
-          </p>
-        ) : !top.length ? (
-          <p className="text-muted-foreground text-sm">当前没有用户有进行中的请求</p>
-        ) : (
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            {top.map((u) => {
-              const r = rpm.data?.[u.user_id];
-              // 只看近 1 分钟真有请求的分组（sub2api 会返回该用户可用的全部分组）
-              const groups = (r?.per_group ?? [])
-                .filter((g) => g.used > 0)
-                .sort((a, b) => b.used - a.used)
-                .slice(0, 4);
-              return (
-                <div key={u.user_id} className="bg-muted/30 rounded-md border p-2.5">
-                  <div className="flex items-center justify-between gap-2 text-sm">
-                    <span className="truncate font-medium" title={u.name}>
-                      {u.name}
-                    </span>
-                    <span className="shrink-0 tabular-nums">
-                      {u.current_in_use}
-                      {u.max_capacity ? <span className="text-muted-foreground"> / {u.max_capacity}</span> : null}
-                    </span>
-                  </div>
-                  {u.max_capacity ? (
-                    <LoadBar value={u.current_in_use} max={u.max_capacity} className="mt-1 h-1.5" />
-                  ) : null}
-                  <div className="mt-2 space-y-0.5 text-xs">
-                    {groups.length ? (
-                      groups.map((g) => (
-                        <div key={g.group_id} className="flex justify-between gap-2">
-                          <span className="truncate">{g.group_name || `#${g.group_id}`}</span>
-                          <span className="text-muted-foreground shrink-0 tabular-nums">
-                            {g.used}
-                            {g.limit ? ` / ${g.limit}` : ""}
-                          </span>
-                        </div>
-                      ))
-                    ) : (
-                      <span className="text-muted-foreground">{r ? "近 1 分钟没有分组用量" : "加载中…"}</span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </CardContent>
-    </Card>
   );
 }
 
@@ -153,11 +63,109 @@ function TestChip({ r }: { r?: TestResult }) {
   );
 }
 
+// ---------- 测试设置（同 bill-manage 的「分组可用性自动检测」）：测试模型 + 定时自动测试，按服务器 + 分组记在浏览器里 ----------
+type TestCfg = { model: string; auto: boolean; intervalMin: number };
+const defaultTestModel = (platform: string) =>
+  platform === "openai" ? "gpt-5.5" : platform === "anthropic" ? "claude-opus-4-6" : "";
+const testCfgKey = (siteId: number, groupId: number) => `ops.traffic.test.${siteId}.${groupId}`;
+function loadTestCfg(siteId: number, g: TGroup): TestCfg {
+  const d: TestCfg = { model: defaultTestModel(g.platform), auto: false, intervalMin: 5 };
+  try {
+    const v = JSON.parse(localStorage.getItem(testCfgKey(siteId, g.id)) ?? "null") as Partial<TestCfg> | null;
+    return v ? { ...d, ...v, intervalMin: Math.max(1, Number(v.intervalMin) || 5) } : d;
+  } catch {
+    return d;
+  }
+}
+
+function TestSettingsDialog({
+  open,
+  onOpenChange,
+  group,
+  cfg,
+  onSave,
+}: {
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  group: TGroup;
+  cfg: TestCfg;
+  onSave: (c: TestCfg) => void;
+}) {
+  const [draft, setDraft] = useState(cfg);
+  useEffect(() => {
+    if (open) setDraft(cfg);
+  }, [open, cfg]);
+  const presets = group.platform === "openai" ? OPENAI_MODELS : CLAUDE_MODELS;
+  return (
+    <ResponsiveDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="分组可用性检测"
+      description={`分组「${group.name}」`}
+    >
+      <div className="space-y-4">
+        <div className="space-y-1.5">
+          <Label>测试模型</Label>
+          <Input
+            list={`test-models-${group.id}`}
+            value={draft.model}
+            placeholder="留空 = sub2api 默认模型"
+            onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+          />
+          <datalist id={`test-models-${group.id}`}>
+            {presets.map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
+          <p className="text-muted-foreground text-xs">「一键测试」和自动测试都用这个模型，可以填自定义的 model id</p>
+        </div>
+        <div className="flex items-center justify-between">
+          <Label htmlFor={`auto-test-${group.id}`}>定时自动测试</Label>
+          <Switch
+            id={`auto-test-${group.id}`}
+            checked={draft.auto}
+            onCheckedChange={(v) => setDraft({ ...draft, auto: v })}
+          />
+        </div>
+        {draft.auto ? (
+          <div className="space-y-1.5">
+            <Label>间隔（分钟）</Label>
+            <Input
+              type="number"
+              min={1}
+              value={draft.intervalMin}
+              onChange={(e) => setDraft({ ...draft, intervalMin: Math.max(1, Number(e.target.value) || 1) })}
+            />
+            <p className="text-muted-foreground text-xs">
+              只在这个页面开着、且在前台时运行；每次会真实请求上游（产生少量费用）
+            </p>
+          </div>
+        ) : null}
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button
+            onClick={() => {
+              onSave(draft);
+              onOpenChange(false);
+            }}
+          >
+            保存
+          </Button>
+        </div>
+      </div>
+    </ResponsiveDialog>
+  );
+}
+
 // ---------- 一个分组：并发占用、渠道列表（按今日消费排序）、批量操作、一键测试 ----------
+// 默认看「调度中」的渠道；切到「未调度」可以把停用 / 未调度的渠道测一遍，再一键启用测试通过的
 function GroupCard({
   siteId,
   group,
   channels,
+  idle,
   rt,
   stats,
   todayCost,
@@ -166,33 +174,43 @@ function GroupCard({
   siteId: number;
   group: TGroup;
   channels: TChannel[];
+  idle: TChannel[];
   rt: TRealtime | undefined;
   stats: TTodayStats | undefined;
   todayCost: number;
   onEdit: (a: TChannel) => void;
 }) {
   const invalidate = useInvalidate();
+  const [mode, setMode] = useState<"live" | "idle">("live");
   const [search, setSearch] = useState("");
   const [sel, setSel] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState(false);
   const [tests, setTests] = useState<Record<number, TestResult>>({});
   const [testing, setTesting] = useState(false);
+  const [cfg, setCfg] = useState<TestCfg>(() => loadTestCfg(siteId, group));
+  const [cfgOpen, setCfgOpen] = useState(false);
   const inUse = (id: number) => rt?.account[id]?.current_in_use ?? 0;
   const inFlight = channels.reduce((s, a) => s + inUse(a.id), 0);
   const capacity = channels.reduce((s, a) => s + (a.concurrency || 0), 0);
+  const list = mode === "live" ? channels : idle;
 
   const sorted = useMemo(() => {
     const kw = search.trim().toLowerCase();
-    return channels
+    return list
       .filter((a) => !kw || a.name.toLowerCase().includes(kw))
       .sort(
         (a, b) =>
           (stats?.[b.id]?.user_cost ?? 0) - (stats?.[a.id]?.user_cost ?? 0) ||
           (rt?.account[b.id]?.current_in_use ?? 0) - (rt?.account[a.id]?.current_in_use ?? 0),
       );
-  }, [channels, stats, rt, search]);
-  const { rows, pager } = usePaged(sorted, search);
+  }, [list, stats, rt, search]);
+  const { rows, pager } = usePaged(sorted, `${mode}|${search}`);
   const changed = () => invalidate("traffic");
+  const switchMode = (m: "live" | "idle") => {
+    setMode(m);
+    setSel(new Set());
+    setTests({});
+  };
 
   const run = async (fn: () => Promise<unknown>, ok: string) => {
     setBusy(true);
@@ -225,20 +243,20 @@ function GroupCard({
       a.schedulable ? "已暂停调度" : "已加入调度",
     );
 
-  // 一键测试：5 个并发，逐个测组内渠道（会真实请求上游）
+  // 一键测试：5 个并发，逐个测当前列表里的渠道（会真实请求上游），用设置里的测试模型
   const testAll = async () => {
+    const targets = [...sorted];
+    if (!targets.length) return;
     setTesting(true);
-    setTests(Object.fromEntries(sorted.map((a) => [a.id, { kind: "pending" } as TestResult])));
-    const queue = [...sorted];
+    setTests(Object.fromEntries(targets.map((a) => [a.id, { kind: "pending" } as TestResult])));
+    const model = cfg.model.trim();
     const worker = async () => {
-      for (let a = queue.shift(); a; a = queue.shift()) {
+      for (let a = targets.shift(); a; a = targets.shift()) {
         const id = a.id;
         try {
           const r = await post<{ ok: boolean; latency_ms: number; output: string }>(
             `/traffic/${siteId}/channels/${id}/test`,
-            {
-              model: DEFAULT_TEST_MODEL,
-            },
+            model ? { model } : {},
           );
           setTests((t) => ({
             ...t,
@@ -249,12 +267,47 @@ function GroupCard({
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(5, queue.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(5, targets.length) }, worker));
     setTesting(false);
   };
+
+  // 定时自动测试（只测「调度中」的渠道；页面在后台或正在测试时跳过）
+  const testRef = useRef(testAll);
+  useEffect(() => {
+    testRef.current = testAll;
+  });
+  const busyRef = useRef(false);
+  useEffect(() => {
+    busyRef.current = testing;
+  }, [testing]);
+  useEffect(() => {
+    if (!cfg.auto || mode !== "live") return;
+    const tick = () => {
+      if (!document.hidden && !busyRef.current) void testRef.current();
+    };
+    tick();
+    const t = setInterval(tick, Math.max(1, cfg.intervalMin) * 60_000);
+    return () => clearInterval(t);
+  }, [cfg.auto, cfg.intervalMin, mode]);
+
   const results = Object.values(tests);
   const okN = results.filter((r) => r.kind === "ok").length;
   const failN = results.filter((r) => r.kind === "fail").length;
+  const okIdle = mode === "idle" ? sorted.filter((a) => tests[a.id]?.kind === "ok") : [];
+  const enableOk = async () => {
+    if (
+      await run(
+        () =>
+          post(`/traffic/${siteId}/channels/bulk-update`, {
+            account_ids: okIdle.map((a) => a.id),
+            status: "active",
+            schedulable: true,
+          }),
+        `已启用 ${okIdle.length} 个测试通过的渠道并加入调度`,
+      )
+    )
+      setTests({});
+  };
   const pageAllSel = rows.length > 0 && rows.every((a) => sel.has(a.id));
 
   return (
@@ -265,29 +318,57 @@ function GroupCard({
           <Tag>×{group.rate_multiplier ?? 1}</Tag>
           {group.status !== "active" ? <Tag tone="warn">{group.status}</Tag> : null}
         </CardTitle>
-        <CardDescription>
-          {channels.length} 个调度中渠道
-          {todayCost > 0 ? (
-            <>
-              {" · 今日 "}
-              <span className="text-success font-medium">{yuan(todayCost)}</span>
-            </>
+        <CardDescription className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span>
+            {channels.length} 个调度中渠道
+            {todayCost > 0 ? (
+              <>
+                {" · 今日 "}
+                <span className="text-success font-medium">{yuan(todayCost)}</span>
+              </>
+            ) : null}
+          </span>
+          {idle.length ? (
+            <button
+              type="button"
+              onClick={() => switchMode(mode === "live" ? "idle" : "live")}
+              className={cn(
+                "rounded-md px-1.5 text-[11px] font-medium",
+                mode === "idle" ? "bg-warning/15 text-warning" : "bg-muted text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {mode === "idle" ? "回到调度中" : `未调度 ${idle.length}`}
+            </button>
           ) : null}
         </CardDescription>
-        <CardAction>
+        <CardAction className="flex items-center gap-1">
           <Button size="sm" variant="outline" disabled={testing || !sorted.length} onClick={testAll}>
             {testing ? <Loader2 className="animate-spin" /> : <TestTube2 />}
             一键测试（{sorted.length}）
           </Button>
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            title={cfg.auto ? `自动测试已开启 · 每 ${cfg.intervalMin} 分钟` : "测试设置"}
+            onClick={() => setCfgOpen(true)}
+          >
+            <Settings2 className={cn(cfg.auto && "text-success")} />
+          </Button>
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-2">
-        <div className="flex items-center gap-3">
-          <LoadBar value={inFlight} max={capacity} />
-          <span className="font-mono text-xs">
-            {inFlight} / {capacity || "∞"}
-          </span>
-        </div>
+        {mode === "live" ? (
+          <div className="flex items-center gap-3">
+            <LoadBar value={inFlight} max={capacity} />
+            <span className="font-mono text-xs">
+              {inFlight} / {capacity || "∞"}
+            </span>
+          </div>
+        ) : (
+          <p className="text-warning text-xs">
+            正在看未调度 / 已停用的渠道：先「一键测试」，再把测试通过的一键启用并加入调度
+          </p>
+        )}
         <div className="flex flex-wrap items-center gap-2">
           <Input
             className="h-8 w-48"
@@ -295,10 +376,21 @@ function GroupCard({
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
+          <span className="text-muted-foreground font-mono text-[11px]" title="在右上角齿轮里修改">
+            模型：{cfg.model || "默认"}
+          </span>
+          {cfg.auto && mode === "live" ? (
+            <span className="text-success text-[11px]">自动测试 · 每 {cfg.intervalMin} 分钟</span>
+          ) : null}
           {okN || failN ? (
             <span className="text-muted-foreground text-xs">
               测试：{okN} 通过{failN ? <span className="text-danger"> · {failN} 失败</span> : null}
             </span>
+          ) : null}
+          {okIdle.length && !testing ? (
+            <Button size="sm" className="h-7" disabled={busy} onClick={enableOk}>
+              启用可用的（{okIdle.length}）
+            </Button>
           ) : null}
         </div>
         {sel.size ? (
@@ -369,6 +461,8 @@ function GroupCard({
                     <span className="text-muted-foreground shrink-0 text-[10px] font-normal">P{a.priority}</span>
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5 leading-tight">
+                    {a.status === "inactive" ? <span className="text-muted-foreground text-[10px]">已停用</span> : null}
+                    {!a.schedulable ? <span className="text-warning text-[10px]">未调度</span> : null}
                     <TestChip r={tests[a.id]} />
                     {a.notes ? (
                       <span className="text-muted-foreground truncate text-[10px]" title={a.notes}>
@@ -411,6 +505,20 @@ function GroupCard({
         </div>
         <Pager {...pager} />
       </CardContent>
+      <TestSettingsDialog
+        open={cfgOpen}
+        onOpenChange={setCfgOpen}
+        group={group}
+        cfg={cfg}
+        onSave={(c) => {
+          setCfg(c);
+          try {
+            localStorage.setItem(testCfgKey(siteId, group.id), JSON.stringify(c));
+          } catch {
+            // 存不下只影响下次打开时的默认值
+          }
+        }}
+      />
     </Card>
   );
 }
@@ -740,45 +848,62 @@ export function TrafficChannels({
 }) {
   const [editing, setEditing] = useState<TChannel | null>(null);
   const [newOpen, setNewOpen] = useState(false);
-  // 分组按今日消费、再按进行中请求数排序；没有渠道的分组不显示
-  const cards = useMemo(() => {
+  const [showIdleGroups, setShowIdleGroups] = useState(false);
+  // 默认只显示启用且开启调度的渠道（出错的仍算启用，需要在这里清错）；停用 / 未调度的收在分组卡片的「未调度」里
+  const all = useMemo(() => {
     if (!structure) return [];
     return structure.groups
       .map((g) => {
-        // 只显示启用且开启调度的渠道（已停用、未调度的不显示；出错的仍算启用，需要在这里清错）
-        const channels = structure.accounts.filter((a) => isLive(a) && a.group_ids.includes(g.id));
+        const inGroup = structure.accounts.filter((a) => a.group_ids.includes(g.id));
+        const channels = inGroup.filter(isLive);
         const inFlight = channels.reduce((s, a) => s + (rt?.account[a.id]?.current_in_use ?? 0), 0);
-        return { g, channels, inFlight, cost: usage?.by_group[g.id]?.actual_cost ?? 0 };
+        return {
+          g,
+          channels,
+          idle: inGroup.filter((a) => !isLive(a)),
+          inFlight,
+          cost: usage?.by_group[g.id]?.actual_cost ?? 0,
+        };
       })
-      .filter((x) => x.channels.length)
+      .filter((x) => x.channels.length || x.idle.length)
       .sort((a, b) => b.cost - a.cost || b.inFlight - a.inFlight);
   }, [structure, rt, usage]);
-  const { rows, pager } = usePaged(cards, String(cards.length));
+  const idleGroups = all.filter((x) => !x.channels.length).length;
+  const cards = showIdleGroups ? all : all.filter((x) => x.channels.length);
+  const { rows, pager } = usePaged(cards, `${cards.length}`);
 
   return (
     <div className="space-y-4">
-      <TopUsers siteId={siteId} rt={rt} />
       <div className="flex items-center justify-between">
         <span className="text-muted-foreground text-sm">
           {structure
             ? `${cards.length} 个分组 · ${structure.accounts.filter(isLive).length} 个调度中渠道，按今日消费排序`
             : " "}
         </span>
-        <Button size="sm" onClick={() => setNewOpen(true)}>
-          <Plus />
-          新增渠道
-        </Button>
+        <div className="flex items-center gap-3">
+          {idleGroups ? (
+            <label className="text-muted-foreground flex items-center gap-1.5 text-xs">
+              <Switch checked={showIdleGroups} onCheckedChange={setShowIdleGroups} />
+              显示没有调度中渠道的分组（{idleGroups}）
+            </label>
+          ) : null}
+          <Button size="sm" onClick={() => setNewOpen(true)}>
+            <Plus />
+            新增渠道
+          </Button>
+        </div>
       </div>
       {!structure ? (
         <Skeleton className="h-96" />
       ) : rows.length ? (
         <div className="grid gap-4 xl:grid-cols-2">
-          {rows.map(({ g, channels, cost }) => (
+          {rows.map(({ g, channels, idle, cost }) => (
             <GroupCard
-              key={g.id}
+              key={`${siteId}-${g.id}`}
               siteId={siteId}
               group={g}
               channels={channels}
+              idle={idle}
               rt={rt}
               stats={stats}
               todayCost={cost}

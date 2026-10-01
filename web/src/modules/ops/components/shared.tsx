@@ -1,6 +1,8 @@
 "use client";
 
-import { useCallback, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from "react";
+
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import {
   AlertDialog,
@@ -71,6 +73,23 @@ export function FormError({ children }: { children?: string | null }) {
   return <p className="text-destructive text-sm">{children}</p>;
 }
 
+// 页面作为另一个页面的 tab 嵌入时，PageHeader 不再显示标题和返回链接（tab 名就是标题），只留说明和按钮
+const EmbeddedCtx = createContext(false);
+export function Embedded({ children }: { children: ReactNode }) {
+  return <EmbeddedCtx.Provider value={true}>{children}</EmbeddedCtx.Provider>;
+}
+
+// 页面内 tab 记在地址栏 ?tab=，刷新、分享链接都能回到同一个 tab（使用的页面需包一层 <Suspense>）
+export function useTabParam<T extends string>(tabs: readonly T[], fallback: T): [T, (t: string) => void] {
+  const params = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+  const cur = params.get("tab");
+  const tab = tabs.includes(cur as T) ? (cur as T) : fallback;
+  const setTab = (t: string) => router.replace(t === fallback ? pathname : `${pathname}?tab=${t}`, { scroll: false });
+  return [tab, setTab];
+}
+
 export function PageHeader({
   title,
   description,
@@ -82,11 +101,14 @@ export function PageHeader({
   actions?: ReactNode;
   back?: ReactNode;
 }) {
+  const embedded = useContext(EmbeddedCtx);
   return (
     <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
       <div className="min-w-0 space-y-1">
-        {back}
-        <h1 className="flex flex-wrap items-center gap-2 text-2xl font-semibold tracking-tight">{title}</h1>
+        {embedded ? null : back}
+        {embedded ? null : (
+          <h1 className="flex flex-wrap items-center gap-2 text-2xl font-semibold tracking-tight">{title}</h1>
+        )}
         {description ? <div className="text-muted-foreground text-sm">{description}</div> : null}
       </div>
       {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}

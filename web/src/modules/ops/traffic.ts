@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+
 import { useQuery } from "@tanstack/react-query";
 
 import { get } from "./api";
@@ -30,8 +32,6 @@ export type TRealtime = {
   rpm: number | null;
   tpm: number | null;
   account: Record<string, { current_in_use: number; max_capacity: number; waiting_in_queue: number }>;
-  user_monitoring: boolean | null;
-  user: Record<string, { user_id: number; name: string; current_in_use: number; max_capacity: number }>;
   at: string;
 };
 export type TTodayStats = Record<string, { requests: number; tokens?: number; cost: number; user_cost: number }>;
@@ -48,10 +48,6 @@ export type TGroupUsers = {
     error?: string;
   }[];
 };
-export type TUserRpm = Record<
-  string,
-  { used: number; limit: number; per_group: { group_id: number; group_name?: string; used: number; limit?: number }[] }
->;
 export type TErrorEvent = {
   id: number;
   created_at: string;
@@ -144,6 +140,20 @@ function usePersisted<T>(siteId: number | null, name: string, path: string, opts
 export const useTrafficSites = () =>
   useQuery({ queryKey: ["ops", "traffic", "sites"], queryFn: () => get<TrafficSite[]>("/traffic/sites") });
 
+// 当前选中的监控服务器：监控大盘、渠道两个页面共用，记在浏览器里；没选过 / 已删除时用默认服务器
+const SITE_KEY = "ops.traffic.site";
+export function useSite() {
+  const sites = useTrafficSites();
+  const [picked, setPicked] = useState<number | null>(() => Number(readLocal<string>(SITE_KEY)) || null);
+  const list = sites.data ?? [];
+  const siteId = list.find((s) => s.id === picked)?.id ?? list.find((s) => s.is_default)?.id ?? list[0]?.id ?? null;
+  const pick = (id: number) => {
+    setPicked(id);
+    writeLocal(SITE_KEY, String(id));
+  };
+  return { sites: list, loaded: !!sites.data, siteId, pick };
+}
+
 export const useStructure = (siteId: number | null) =>
   usePersisted<TStructure>(siteId, "structure", "structure", { refetchInterval: 60_000 });
 export const useTodayStats = (siteId: number | null) =>
@@ -152,7 +162,7 @@ export const useGroupUsage = (siteId: number | null) =>
   usePersisted<TGroupUsage>(siteId, "group-usage", "group-usage", { refetchInterval: 60_000 });
 export const useGroupUsers = (siteId: number | null) => usePersisted<TGroupUsers>(siteId, "group-users", "group-users");
 
-// 实时：每 2 秒（页面在后台时暂停）
+// 实时：RPM / TPM + 各渠道并发，每 2 秒（页面在后台时暂停）
 export const useRealtime = (siteId: number | null) =>
   useQuery({
     queryKey: tk(siteId, "realtime"),
@@ -161,17 +171,6 @@ export const useRealtime = (siteId: number | null) =>
     refetchInterval: 2000,
     retry: false,
   });
-
-export const useUserRpm = (siteId: number | null, userIds: number[]) => {
-  const ids = userIds.join(",");
-  return useQuery({
-    queryKey: tk(siteId, "user-rpm", ids),
-    queryFn: () => get<TUserRpm>(`/traffic/${siteId}/user-rpm?ids=${ids}`),
-    enabled: siteId != null && !!ids,
-    refetchInterval: 5000,
-    placeholderData: (prev) => prev,
-  });
-};
 
 export const useErrorRanking = (siteId: number | null, range: string) =>
   useQuery({

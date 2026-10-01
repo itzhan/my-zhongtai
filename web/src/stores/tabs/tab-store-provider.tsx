@@ -37,6 +37,7 @@ function getPageTitle(pathname: string): string {
     [/^\/dashboard\/accounts\/\d+\/edit$/, "编辑账号"],
     [/^\/dashboard\/accounts\/\d+$/, "账号详情"],
     [/^\/dashboard\/suppliers\/\d+$/, "供应商详情"],
+    [/^\/dashboard\/billing$/, "账单"],
   ];
   for (const [re, title] of detail) if (re.test(pathname)) return title;
 

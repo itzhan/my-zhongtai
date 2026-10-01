@@ -25,7 +25,7 @@ const STATUS_OPTS: [string, string][] = [
   ["limited", "限流/过载/临时不可调度"],
 ];
 
-export default function AccountsPage() {
+export function AccountsView() {
   const { groups } = useOps();
   const { data, refetch, isFetching } = useAccounts();
   const [f, setF] = useState({ q: "", platform: ALL, group: ALL, status: ALL });

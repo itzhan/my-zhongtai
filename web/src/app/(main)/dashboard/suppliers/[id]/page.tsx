@@ -149,7 +149,7 @@ export default function SupplierPage({ params }: { params: Promise<{ id: string 
             className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 text-sm"
           >
             <ArrowLeft className="size-4" />
-            供应商管理
+            供应商
           </Link>
         }
         title={

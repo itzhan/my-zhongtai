@@ -287,11 +287,11 @@ export default function GroupPage({ params }: { params: Promise<{ id: string }> 
         back={
           <Link
             prefetch={false}
-            href="/dashboard/groups"
+            href="/dashboard/channels?tab=sched"
             className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 text-sm"
           >
             <ArrowLeft className="size-4" />
-            分组
+            渠道配置 · 智能调度
           </Link>
         }
         title={

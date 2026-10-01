@@ -33,7 +33,7 @@ export function AlertBar() {
       ))}
       {list.length > 3 ? <span>…</span> : null}
       {data.lastError ? <span>引擎异常：{data.lastError}</span> : null}
-      <Link prefetch={false} href="/dashboard/sched" className="ml-auto underline">
+      <Link prefetch={false} href="/dashboard/channels?tab=sched" className="ml-auto underline">
         查看
       </Link>
     </div>

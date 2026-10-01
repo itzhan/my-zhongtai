@@ -13,8 +13,9 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CustomerDialog } from "@/modules/ops/components/customer-dialog";
 import { ChannelsTab, ErrorsTab, GroupsTab, OverviewTab, UsageTab } from "@/modules/ops/components/customer-tabs";
-import { PageHeader } from "@/modules/ops/components/shared";
+import { Embedded, PageHeader } from "@/modules/ops/components/shared";
 import { useCustomerOverview, useInvalidate } from "@/modules/ops/hooks";
+import { BillingView } from "@/modules/ops/views/billing-view";
 import { useTabTitle } from "@/stores/tabs/tab-store-provider";
 
 const TABS: [string, string][] = [
@@ -23,6 +24,7 @@ const TABS: [string, string][] = [
   ["groups", "分组"],
   ["usage", "使用日志"],
   ["errors", "报错日志"],
+  ["billing", "账单"],
 ];
 
 function CustomerInner({ id }: { id: string }) {
@@ -88,6 +90,13 @@ function CustomerInner({ id }: { id: string }) {
           <TabsContent value="groups">{tab === "groups" ? <GroupsTab ov={ov} id={id} /> : null}</TabsContent>
           <TabsContent value="usage">{tab === "usage" ? <UsageTab ov={ov} id={id} /> : null}</TabsContent>
           <TabsContent value="errors">{tab === "errors" ? <ErrorsTab ov={ov} id={id} /> : null}</TabsContent>
+          <TabsContent value="billing">
+            {tab === "billing" ? (
+              <Embedded>
+                <BillingView presetUsers={ov.users.map((u) => ({ id: u.id, email: u.email }))} />
+              </Embedded>
+            ) : null}
+          </TabsContent>
         </Tabs>
       )}
       <CustomerDialog

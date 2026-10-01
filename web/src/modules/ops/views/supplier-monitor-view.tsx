@@ -16,7 +16,7 @@ import { MonitorDialog } from "@/modules/ops/components/supplier-dialogs";
 import { readErr } from "@/modules/ops/format";
 import { useEnv, useInvalidate, useSupplierMonitors, useSuppliers } from "@/modules/ops/hooks";
 
-export default function SupplierMonitorPage() {
+export function SupplierMonitorView() {
   const { data, refetch } = useSupplierMonitors();
   const suppliers = useSuppliers("", "");
   const env = useEnv();
