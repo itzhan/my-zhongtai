@@ -8,7 +8,38 @@ import { get } from "./api";
 
 // 流量监控（后端 server/traffic.js）：多台 sub2api 服务器的实时流量、渠道调度、分组使用、错误排行
 
-export type TrafficSite = { id: number; name: string; base_url: string; key_masked: string; is_default: boolean };
+export type TrafficSite = {
+  id: number;
+  name: string;
+  base_url: string;
+  key_masked: string;
+  is_default: boolean;
+  // 和本系统连的是同一台 sub2api（有数据库直连），才能看用户实时 RPM
+  is_main: boolean;
+};
+
+export type TUserRpm = {
+  at: string;
+  users: {
+    user_id: number;
+    name: string;
+    email: string;
+    rpm_limit: number;
+    concurrency: number | null;
+    rpm: number;
+    tpm: number;
+    groups: { group_id: number; name: string; rpm: number }[];
+  }[];
+};
+
+// 用户实时 RPM（近 60 秒滚动窗口，主服务器数据库统计），每 5 秒刷新
+export const useUserRpm = (enabled: boolean) =>
+  useQuery({
+    queryKey: ["ops", "user-rpm"],
+    queryFn: () => get<TUserRpm>("/monitor/user-rpm"),
+    enabled,
+    refetchInterval: 5000,
+  });
 
 export type TGroup = { id: number; name: string; platform: string; status: string; rate_multiplier: number };
 export type TChannel = {
@@ -151,7 +182,7 @@ export function useSite() {
     setPicked(id);
     writeLocal(SITE_KEY, String(id));
   };
-  return { sites: list, loaded: !!sites.data, siteId, pick };
+  return { sites: list, loaded: !!sites.data, siteId, site: list.find((s) => s.id === siteId) ?? null, pick };
 }
 
 export const useStructure = (siteId: number | null) =>

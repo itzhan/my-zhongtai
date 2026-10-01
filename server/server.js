@@ -227,6 +227,48 @@ const intOrNull = (v) => (v === undefined || v === "" || v === null ? null : par
 
 // ---------- 基础数据 ----------
 app.get("/api/meta", wrap(async () => ({ groups: await getGroups() })));
+// 用户实时 RPM：直接按 usage_logs 统计近 60 秒每个用户的请求数 / token（滚动窗口，比 sub2api 的 rpm-status 准：
+// 那个只算当前分钟、且只统计设了 RPM 上限的用户）。用户名 / 上限来自管理 API，缓存 60 秒
+const getUsersAll = () =>
+  cached("users-all", 60000, async () => {
+    const d = await s2("GET", "/admin/users?page=1&page_size=1000");
+    return new Map(d.items.map((u) => [u.id, u]));
+  });
+app.get("/api/monitor/user-rpm", wrap(async () =>
+  cached("user-rpm", 3000, async () => {
+    const [rows, users, groups] = await Promise.all([
+      pool.query(
+        `SELECT user_id, group_id, count(*)::int AS n,
+                coalesce(sum(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0)::bigint AS tokens
+           FROM usage_logs WHERE created_at > now() - interval '60 seconds' GROUP BY 1, 2`,
+      ),
+      getUsersAll().catch(() => new Map()),
+      getGroups().catch(() => []),
+    ]);
+    const gname = new Map(groups.map((g) => [g.id, g.name]));
+    const by = new Map();
+    for (const r of rows.rows) {
+      const u = users.get(r.user_id);
+      const x = by.get(r.user_id) || {
+        user_id: r.user_id,
+        name: u?.username || u?.email || `用户 #${r.user_id}`,
+        email: u?.email || "",
+        rpm_limit: u?.rpm_limit || 0,
+        concurrency: u?.current_concurrency ?? null,
+        rpm: 0,
+        tpm: 0,
+        groups: [],
+      };
+      x.rpm += r.n;
+      x.tpm += Number(r.tokens);
+      x.groups.push({ group_id: r.group_id, name: gname.get(r.group_id) || `分组 #${r.group_id}`, rpm: r.n });
+      by.set(r.user_id, x);
+    }
+    const list = [...by.values()].sort((a, b) => b.rpm - a.rpm);
+    for (const x of list) x.groups.sort((a, b) => b.rpm - a.rpm);
+    return { at: new Date().toISOString(), users: list };
+  }),
+));
 app.get("/api/env", (req, res) => res.json({ readonly: READONLY, jobs: READONLY ? "observe" : "full" }));
 
 app.get("/api/s2/users", wrap(async (req) => {
@@ -1099,7 +1141,7 @@ app.get("/api/billing/export", async (req, res) => {
 
 registerMonitor({ app, wrap, pool, getAccounts, httpError, ERROR_CLASS_SQL });
 registerSuppliers({ app, wrap, httpError, dataDir: DATA_DIR, jobs: !READONLY });
-registerTraffic({ app, wrap, httpError, dataDir: DATA_DIR, readonly: READONLY });
+registerTraffic({ app, wrap, httpError, dataDir: DATA_DIR, readonly: READONLY, mainKey: S2_KEY });
 
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 

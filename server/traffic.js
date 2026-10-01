@@ -58,7 +58,7 @@ function accountView(a) {
   };
 }
 
-export function registerTraffic({ app, wrap, httpError, dataDir, readonly }) {
+export function registerTraffic({ app, wrap, httpError, dataDir, readonly, mainKey }) {
   const db = new DatabaseSync(path.join(dataDir, "ops.db"));
   db.exec(`
     PRAGMA journal_mode = WAL;
@@ -76,7 +76,15 @@ export function registerTraffic({ app, wrap, httpError, dataDir, readonly }) {
     all: db.prepare("SELECT * FROM traffic_sites ORDER BY is_default DESC, id"),
     one: db.prepare("SELECT * FROM traffic_sites WHERE id = ?"),
   };
-  const siteView = (s) => ({ id: s.id, name: s.name, base_url: s.base_url, key_masked: masked(s.api_key), is_default: !!s.is_default });
+  // is_main：和本系统连的是同一台 sub2api（Admin Key 相同），这台有数据库直连，能看用户实时 RPM 等
+  const siteView = (s) => ({
+    id: s.id,
+    name: s.name,
+    base_url: s.base_url,
+    key_masked: masked(s.api_key),
+    is_default: !!s.is_default,
+    is_main: !!mainKey && s.api_key === mainKey,
+  });
   const mustSite = (id) => {
     const s = q.one.get(Number(id));
     if (!s) throw httpError(404, "监控服务器不存在");

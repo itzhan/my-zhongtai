@@ -8,7 +8,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PageHeader, useTabParam } from "@/modules/ops/components/shared";
 import { TrafficChannels } from "@/modules/ops/components/traffic-channels";
-import { RealtimeCards, SitePicker } from "@/modules/ops/components/traffic-header";
+import { RealtimeCards, SitePicker, UserRpmPanel } from "@/modules/ops/components/traffic-header";
 import { TrafficErrors, TrafficGroupUsers } from "@/modules/ops/components/traffic-usage";
 import {
   type TRealtime,
@@ -17,6 +17,7 @@ import {
   useSite,
   useStructure,
   useTodayStats,
+  useUserRpm,
 } from "@/modules/ops/traffic";
 
 const TABS = [
@@ -29,6 +30,9 @@ const TABS = [
 function MonitorInner() {
   const site = useSite();
   const rt = useRealtime(site.siteId);
+  // 用户实时 RPM 来自本系统的数据库，只有选中的是主服务器时才显示
+  const isMain = !!site.site?.is_main;
+  const userRpm = useUserRpm(isMain);
   const [tab, setTab] = useTabParam(
     TABS.map(([k]) => k),
     "channels",
@@ -45,6 +49,7 @@ function MonitorInner() {
       ) : (
         <>
           <RealtimeCards rt={rt.data} error={rt.error} />
+          {isMain ? <UserRpmPanel data={userRpm.data} error={userRpm.error} /> : null}
           <Tabs value={tab} onValueChange={setTab}>
             <TabsList>
               {TABS.map(([k, l]) => (
