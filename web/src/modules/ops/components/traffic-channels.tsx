@@ -17,7 +17,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
 import { get, post, put } from "../api";
-import { money, ms, num, readErr } from "../format";
+import { ms, num, readErr, yuan } from "../format";
 import { useInvalidate } from "../hooks";
 import { type TChannel, type TGroup, type TGroupUsage, type TRealtime, type TTodayStats, useUserRpm } from "../traffic";
 
@@ -265,7 +265,13 @@ function GroupCard({
           {group.status !== "active" ? <Tag tone="warn">{group.status}</Tag> : null}
         </CardTitle>
         <CardDescription>
-          {channels.length} 个渠道{todayCost > 0 ? ` · 今日 ${money(todayCost)}` : ""}
+          {channels.length} 个启用渠道
+          {todayCost > 0 ? (
+            <>
+              {" · 今日 "}
+              <span className="text-success font-medium">{yuan(todayCost)}</span>
+            </>
+          ) : null}
         </CardDescription>
         <CardAction>
           <Button size="sm" variant="outline" disabled={testing || !sorted.length} onClick={testAll}>
@@ -363,7 +369,6 @@ function GroupCard({
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5 leading-tight">
                     {!a.schedulable ? <span className="text-warning text-[10px]">未调度</span> : null}
-                    {a.status === "inactive" ? <span className="text-muted-foreground text-[10px]">已停用</span> : null}
                     <TestChip r={tests[a.id]} />
                     {a.notes ? (
                       <span className="text-muted-foreground truncate text-[10px]" title={a.notes}>
@@ -377,7 +382,7 @@ function GroupCard({
                     ) : null}
                   </div>
                 </div>
-                {cost > 0 ? <span className="text-muted-foreground shrink-0 font-mono">{money(cost)}</span> : null}
+                {cost > 0 ? <span className="text-success shrink-0 font-mono">{yuan(cost)}</span> : null}
                 <span
                   className={cn(
                     "shrink-0 font-mono",
@@ -740,7 +745,8 @@ export function TrafficChannels({
     if (!structure) return [];
     return structure.groups
       .map((g) => {
-        const channels = structure.accounts.filter((a) => a.group_ids.includes(g.id));
+        // 只显示启用的渠道（已停用的不显示；出错的仍算启用，需要在这里清错）
+        const channels = structure.accounts.filter((a) => a.status !== "inactive" && a.group_ids.includes(g.id));
         const inFlight = channels.reduce((s, a) => s + (rt?.account[a.id]?.current_in_use ?? 0), 0);
         return { g, channels, inFlight, cost: usage?.by_group[g.id]?.actual_cost ?? 0 };
       })
@@ -754,7 +760,9 @@ export function TrafficChannels({
       <TopUsers siteId={siteId} rt={rt} />
       <div className="flex items-center justify-between">
         <span className="text-muted-foreground text-sm">
-          {structure ? `${cards.length} 个分组 · ${structure.accounts.length} 个渠道，按今日消费排序` : " "}
+          {structure
+            ? `${cards.length} 个分组 · ${structure.accounts.filter((a) => a.status !== "inactive").length} 个启用渠道，按今日消费排序`
+            : " "}
         </span>
         <Button size="sm" onClick={() => setNewOpen(true)}>
           <Plus />

@@ -13,7 +13,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 
-import { money, num, time } from "../format";
+import { num, time, yuan } from "../format";
 import { ERROR_RANGES, type TErrorAccount, useErrorRanking, useGroupUsers } from "../traffic";
 
 import { Pager, ResponsiveDialog, StatCards, usePaged } from "./shared";
@@ -84,7 +84,7 @@ function GroupUsersCard({
       <CardHeader>
         <CardTitle className="flex items-center justify-between gap-2">
           <span className="truncate">{g.group_name}</span>
-          <span className="tabular-nums">{money(g.cost)}</span>
+          <span className="text-success tabular-nums">{yuan(g.cost)}</span>
         </CardTitle>
         <CardDescription>
           {g.users.length} 个用户 · {num(g.requests)} 次请求
@@ -102,7 +102,7 @@ function GroupUsersCard({
                 </div>
               </div>
               <span className="text-muted-foreground shrink-0">{num(u.requests)} 次</span>
-              <span className="w-20 shrink-0 text-right font-mono">{money(u.actual_cost)}</span>
+              <span className="text-success w-20 shrink-0 text-right font-mono">{yuan(u.actual_cost)}</span>
             </div>
           );
         })}

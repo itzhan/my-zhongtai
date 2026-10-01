@@ -4,6 +4,15 @@ export const money = (v: number | null | undefined) =>
   Number(v || 0)
     .toFixed(Number(v || 0) >= 100 ? 2 : 4)
     .replace(/\.?0+$/, (m) => (m.includes(".") ? "" : m));
+// 金额：不足 1000 显示「元」，满 1000 用「千」，满 1 万用「万」
+export const yuan = (v: number | null | undefined) => {
+  const n = Number(v || 0);
+  const a = Math.abs(n);
+  if (a >= 1e4) return `${+(n / 1e4).toFixed(2)}万`;
+  if (a >= 1e3) return `${+(n / 1e3).toFixed(2)}千`;
+  if (a > 0 && a < 0.01) return "<0.01元";
+  return `${+n.toFixed(2)}元`;
+};
 export const moneyFull = (v: number | null | undefined) =>
   "$" + Number(v || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 export const num = (v: number | null | undefined) => Number(v || 0).toLocaleString("en-US");
