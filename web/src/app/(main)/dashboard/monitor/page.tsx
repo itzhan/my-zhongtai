@@ -301,7 +301,16 @@ function GroupSection({
       </CollapsibleTrigger>
       <CollapsibleContent className="border-t">
         <div className="overflow-x-auto">
-          <Table>
+          {/* 固定列宽：每个分组各自是一张表，不固定的话各组列宽随内容变化、上下对不齐 */}
+          <Table className="min-w-[56rem] table-fixed">
+            <colgroup>
+              <col />
+              <col className="w-56" />
+              <col className="w-24" />
+              <col className="w-28" />
+              <col className="w-28" />
+              <col className="w-20" />
+            </colgroup>
             <TableHeader>
               <TableRow>
                 <TableHead className="pl-4">账号</TableHead>
@@ -315,7 +324,7 @@ function GroupSection({
             <TableBody>
               {rows.map(({ a, m, lastP50 }) => (
                 <TableRow key={a.id}>
-                  <TableCell className="min-w-40 pl-4">
+                  <TableCell className="truncate pl-4" title={a.name}>
                     <Link prefetch={false} href={`/dashboard/accounts/${a.id}`} className="font-medium hover:underline">
                       {a.name}
                     </Link>{" "}
