@@ -26,6 +26,7 @@ import { Pager, ResponsiveDialog, usePaged } from "./shared";
 
 const DEFAULT_TEST_MODEL = "claude-sonnet-4-6";
 const barColor = (pct: number) => (pct >= 90 ? "bg-danger" : pct >= 70 ? "bg-warning" : "bg-primary");
+const isLive = (a: TChannel) => a.status !== "inactive" && a.schedulable;
 const isErrored = (a: TChannel) => a.status === "error" || !!a.error_message?.trim();
 
 function LoadBar({ value, max, className }: { value: number; max: number; className?: string }) {
@@ -265,7 +266,7 @@ function GroupCard({
           {group.status !== "active" ? <Tag tone="warn">{group.status}</Tag> : null}
         </CardTitle>
         <CardDescription>
-          {channels.length} 个启用渠道
+          {channels.length} 个调度中渠道
           {todayCost > 0 ? (
             <>
               {" · 今日 "}
@@ -368,7 +369,6 @@ function GroupCard({
                     <span className="text-muted-foreground shrink-0 text-[10px] font-normal">P{a.priority}</span>
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5 leading-tight">
-                    {!a.schedulable ? <span className="text-warning text-[10px]">未调度</span> : null}
                     <TestChip r={tests[a.id]} />
                     {a.notes ? (
                       <span className="text-muted-foreground truncate text-[10px]" title={a.notes}>
@@ -745,8 +745,8 @@ export function TrafficChannels({
     if (!structure) return [];
     return structure.groups
       .map((g) => {
-        // 只显示启用的渠道（已停用的不显示；出错的仍算启用，需要在这里清错）
-        const channels = structure.accounts.filter((a) => a.status !== "inactive" && a.group_ids.includes(g.id));
+        // 只显示启用且开启调度的渠道（已停用、未调度的不显示；出错的仍算启用，需要在这里清错）
+        const channels = structure.accounts.filter((a) => isLive(a) && a.group_ids.includes(g.id));
         const inFlight = channels.reduce((s, a) => s + (rt?.account[a.id]?.current_in_use ?? 0), 0);
         return { g, channels, inFlight, cost: usage?.by_group[g.id]?.actual_cost ?? 0 };
       })
@@ -761,7 +761,7 @@ export function TrafficChannels({
       <div className="flex items-center justify-between">
         <span className="text-muted-foreground text-sm">
           {structure
-            ? `${cards.length} 个分组 · ${structure.accounts.filter((a) => a.status !== "inactive").length} 个启用渠道，按今日消费排序`
+            ? `${cards.length} 个分组 · ${structure.accounts.filter(isLive).length} 个调度中渠道，按今日消费排序`
             : " "}
         </span>
         <Button size="sm" onClick={() => setNewOpen(true)}>
