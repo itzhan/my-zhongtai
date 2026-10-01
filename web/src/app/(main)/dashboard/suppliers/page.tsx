@@ -21,7 +21,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { del } from "@/modules/ops/api";
 import { Tag } from "@/modules/ops/components/badges";
-import { PageHeader, useConfirm } from "@/modules/ops/components/shared";
+import { LINE_RANGE, LineQualityBadge, lineQuality, supplierAccounts } from "@/modules/ops/components/line-quality";
+import { PageHeader, Pager, useConfirm, usePaged } from "@/modules/ops/components/shared";
 import {
   CATEGORIES,
   CategoryTags,
@@ -31,8 +32,8 @@ import {
   goodsTone,
 } from "@/modules/ops/components/supplier-dialogs";
 import { readErr } from "@/modules/ops/format";
-import { useInvalidate, useSuppliers } from "@/modules/ops/hooks";
-import type { Supplier } from "@/modules/ops/types";
+import { useAccounts, useInvalidate, useMonitor, useSuppliers } from "@/modules/ops/hooks";
+import type { Account, MonitorResp, Supplier } from "@/modules/ops/types";
 
 const ALL = "all";
 
@@ -45,6 +46,10 @@ export default function SuppliersPage() {
     return () => clearTimeout(t);
   }, [q]);
   const { data } = useSuppliers(dq, cat === ALL ? "" : cat);
+  const { rows, pager } = usePaged(data ?? [], `${dq}|${cat}`);
+  // 线路质量：名下账号在监控大盘的延迟评级
+  const accounts = useAccounts();
+  const mon = useMonitor(LINE_RANGE);
   const invalidate = useInvalidate();
   const [confirm, confirmEl] = useConfirm();
   const [editing, setEditing] = useState<Supplier | null>(null);
@@ -114,7 +119,7 @@ export default function SuppliersPage() {
         <Skeleton className="h-64" />
       ) : data.length ? (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {data.map((s) => (
+          {rows.map((s) => (
             <Card key={s.id} className={cn("gap-3", s.status !== "active" && "opacity-70")}>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
@@ -180,6 +185,7 @@ export default function SuppliersPage() {
                     <span className="text-muted-foreground text-xs">还没记录可提供的货</span>
                   )}
                 </div>
+                <SupplierLineRow s={s} accounts={accounts.data} mon={mon.data} />
                 {s.monitor_count ? (
                   <div className="text-muted-foreground text-xs">接口监测 {s.monitor_count} 项</div>
                 ) : null}
@@ -194,6 +200,7 @@ export default function SuppliersPage() {
           </CardContent>
         </Card>
       )}
+      <Pager {...pager} />
       <SupplierDialog
         open={open}
         onOpenChange={setOpen}
@@ -201,6 +208,29 @@ export default function SuppliersPage() {
         onSaved={() => invalidate("suppliers", "supplier")}
       />
       {confirmEl}
+    </div>
+  );
+}
+
+function SupplierLineRow({
+  s,
+  accounts,
+  mon,
+}: {
+  s: Supplier;
+  accounts: Account[] | undefined;
+  mon: MonitorResp | undefined;
+}) {
+  if (!accounts || !mon) return <Skeleton className="h-5 w-40" />;
+  const { linked } = supplierAccounts(s, accounts);
+  const q = lineQuality(
+    linked.map((x) => x.account.id),
+    mon,
+  );
+  return (
+    <div className="flex items-center gap-2 border-t pt-2">
+      <span className="text-muted-foreground shrink-0 text-xs">线路质量</span>
+      <LineQualityBadge q={q} total={linked.length} />
     </div>
   );
 }

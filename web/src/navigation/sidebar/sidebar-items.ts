@@ -1,4 +1,4 @@
-import { Activity, Users, Layers, Server, Workflow, Receipt, Truck, Radar, type LucideIcon } from "lucide-react";
+import { Activity, Gauge, Users, Layers, Server, Workflow, Receipt, Truck, Radar, type LucideIcon } from "lucide-react";
 
 export interface NavSubItem {
   title: string;
@@ -29,7 +29,10 @@ export const sidebarItems: NavGroup[] = [
   {
     id: 1,
     label: "监控",
-    items: [{ title: "监控大盘", url: "/dashboard/monitor", icon: Activity }],
+    items: [
+      { title: "监控大盘", url: "/dashboard/monitor", icon: Activity },
+      { title: "流量监控", url: "/dashboard/traffic", icon: Gauge },
+    ],
   },
   {
     id: 2,

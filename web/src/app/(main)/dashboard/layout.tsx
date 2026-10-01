@@ -1,53 +1,37 @@
 import { ReactNode } from "react";
 
-import { cookies } from "next/headers";
-
 import { AppSidebar } from "@/app/(main)/dashboard/_components/sidebar/app-sidebar";
 import { Separator } from "@/components/ui/separator";
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
 import { OpsProvider } from "@/modules/ops/provider";
-import { getPreference } from "@/server/server-actions";
 import { TabsStoreProvider } from "@/stores/tabs/tab-store-provider";
-import {
-  SIDEBAR_VARIANT_VALUES,
-  SIDEBAR_COLLAPSIBLE_VALUES,
-  CONTENT_LAYOUT_VALUES,
-  NAVBAR_STYLE_VALUES,
-  type SidebarVariant,
-  type SidebarCollapsible,
-  type ContentLayout,
-  type NavbarStyle,
-} from "@/types/preferences/layout";
 
 import { AlertBar, ReadonlyBadge } from "./_components/alert-bar";
 import { LayoutControls } from "./_components/sidebar/layout-controls";
+import { PersistedSidebarProvider } from "./_components/sidebar/persisted-sidebar-provider";
 import { SearchDialog } from "./_components/sidebar/search-dialog";
 import { ThemeSwitcher } from "./_components/sidebar/theme-switcher";
 import { TabBar } from "./_components/tab-bar";
 
-export default async function Layout({ children }: Readonly<{ children: ReactNode }>) {
-  const cookieStore = await cookies();
-  const defaultOpen = cookieStore.get("sidebar_state")?.value !== "false";
+// 布局偏好用默认值（偏好面板的改动只作用于当前页面 DOM，不写 cookie）。
+// 这里不读 cookies()：否则每个页面都成了动态渲染，切 tab 都要先等服务器渲染一次。
+const sidebarVariant = "inset";
+const sidebarCollapsible = "icon";
+const contentLayout = "centered";
+const navbarStyle = "scroll";
+const layoutPreferences = {
+  contentLayout,
+  variant: sidebarVariant,
+  collapsible: sidebarCollapsible,
+  navbarStyle,
+} as const;
 
-  const [sidebarVariant, sidebarCollapsible, contentLayout, navbarStyle] = await Promise.all([
-    getPreference<SidebarVariant>("sidebar_variant", SIDEBAR_VARIANT_VALUES, "inset"),
-    getPreference<SidebarCollapsible>("sidebar_collapsible", SIDEBAR_COLLAPSIBLE_VALUES, "icon"),
-    getPreference<ContentLayout>("content_layout", CONTENT_LAYOUT_VALUES, "centered"),
-    getPreference<NavbarStyle>("navbar_style", NAVBAR_STYLE_VALUES, "scroll"),
-  ]);
-
-  const layoutPreferences = {
-    contentLayout,
-    variant: sidebarVariant,
-    collapsible: sidebarCollapsible,
-    navbarStyle,
-  };
-
+export default function Layout({ children }: Readonly<{ children: ReactNode }>) {
   return (
     <TabsStoreProvider>
       <OpsProvider>
-        <SidebarProvider defaultOpen={defaultOpen}>
+        <PersistedSidebarProvider>
           <AppSidebar variant={sidebarVariant} collapsible={sidebarCollapsible} />
           <SidebarInset
             data-content-layout={contentLayout}
@@ -83,7 +67,7 @@ export default async function Layout({ children }: Readonly<{ children: ReactNod
             <AlertBar />
             <div className="h-full p-4 md:p-6">{children}</div>
           </SidebarInset>
-        </SidebarProvider>
+        </PersistedSidebarProvider>
       </OpsProvider>
     </TabsStoreProvider>
   );

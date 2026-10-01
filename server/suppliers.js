@@ -78,6 +78,14 @@ export function openDb(dataDir) {
       checked_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_sample_monitor ON supplier_monitor_samples(monitor_id, checked_at);
+    -- 供应商 ↔ sub2api 账号的手动关联（线路质量用）。默认按账号名前缀自动匹配，
+    -- include = 手动加上的账号，exclude = 从自动匹配里去掉的账号
+    CREATE TABLE IF NOT EXISTS supplier_account_links (
+      supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+      account_id INTEGER NOT NULL,
+      mode TEXT NOT NULL CHECK (mode IN ('include', 'exclude')),
+      PRIMARY KEY (supplier_id, account_id)
+    );
   `);
   return db;
 }
@@ -158,6 +166,7 @@ export function registerSuppliers({ app, wrap, httpError, dataDir, jobs }) {
   const db = openDb(dataDir);
   const q = {
     goodsOf: db.prepare("SELECT id, name, rate FROM supplier_goods WHERE supplier_id = ? ORDER BY id"),
+    linksOf: db.prepare("SELECT account_id, mode FROM supplier_account_links WHERE supplier_id = ? ORDER BY account_id"),
     supplier: db.prepare("SELECT * FROM suppliers WHERE id = ? AND deleted_at IS NULL"),
     monitor: db.prepare("SELECT * FROM supplier_monitors WHERE id = ?"),
     samplesOf: db.prepare(
@@ -174,6 +183,7 @@ export function registerSuppliers({ app, wrap, httpError, dataDir, jobs }) {
     ...s,
     category: s.category ? s.category.split(",") : [],
     goods: q.goodsOf.all(s.id),
+    links: q.linksOf.all(s.id),
   });
   // apiKey 不回传，只给脱敏后缀
   const monitorView = (m) => {
@@ -301,6 +311,24 @@ export function registerSuppliers({ app, wrap, httpError, dataDir, jobs }) {
     wrap(async (req) => {
       const s = mustSupplier(req.params.id);
       db.prepare("DELETE FROM supplier_goods WHERE id = ? AND supplier_id = ?").run(Number(req.params.gid), s.id);
+      return supplierView(q.supplier.get(s.id));
+    }),
+  );
+
+  // 线路质量的账号关联：body { account_id, mode: include | exclude | null }，null = 恢复为自动匹配
+  app.put(
+    "/api/suppliers/:id/links",
+    wrap(async (req) => {
+      const s = mustSupplier(req.params.id);
+      const accountId = parseInt(req.body?.account_id);
+      if (!accountId) throw httpError(400, "account_id 必填");
+      const mode = req.body?.mode;
+      if (mode == null) db.prepare("DELETE FROM supplier_account_links WHERE supplier_id = ? AND account_id = ?").run(s.id, accountId);
+      else if (mode === "include" || mode === "exclude")
+        db.prepare(
+          "INSERT INTO supplier_account_links (supplier_id, account_id, mode) VALUES (?, ?, ?) ON CONFLICT(supplier_id, account_id) DO UPDATE SET mode = excluded.mode",
+        ).run(s.id, accountId, mode);
+      else throw httpError(400, "mode 只能是 include / exclude / null");
       return supplierView(q.supplier.get(s.id));
     }),
   );

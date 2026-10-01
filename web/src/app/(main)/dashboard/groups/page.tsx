@@ -10,7 +10,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { get } from "@/modules/ops/api";
 import { PlatformBadge, Tag } from "@/modules/ops/components/badges";
 import { GroupSwitches, type SchedGroupRow } from "@/modules/ops/components/group-switches";
-import { PageHeader } from "@/modules/ops/components/shared";
+import { PageHeader, Pager, usePaged } from "@/modules/ops/components/shared";
 import { qk } from "@/modules/ops/hooks";
 
 export default function GroupsPage() {
@@ -18,6 +18,7 @@ export default function GroupsPage() {
     queryKey: qk.schedOverview,
     queryFn: () => get<{ enabled: boolean; groups: SchedGroupRow[] }>("/sched/overview"),
   });
+  const { rows, pager } = usePaged(data?.groups ?? []);
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
@@ -48,7 +49,7 @@ export default function GroupsPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {data.groups.map((g) => (
+                {rows.map((g) => (
                   <TableRow key={g.id}>
                     <TableCell className="pl-4">
                       <Link prefetch={false} href={`/dashboard/groups/${g.id}`} className="font-medium hover:underline">
@@ -96,6 +97,7 @@ export default function GroupsPage() {
               </TableBody>
             </Table>
           )}
+          <Pager {...pager} className="border-t px-4 py-3" />
         </CardContent>
       </Card>
     </div>

@@ -26,7 +26,7 @@ import { DetectCell, type DetectInfo } from "@/modules/ops/components/detect";
 import { AccountErrorsDialog } from "@/modules/ops/components/dialogs";
 import { GroupSwitches } from "@/modules/ops/components/group-switches";
 import { GradeBadge, LatencyBar, accountCells } from "@/modules/ops/components/latency-bar";
-import { PageHeader, useConfirm } from "@/modules/ops/components/shared";
+import { PageHeader, Pager, useConfirm, usePaged } from "@/modules/ops/components/shared";
 import { ms, num, pct, readErr } from "@/modules/ops/format";
 import { qk, useMonitor } from "@/modules/ops/hooks";
 import type { Account } from "@/modules/ops/types";
@@ -196,8 +196,17 @@ export default function GroupPage({ params }: { params: Promise<{ id: string }> 
   } = useQuery({ queryKey: qk.schedGroup(gid), queryFn: () => get<GroupDetail>(`/sched/groups/${gid}`) });
   useTabTitle(d?.group.name);
   const [range, setRange] = useState("2h");
-  const accIds = useMemo(() => d?.accounts.map((a) => a.id) ?? [], [d]);
-  const mon = useMonitor(range, accIds);
+  const rows = useMemo(
+    () => [...(d?.accounts ?? [])].sort((a, b) => Number(b.enrolled) - Number(a.enrolled) || a.priority - b.priority),
+    [d],
+  );
+  const { rows: pageRows, pager } = usePaged(rows);
+  const { rows: cells, pager: cellPager } = usePaged(d?.cells ?? []);
+  // 延迟条只查当前页的账号
+  const mon = useMonitor(
+    range,
+    pageRows.map((a) => a.id),
+  );
   const { bulk, confirm, confirmEl } = useBulk();
   const [sel, setSel] = useState<Set<number>>(new Set());
   const [errorsFor, setErrorsFor] = useState<Account | null>(null);
@@ -207,7 +216,6 @@ export default function GroupPage({ params }: { params: Promise<{ id: string }> 
   if (!d) return <Skeleton className="h-96" />;
   const g = d.group;
   const enrolledN = d.accounts.filter((a) => a.enrolled).length;
-  const rows = [...d.accounts].sort((a, b) => Number(b.enrolled) - Number(a.enrolled) || a.priority - b.priority);
 
   const setCfg = async (body: Record<string, unknown>, msg: string) => {
     try {
@@ -433,8 +441,8 @@ export default function GroupPage({ params }: { params: Promise<{ id: string }> 
               <TableRow>
                 <TableHead className="w-8">
                   <Checkbox
-                    checked={rows.length > 0 && sel.size === rows.length}
-                    onCheckedChange={(v) => setSel(v ? new Set(rows.map((a) => a.id)) : new Set())}
+                    checked={pageRows.length > 0 && pageRows.every((a) => sel.has(a.id))}
+                    onCheckedChange={(v) => setSel(v ? new Set(pageRows.map((a) => a.id)) : new Set())}
                   />
                 </TableHead>
                 <TableHead>关联</TableHead>
@@ -460,7 +468,7 @@ export default function GroupPage({ params }: { params: Promise<{ id: string }> 
             </TableHeader>
             <TableBody>
               {rows.length ? (
-                rows.map((a) => {
+                pageRows.map((a) => {
                   const st = a.stats;
                   const l = a.live;
                   const m = mon.data?.accounts[a.id];
@@ -639,6 +647,7 @@ export default function GroupPage({ params }: { params: Promise<{ id: string }> 
             </TableBody>
           </Table>
         </div>
+        <Pager {...pager} />
       </div>
 
       <Card>
@@ -659,7 +668,7 @@ export default function GroupPage({ params }: { params: Promise<{ id: string }> 
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {d.cells.map((c) => (
+                  {cells.map((c) => (
                     <TableRow key={c.model}>
                       <TableCell className="font-medium">{c.model}</TableCell>
                       <TableCell className="text-right tabular-nums">
@@ -686,6 +695,7 @@ export default function GroupPage({ params }: { params: Promise<{ id: string }> 
                   ))}
                 </TableBody>
               </Table>
+              <Pager {...cellPager} className="border-t px-4 py-2" />
             </div>
           ) : (
             <p className="text-muted-foreground text-sm">

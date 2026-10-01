@@ -25,7 +25,7 @@ import type { CustomerOverview, Paged } from "../types";
 import { AccountTable } from "./account-table";
 import { PlatformBadge, Tag } from "./badges";
 import { ErrorDetailDialog, RangeSelect } from "./dialogs";
-import { Pager, StatCards, useConfirm } from "./shared";
+import { DEFAULT_PAGE_SIZE, PagedList, Pager, StatCards, useConfirm, usePaged } from "./shared";
 
 const ALL = "all";
 const trendConfig = { cost: { label: "消费", color: "var(--primary)" } } satisfies ChartConfig;
@@ -156,61 +156,65 @@ export function OverviewTab({ ov }: { ov: CustomerOverview }) {
             )}
           </CardHeader>
           <CardContent>
-            <div className="overflow-x-auto rounded-md border">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Key 名称</TableHead>
-                    <TableHead>Key</TableHead>
-                    <TableHead>使用分组</TableHead>
-                    <TableHead>状态</TableHead>
-                    <TableHead>最近使用</TableHead>
-                    <TableHead>创建时间</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {u.keys.length ? (
-                    u.keys.map((k) => (
-                      <TableRow key={k.id}>
-                        <TableCell>
-                          {k.name} <span className="text-muted-foreground text-xs">#{k.id}</span>
-                        </TableCell>
-                        <TableCell className="font-mono text-xs">{k.key_masked}</TableCell>
-                        <TableCell>
-                          <Select
-                            value={k.group_id ? String(k.group_id) : ALL}
-                            onValueChange={(v) => setKeyGroup(k.id, v)}
-                          >
-                            <SelectTrigger size="sm" className="w-44">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value={ALL}>（无分组）</SelectItem>
-                              {groups.map((g) => (
-                                <SelectItem key={g.id} value={String(g.id)}>
-                                  {g.name}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        </TableCell>
-                        <TableCell>
-                          <Tag tone={k.status === "active" ? "ok" : "muted"}>{k.status}</Tag>
-                        </TableCell>
-                        <TableCell className="text-muted-foreground">{ago(k.last_used_at)}</TableCell>
-                        <TableCell className="text-muted-foreground">{time(k.created_at)}</TableCell>
+            <PagedList items={u.keys}>
+              {(keys) => (
+                <div className="overflow-x-auto rounded-md border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Key 名称</TableHead>
+                        <TableHead>Key</TableHead>
+                        <TableHead>使用分组</TableHead>
+                        <TableHead>状态</TableHead>
+                        <TableHead>最近使用</TableHead>
+                        <TableHead>创建时间</TableHead>
                       </TableRow>
-                    ))
-                  ) : (
-                    <TableRow>
-                      <TableCell colSpan={6} className="text-muted-foreground">
-                        没有 Key
-                      </TableCell>
-                    </TableRow>
-                  )}
-                </TableBody>
-              </Table>
-            </div>
+                    </TableHeader>
+                    <TableBody>
+                      {keys.length ? (
+                        keys.map((k) => (
+                          <TableRow key={k.id}>
+                            <TableCell>
+                              {k.name} <span className="text-muted-foreground text-xs">#{k.id}</span>
+                            </TableCell>
+                            <TableCell className="font-mono text-xs">{k.key_masked}</TableCell>
+                            <TableCell>
+                              <Select
+                                value={k.group_id ? String(k.group_id) : ALL}
+                                onValueChange={(v) => setKeyGroup(k.id, v)}
+                              >
+                                <SelectTrigger size="sm" className="w-44">
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value={ALL}>（无分组）</SelectItem>
+                                  {groups.map((g) => (
+                                    <SelectItem key={g.id} value={String(g.id)}>
+                                      {g.name}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                            </TableCell>
+                            <TableCell>
+                              <Tag tone={k.status === "active" ? "ok" : "muted"}>{k.status}</Tag>
+                            </TableCell>
+                            <TableCell className="text-muted-foreground">{ago(k.last_used_at)}</TableCell>
+                            <TableCell className="text-muted-foreground">{time(k.created_at)}</TableCell>
+                          </TableRow>
+                        ))
+                      ) : (
+                        <TableRow>
+                          <TableCell colSpan={6} className="text-muted-foreground">
+                            没有 Key
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </div>
+              )}
+            </PagedList>
           </CardContent>
         </Card>
       ))}
@@ -261,6 +265,7 @@ export function GroupsTab({ ov, id }: { ov: CustomerOverview; id: string }) {
     () => setAllowed(Object.fromEntries(ov.users.map((u) => [u.id, new Set(u.allowed_groups ?? [])]))),
     [ov.users],
   );
+  const { rows: groupRows, pager: groupPager } = usePaged(data?.groups ?? []);
   if (!data) return <Skeleton className="h-64" />;
   const accBy = (gid: number) =>
     data.accounts.filter((a) => a.group_ids.includes(gid)).sort((a, b) => a.priority - b.priority);
@@ -294,7 +299,7 @@ export function GroupsTab({ ov, id }: { ov: CustomerOverview; id: string }) {
               </TableHeader>
               <TableBody>
                 {data.groups.length ? (
-                  data.groups.map((g) => (
+                  groupRows.map((g) => (
                     <TableRow key={g.id}>
                       <TableCell>
                         <b>{g.name}</b> <span className="text-muted-foreground text-xs">#{g.id}</span>
@@ -331,6 +336,7 @@ export function GroupsTab({ ov, id }: { ov: CustomerOverview; id: string }) {
               </TableBody>
             </Table>
           </div>
+          <Pager {...groupPager} className="mt-3" />
         </CardContent>
       </Card>
       {ov.users
@@ -492,15 +498,16 @@ type UsageRow = {
 export function UsageTab({ ov, id }: { ov: CustomerOverview; id: string }) {
   const [f, setF] = useState<LogFilters>({ range: "24h", user_id: "", api_key_id: "", account_id: "", model: "" });
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const set = (p: Partial<LogFilters>) => {
     setF((x) => ({ ...x, ...p }));
     setPage(1);
   };
   const q = useQuery({
-    queryKey: ["ops", "usage", id, f, page],
+    queryKey: ["ops", "usage", id, f, page, pageSize],
     queryFn: () =>
       get<Paged<UsageRow> & { sum: { cost: number; tokens: number; avg_ms: number } }>(
-        `/customers/${id}/usage?${qs({ ...f, page })}`,
+        `/customers/${id}/usage?${qs({ ...f, page, page_size: pageSize })}`,
       ),
     placeholderData: keepPreviousData,
   });
@@ -583,7 +590,9 @@ export function UsageTab({ ov, id }: { ov: CustomerOverview; id: string }) {
           </TableBody>
         </Table>
       </div>
-      {d ? <Pager page={d.page} pageSize={d.page_size} total={d.total} onPage={setPage} /> : null}
+      {d ? (
+        <Pager page={d.page} pageSize={d.page_size} total={d.total} onPage={setPage} onPageSize={setPageSize} />
+      ) : null}
     </div>
   );
 }
@@ -617,20 +626,21 @@ export function ErrorsTab({ ov, id }: { ov: CustomerOverview; id: string }) {
     status_code: "",
   });
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [detail, setDetail] = useState<number | null>(null);
   const set = (p: Partial<LogFilters>) => {
     setF((x) => ({ ...x, ...p }));
     setPage(1);
   };
   const q = useQuery({
-    queryKey: ["ops", "errors", id, f, page],
+    queryKey: ["ops", "errors", id, f, page, pageSize],
     queryFn: () =>
       get<
         Paged<ErrRow> & {
           by_status: { status_code: number | null; n: number }[];
           by_account: { account_id: number | null; account_name: string | null; n: number }[];
         }
-      >(`/customers/${id}/errors?${qs({ ...f, page })}`),
+      >(`/customers/${id}/errors?${qs({ ...f, page, page_size: pageSize })}`),
     placeholderData: keepPreviousData,
   });
   const d = q.data;
@@ -743,7 +753,9 @@ export function ErrorsTab({ ov, id }: { ov: CustomerOverview; id: string }) {
           </TableBody>
         </Table>
       </div>
-      {d ? <Pager page={d.page} pageSize={d.page_size} total={d.total} onPage={setPage} /> : null}
+      {d ? (
+        <Pager page={d.page} pageSize={d.page_size} total={d.total} onPage={setPage} onPageSize={setPageSize} />
+      ) : null}
       <ErrorDetailDialog id={detail} onClose={() => setDetail(null)} />
     </div>
   );

@@ -93,6 +93,11 @@ export function TabBar() {
   const router = useRouter();
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // 预加载已打开的标签页，切换时不用再等服务器
+  useEffect(() => {
+    for (const t of tabs) router.prefetch(t.url);
+  }, [tabs, router]);
+
   const handleActivate = useCallback(
     (url: string) => {
       setActiveTab(url);

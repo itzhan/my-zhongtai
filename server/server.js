@@ -11,6 +11,7 @@ import { createScheduler, ERROR_CLASS_SQL } from "./scheduler.js";
 import { createDetector } from "./detector.js";
 import { registerMonitor } from "./monitor.js";
 import { registerSuppliers } from "./suppliers.js";
+import { registerTraffic } from "./traffic.js";
 import ExcelJS from "exceljs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1098,6 +1099,7 @@ app.get("/api/billing/export", async (req, res) => {
 
 registerMonitor({ app, wrap, pool, getAccounts, httpError, ERROR_CLASS_SQL });
 registerSuppliers({ app, wrap, httpError, dataDir: DATA_DIR, jobs: !READONLY });
+registerTraffic({ app, wrap, httpError, dataDir: DATA_DIR, readonly: READONLY });
 
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 

@@ -15,7 +15,7 @@ import type { Supplier, SupplierMonitor } from "../types";
 
 import { Tag } from "./badges";
 import { GradeBadge, LatencyBar, STATUS_LABEL, supplierCells } from "./latency-bar";
-import { useConfirm } from "./shared";
+import { Pager, useConfirm, usePaged } from "./shared";
 import { KINDS, MonitorDialog } from "./supplier-dialogs";
 
 const STATUS_TONE = { up: "ok", slow: "warn", down: "bad", limited: "info", unknown: "muted" } as const;
@@ -35,6 +35,7 @@ export function MonitorTable({
   const [confirm, confirmEl] = useConfirm();
   const [editing, setEditing] = useState<SupplierMonitor | null>(null);
   const [probing, setProbing] = useState<Set<number>>(new Set());
+  const { rows, pager } = usePaged(monitors, String(monitors.length));
 
   const probe = async (m: SupplierMonitor) => {
     setProbing((s) => new Set(s).add(m.id));
@@ -100,7 +101,7 @@ export function MonitorTable({
           </TableHeader>
           <TableBody>
             {monitors.length ? (
-              monitors.map((m) => (
+              rows.map((m) => (
                 <TableRow key={m.id}>
                   {showSupplier ? (
                     <TableCell>
@@ -175,6 +176,7 @@ export function MonitorTable({
           </TableBody>
         </Table>
       </div>
+      <Pager {...pager} className="mt-3" />
       <MonitorDialog
         open={!!editing}
         onOpenChange={(o) => !o && setEditing(null)}

@@ -14,6 +14,13 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { del, patch, post } from "@/modules/ops/api";
 import { Tag } from "@/modules/ops/components/badges";
+import {
+  LINE_RANGE,
+  LineQualityBadge,
+  SupplierLines,
+  lineQuality,
+  supplierAccounts,
+} from "@/modules/ops/components/line-quality";
 import { MonitorTable } from "@/modules/ops/components/monitor-table";
 import { PageHeader, useConfirm } from "@/modules/ops/components/shared";
 import {
@@ -25,7 +32,7 @@ import {
   goodsTone,
 } from "@/modules/ops/components/supplier-dialogs";
 import { readErr, time } from "@/modules/ops/format";
-import { useInvalidate, useSupplier } from "@/modules/ops/hooks";
+import { useAccounts, useInvalidate, useMonitor, useSupplier } from "@/modules/ops/hooks";
 import { useTabTitle, useTabsStore } from "@/stores/tabs/tab-store-provider";
 
 // 一行货物：名称 + 倍率，可改可删
@@ -84,6 +91,8 @@ export default function SupplierPage({ params }: { params: Promise<{ id: string 
   const id = Number(use(params).id);
   const router = useRouter();
   const { data: s, error, refetch } = useSupplier(id);
+  const accounts = useAccounts();
+  const mon = useMonitor(LINE_RANGE);
   const invalidate = useInvalidate();
   const [confirm, confirmEl] = useConfirm();
   const [editOpen, setEditOpen] = useState(false);
@@ -94,6 +103,7 @@ export default function SupplierPage({ params }: { params: Promise<{ id: string 
 
   if (error) return <p className="text-destructive">{error.message}</p>;
   if (!s) return <Skeleton className="h-96" />;
+  const linkedIds = accounts.data ? supplierAccounts(s, accounts.data).linked.map((x) => x.account.id) : [];
   const changed = () => {
     refetch();
     invalidate("suppliers", "supplier-monitors");
@@ -217,6 +227,24 @@ export default function SupplierPage({ params }: { params: Promise<{ id: string 
           </CardContent>
         </Card>
       </div>
+      <Card>
+        <CardHeader>
+          <CardTitle>线路质量</CardTitle>
+          <CardDescription>名下 sub2api 账号在监控大盘里近 24 小时的延迟评级（真实流量，每小时一格）</CardDescription>
+          <CardAction>
+            {accounts.data && mon.data ? (
+              <LineQualityBadge q={lineQuality(linkedIds, mon.data)} total={linkedIds.length} />
+            ) : null}
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          {accounts.data ? (
+            <SupplierLines supplier={s} accounts={accounts.data} mon={mon.data} onChanged={changed} />
+          ) : (
+            <Skeleton className="h-40" />
+          )}
+        </CardContent>
+      </Card>
       <Card>
         <CardHeader>
           <CardTitle>接口监测</CardTitle>

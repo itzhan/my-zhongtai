@@ -130,6 +130,7 @@ export type Supplier = {
   created_at: string;
   updated_at: string;
   goods: { id: number; name: string; rate: string }[];
+  links?: { account_id: number; mode: "include" | "exclude" }[];
   monitor_count?: number;
 };
 

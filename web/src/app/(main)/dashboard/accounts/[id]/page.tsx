@@ -23,7 +23,7 @@ import { AccountStatus, BreakerBadge, PlatformBadge, Tag } from "@/modules/ops/c
 import { DetectCell, type DetectInfo } from "@/modules/ops/components/detect";
 import { ErrorDetailDialog, RangeSelect } from "@/modules/ops/components/dialogs";
 import { GradeBadge, LatencyBar, Legend, accountCells } from "@/modules/ops/components/latency-bar";
-import { PageHeader, Pager, StatCards, useConfirm } from "@/modules/ops/components/shared";
+import { DEFAULT_PAGE_SIZE, PageHeader, Pager, StatCards, useConfirm } from "@/modules/ops/components/shared";
 import { ago, bigNum, money, ms, num, pct, readErr, time } from "@/modules/ops/format";
 import { qk, useMonitor, useNow } from "@/modules/ops/hooks";
 import { useOps } from "@/modules/ops/provider";
@@ -159,11 +159,14 @@ function Logs({ id }: { id: number }) {
   const [tab, setTab] = useState("usage");
   const [range, setRange] = useState("24h");
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [detail, setDetail] = useState<number | null>(null);
   const q = useQuery({
-    queryKey: ["ops", "acc-logs", id, tab, range, page],
+    queryKey: ["ops", "acc-logs", id, tab, range, page, pageSize],
     queryFn: () =>
-      get<Paged<UsageRow | ErrRow>>(`/accounts/${id}/${tab === "usage" ? "usage" : "errors"}?${qs({ range, page })}`),
+      get<Paged<UsageRow | ErrRow>>(
+        `/accounts/${id}/${tab === "usage" ? "usage" : "errors"}?${qs({ range, page, page_size: pageSize })}`,
+      ),
     placeholderData: keepPreviousData,
   });
   const d = q.data;
@@ -283,7 +286,9 @@ function Logs({ id }: { id: number }) {
             </Table>
           )}
         </div>
-        {d ? <Pager page={d.page} pageSize={d.page_size} total={d.total} onPage={setPage} /> : null}
+        {d ? (
+          <Pager page={d.page} pageSize={d.page_size} total={d.total} onPage={setPage} onPageSize={setPageSize} />
+        ) : null}
       </CardContent>
       <ErrorDetailDialog id={detail} onClose={() => setDetail(null)} />
     </Card>

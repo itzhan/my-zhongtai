@@ -5,24 +5,26 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 
 import { useQuery } from "@tanstack/react-query";
-import { Search } from "lucide-react";
+import { ChevronRight, Search } from "lucide-react";
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { cn } from "@/lib/utils";
 import { get } from "@/modules/ops/api";
 import { MONITOR_RANGES } from "@/modules/ops/components/account-table";
-import { AccountStatus, GroupTags, PlatformBadge, Tag } from "@/modules/ops/components/badges";
-import { GradeBadge, LatencyBar, Legend, accountCells } from "@/modules/ops/components/latency-bar";
-import { PageHeader, StatCards } from "@/modules/ops/components/shared";
+import { AccountStatus, PlatformBadge, Tag } from "@/modules/ops/components/badges";
+import { GRADE, GradeBadge, LatencyBar, Legend, accountCells } from "@/modules/ops/components/latency-bar";
+import { PageHeader, Pager, StatCards, usePaged } from "@/modules/ops/components/shared";
 import { ago, ms, num } from "@/modules/ops/format";
 import { qk, useAccounts, useAlerts, useMonitor } from "@/modules/ops/hooks";
 import { useOps } from "@/modules/ops/provider";
-import type { Grade } from "@/modules/ops/types";
+import type { Account, AccountSample, Grade } from "@/modules/ops/types";
 
 type SchedOverview = {
   enabled: boolean;
@@ -43,8 +45,13 @@ type SchedOverview = {
 
 const GRADE_ORDER: Record<Grade["grade"], number> = { unavailable: 0, unstable: 1, excellent: 2, unknown: 3 };
 
+type Row = { a: Account; m?: { samples: AccountSample[]; score: Grade }; lastP50: number | null };
+type Section = { id: number; name: string; rows: Row[]; bad: number; unstable: number; excellent: number };
+
 export default function MonitorPage() {
-  const { groupName } = useOps();
+  const { groups } = useOps();
+  // 用户手动展开 / 收起过的分组（相对默认状态取反）；默认：有异常 / 不稳定账号的分组展开
+  const [toggled, setToggled] = useState<Set<number>>(new Set());
   const [range, setRange] = useState("2h");
   const [activeOnly, setActiveOnly] = useState(true);
   const [q, setQ] = useState("");
@@ -74,6 +81,39 @@ export default function MonitorPage() {
           x.a.priority - y.a.priority,
       );
   }, [accounts.data, mon.data, activeOnly, q]);
+
+  // 按 sub2api 分组归类（一个账号在多个分组里就各出现一次），有不可用 / 不稳定账号的分组排前面
+  const sections = useMemo<Section[]>(() => {
+    const make = (id: number, name: string, list: Row[]): Section => {
+      const n = (g: Grade["grade"]) => list.filter((r) => r.m?.score.grade === g).length;
+      return { id, name, rows: list, bad: n("unavailable"), unstable: n("unstable"), excellent: n("excellent") };
+    };
+    const out = groups.map((g) =>
+      make(
+        g.id,
+        g.name,
+        rows.filter((r) => r.a.group_ids.includes(g.id)),
+      ),
+    );
+    out.push(
+      make(
+        0,
+        "未分组",
+        rows.filter((r) => !r.a.group_ids.length),
+      ),
+    );
+    return out
+      .filter((x) => x.rows.length)
+      .sort((x, y) => y.bad - x.bad || y.unstable - x.unstable || y.rows.length - x.rows.length);
+  }, [groups, rows]);
+  const isOpen = (x: Section) => x.bad + x.unstable > 0 !== toggled.has(x.id);
+  const flip = (id: number) =>
+    setToggled((t) => {
+      const n = new Set(t);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
 
   const all = accounts.data ?? [];
   const grades = mon.data ? Object.values(mon.data.accounts).map((m) => m.score.grade) : [];
@@ -175,7 +215,9 @@ export default function MonitorPage() {
               </Label>
             </div>
             <div className="ml-auto flex items-center gap-3">
-              <span className="text-muted-foreground hidden text-xs lg:inline">异常的排在前面 · 每分钟自动刷新</span>
+              <span className="text-muted-foreground hidden text-xs lg:inline">
+                按分组显示，异常的排在前面 · 每分钟自动刷新
+              </span>
               <ToggleGroup
                 type="single"
                 size="sm"
@@ -193,65 +235,109 @@ export default function MonitorPage() {
           </div>
           {!mon.data || !accounts.data ? (
             <Skeleton className="h-64" />
-          ) : (
-            <div className="overflow-x-auto rounded-md border">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>账号</TableHead>
-                    <TableHead>延迟监控条</TableHead>
-                    <TableHead>评级</TableHead>
-                    <TableHead className="text-right">最近首字 P50</TableHead>
-                    <TableHead>状态</TableHead>
-                    <TableHead>分组</TableHead>
-                    <TableHead className="text-right">优先级</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {rows.length ? (
-                    rows.map(({ a, m, lastP50 }) => (
-                      <TableRow key={a.id}>
-                        <TableCell className="min-w-40">
-                          <Link
-                            prefetch={false}
-                            href={`/dashboard/accounts/${a.id}`}
-                            className="font-medium hover:underline"
-                          >
-                            {a.name}
-                          </Link>{" "}
-                          <span className="text-muted-foreground text-xs">#{a.id}</span>
-                          <div className="mt-0.5">
-                            <PlatformBadge platform={a.platform} />
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          {m ? <LatencyBar cells={accountCells(m.samples, mon.data.bucket_min)} /> : null}
-                        </TableCell>
-                        <TableCell>{m ? <GradeBadge score={m.score} /> : null}</TableCell>
-                        <TableCell className="text-right tabular-nums">{ms(lastP50)}</TableCell>
-                        <TableCell>
-                          <AccountStatus a={a} />
-                        </TableCell>
-                        <TableCell className="max-w-56">
-                          <GroupTags ids={a.group_ids} name={groupName} />
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">{a.priority}</TableCell>
-                      </TableRow>
-                    ))
-                  ) : (
-                    <TableRow>
-                      <TableCell colSpan={7} className="text-muted-foreground py-10 text-center">
-                        {activeOnly ? "这段时间没有账号有流量，关掉「只看有流量」可查看全部" : "没有账号"}
-                      </TableCell>
-                    </TableRow>
-                  )}
-                </TableBody>
-              </Table>
+          ) : sections.length ? (
+            <div className="space-y-2">
+              {sections.map((x) => (
+                <GroupSection
+                  key={x.id}
+                  section={x}
+                  open={isOpen(x)}
+                  onToggle={() => flip(x.id)}
+                  bucketMin={mon.data.bucket_min}
+                />
+              ))}
             </div>
+          ) : (
+            <p className="text-muted-foreground py-10 text-center text-sm">
+              {activeOnly ? "这段时间没有账号有流量，关掉「只看有流量」可查看全部" : "没有账号"}
+            </p>
           )}
-          <p className="text-muted-foreground text-xs">共 {num(rows.length)} 个账号</p>
+          {mon.data && accounts.data ? (
+            <p className="text-muted-foreground text-xs">
+              共 {num(rows.length)} 个账号 · {sections.length} 个分组
+            </p>
+          ) : null}
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+// 一个分组：标题行（账号数、各评级数量）+ 可折叠的账号表（分页）
+function GroupSection({
+  section,
+  open,
+  onToggle,
+  bucketMin,
+}: {
+  section: Section;
+  open: boolean;
+  onToggle: () => void;
+  bucketMin: number;
+}) {
+  const { rows, pager } = usePaged(section.rows, String(section.rows.length));
+  const worst: Grade["grade"] = section.bad
+    ? "unavailable"
+    : section.unstable
+      ? "unstable"
+      : section.excellent
+        ? "excellent"
+        : "unknown";
+  return (
+    <Collapsible open={open} onOpenChange={onToggle} className="rounded-md border">
+      <CollapsibleTrigger className="hover:bg-accent/50 flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm">
+        <ChevronRight
+          className={cn("text-muted-foreground size-4 shrink-0 transition-transform", open && "rotate-90")}
+        />
+        <b className="truncate">{section.name}</b>
+        {section.id ? <span className="text-muted-foreground text-xs">#{section.id}</span> : null}
+        <span className="text-muted-foreground text-xs">{section.rows.length} 个账号</span>
+        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {section.bad ? <Tag tone="bad">不可用 {section.bad}</Tag> : null}
+          {section.unstable ? <Tag tone="warn">不稳定 {section.unstable}</Tag> : null}
+          {section.excellent ? <Tag tone="ok">优秀 {section.excellent}</Tag> : null}
+          {worst === "unknown" ? <Tag tone="muted">{GRADE.unknown.label}</Tag> : null}
+        </span>
+      </CollapsibleTrigger>
+      <CollapsibleContent className="border-t">
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="pl-4">账号</TableHead>
+                <TableHead>延迟监控条</TableHead>
+                <TableHead>评级</TableHead>
+                <TableHead className="text-right">最近首字 P50</TableHead>
+                <TableHead>状态</TableHead>
+                <TableHead className="text-right">优先级</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map(({ a, m, lastP50 }) => (
+                <TableRow key={a.id}>
+                  <TableCell className="min-w-40 pl-4">
+                    <Link prefetch={false} href={`/dashboard/accounts/${a.id}`} className="font-medium hover:underline">
+                      {a.name}
+                    </Link>{" "}
+                    <span className="text-muted-foreground text-xs">#{a.id}</span>
+                    <div className="mt-0.5">
+                      <PlatformBadge platform={a.platform} />
+                    </div>
+                  </TableCell>
+                  <TableCell>{m ? <LatencyBar cells={accountCells(m.samples, bucketMin)} /> : null}</TableCell>
+                  <TableCell>{m ? <GradeBadge score={m.score} /> : null}</TableCell>
+                  <TableCell className="text-right tabular-nums">{ms(lastP50)}</TableCell>
+                  <TableCell>
+                    <AccountStatus a={a} />
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">{a.priority}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+        <Pager {...pager} className="border-t px-4 py-2" />
+      </CollapsibleContent>
+    </Collapsible>
   );
 }

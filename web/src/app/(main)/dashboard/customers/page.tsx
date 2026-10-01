@@ -16,7 +16,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { del } from "@/modules/ops/api";
 import { Tag } from "@/modules/ops/components/badges";
 import { CustomerDialog } from "@/modules/ops/components/customer-dialog";
-import { PageHeader, useConfirm } from "@/modules/ops/components/shared";
+import { PageHeader, Pager, useConfirm, usePaged } from "@/modules/ops/components/shared";
 import { money, num, readErr } from "@/modules/ops/format";
 import { useCustomers, useInvalidate } from "@/modules/ops/hooks";
 import type { Customer } from "@/modules/ops/types";
@@ -39,6 +39,7 @@ export default function CustomersPage() {
       (c.contact || "").toLowerCase().includes(kw),
   );
 
+  const { rows: pageRows, pager } = usePaged(rows, kw);
   const remove = async (c: Customer) => {
     if (
       !(await confirm({
@@ -100,7 +101,7 @@ export default function CustomersPage() {
               </TableHeader>
               <TableBody>
                 {rows.length ? (
-                  rows.map((c) => (
+                  pageRows.map((c) => (
                     <TableRow key={c.id}>
                       <TableCell className="pl-4">
                         <Link
@@ -171,6 +172,7 @@ export default function CustomersPage() {
               </TableBody>
             </Table>
           )}
+          <Pager {...pager} className="border-t px-4 py-3" />
         </CardContent>
       </Card>
       <CustomerDialog

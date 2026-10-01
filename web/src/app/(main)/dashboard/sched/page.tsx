@@ -20,7 +20,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { get, post, put } from "@/modules/ops/api";
 import { Tag, type Tone } from "@/modules/ops/components/badges";
 import { GroupSwitches, type SchedGroupRow } from "@/modules/ops/components/group-switches";
-import { PageHeader, useConfirm } from "@/modules/ops/components/shared";
+import { PageHeader, Pager, useConfirm, usePaged } from "@/modules/ops/components/shared";
 import { ago, readErr, time } from "@/modules/ops/format";
 import { qk } from "@/modules/ops/hooks";
 import type { Alert } from "@/modules/ops/types";
@@ -95,8 +95,10 @@ export default function SchedPage() {
     ov.refetch();
     audit.refetch();
   };
+  const { rows: on, pager: onPager } = usePaged((d?.groups ?? []).filter((g) => g.enrolled_count));
+  const logs = (audit.data ?? []).filter((e) => lv === ALL || e.level === lv);
+  const { rows, pager: logPager } = usePaged(logs, lv);
   if (!d) return <Skeleton className="h-96" />;
-  const on = d.groups.filter((g) => g.enrolled_count);
 
   const setMaster = async (v: boolean) => {
     try {
@@ -157,7 +159,6 @@ export default function SchedPage() {
     }
   };
 
-  const rows = (audit.data ?? []).filter((e) => lv === ALL || e.level === lv);
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
@@ -224,6 +225,7 @@ export default function SchedPage() {
                     ))}
                   </TableBody>
                 </Table>
+                <Pager {...onPager} className="mt-3" />
               </div>
             ) : (
               <p className="text-muted-foreground text-sm">
@@ -311,7 +313,7 @@ export default function SchedPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {rows.length ? (
+                {logs.length ? (
                   rows.map((e, i) => (
                     <TableRow key={i}>
                       <TableCell className="whitespace-nowrap">{time(e.t)}</TableCell>
@@ -342,6 +344,7 @@ export default function SchedPage() {
               </TableBody>
             </Table>
           </div>
+          <Pager {...logPager} className="mt-3" />
         </CardContent>
       </Card>
       {confirmEl}

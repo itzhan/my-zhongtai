@@ -18,7 +18,7 @@ import { useOps } from "../provider";
 import type { Account, Paged } from "../types";
 
 import { Tag } from "./badges";
-import { Pager } from "./shared";
+import { DEFAULT_PAGE_SIZE, Pager } from "./shared";
 
 // ---------- 报错详情 ----------
 type ErrorDetail = Record<string, unknown> & { id: number; created_at: string; request_id: string };
@@ -106,11 +106,12 @@ export function AccountErrorsDialog({
 }) {
   const [range, setRange] = useState("24h");
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [detail, setDetail] = useState<number | null>(null);
   useEffect(() => setPage(1), [account?.id, range]);
   const q = useQuery({
-    queryKey: ["ops", "acc-errors", account?.id, range, page],
-    queryFn: () => get<Paged<AccErr>>(`/accounts/${account!.id}/errors?${qs({ range, page })}`),
+    queryKey: ["ops", "acc-errors", account?.id, range, page, pageSize],
+    queryFn: () => get<Paged<AccErr>>(`/accounts/${account!.id}/errors?${qs({ range, page, page_size: pageSize })}`),
     enabled: !!account,
   });
   return (
@@ -169,7 +170,13 @@ export function AccountErrorsDialog({
                   </TableBody>
                 </Table>
               </div>
-              <Pager page={q.data.page} pageSize={q.data.page_size} total={q.data.total} onPage={setPage} />
+              <Pager
+                page={q.data.page}
+                pageSize={q.data.page_size}
+                total={q.data.total}
+                onPage={setPage}
+                onPageSize={setPageSize}
+              />
             </div>
           )}
         </DialogContent>

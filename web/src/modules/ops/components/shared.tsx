@@ -17,6 +17,7 @@ import { Card, CardDescription, CardFooter, CardHeader, CardTitle } from "@/comp
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Drawer, DrawerContent, DrawerDescription, DrawerHeader, DrawerTitle } from "@/components/ui/drawer";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { cn } from "@/lib/utils";
 
@@ -119,30 +120,100 @@ export function StatCards({ items, cols = 4 }: { items: Stat[]; cols?: 3 | 4 | 5
   );
 }
 
+export const PAGE_SIZES = [10, 20, 50, 100];
+export const DEFAULT_PAGE_SIZE = 20;
+const MIN_PAGE_SIZE = 10;
+
+// 分页条：共 N 条 · 每页 [20] 条 · 上一页 x/y 下一页。total 不超过最小档时不显示
 export function Pager({
   page,
   pageSize,
   total,
   onPage,
+  onPageSize,
+  className,
 }: {
   page: number;
   pageSize: number;
   total: number;
   onPage: (p: number) => void;
+  onPageSize?: (s: number) => void;
+  className?: string;
 }) {
-  const pages = Math.max(1, Math.ceil((total || 0) / (pageSize || 50)));
+  const pages = Math.max(1, Math.ceil((total || 0) / (pageSize || DEFAULT_PAGE_SIZE)));
+  if ((total || 0) <= MIN_PAGE_SIZE && page <= 1) return null;
   return (
-    <div className="text-muted-foreground flex items-center justify-end gap-2 text-sm">
-      <span>
-        共 {num(total)} 条 · 第 {page}/{pages} 页
-      </span>
+    <div className={cn("text-muted-foreground flex flex-wrap items-center justify-end gap-2 text-sm", className)}>
+      <span>共 {num(total)} 条</span>
+      {onPageSize ? (
+        <Select
+          value={String(pageSize)}
+          onValueChange={(v) => {
+            onPageSize(Number(v));
+            onPage(1);
+          }}
+        >
+          <SelectTrigger size="sm" className="w-28">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {PAGE_SIZES.map((n) => (
+              <SelectItem key={n} value={String(n)}>
+                {n} 条/页
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      ) : null}
       <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => onPage(page - 1)}>
         上一页
       </Button>
+      <span className="tabular-nums">
+        {page} / {pages}
+      </span>
       <Button variant="outline" size="sm" disabled={page >= pages} onClick={() => onPage(page + 1)}>
         下一页
       </Button>
     </div>
+  );
+}
+
+// 前端分页：const { rows, pager } = usePaged(list)；<Pager {...pager} />。
+// resetKey（字符串，如 JSON.stringify(筛选条件)）变化时回到第 1 页
+export function usePaged<T>(items: T[], resetKey: unknown = null, defaultSize = DEFAULT_PAGE_SIZE) {
+  const [state, setState] = useState({ page: 1, key: resetKey });
+  const [pageSize, setPageSize] = useState(defaultSize);
+  const page = Object.is(state.key, resetKey) ? state.page : 1;
+  const pages = Math.max(1, Math.ceil(items.length / pageSize));
+  const cur = Math.min(page, pages);
+  return {
+    rows: items.slice((cur - 1) * pageSize, cur * pageSize),
+    pager: {
+      page: cur,
+      pageSize,
+      total: items.length,
+      onPage: (p: number) => setState({ page: p, key: resetKey }),
+      onPageSize: setPageSize,
+    },
+  };
+}
+
+// 渲染函数形式的前端分页，用在 .map 循环里（循环里不能直接调 hook）
+export function PagedList<T>({
+  items,
+  children,
+  className = "mt-3",
+}: {
+  items: T[];
+  children: (rows: T[]) => ReactNode;
+  className?: string;
+}) {
+  const { rows, pager } = usePaged(items);
+  return (
+    <>
+      {children(rows)}
+      <Pager {...pager} className={className} />
+    </>
   );
 }
 

@@ -1,0 +1,184 @@
+"use client";
+
+import { useQuery } from "@tanstack/react-query";
+
+import { get } from "./api";
+
+// 流量监控（后端 server/traffic.js）：多台 sub2api 服务器的实时流量、渠道调度、分组使用、错误排行
+
+export type TrafficSite = { id: number; name: string; base_url: string; key_masked: string; is_default: boolean };
+
+export type TGroup = { id: number; name: string; platform: string; status: string; rate_multiplier: number };
+export type TChannel = {
+  id: number;
+  name: string;
+  platform: string;
+  type: string;
+  status: string;
+  schedulable: boolean;
+  priority: number;
+  concurrency: number;
+  rate_multiplier?: number;
+  group_ids: number[];
+  error_message: string | null;
+  notes: string | null;
+  last_used_at: string | null;
+};
+export type TStructure = { groups: TGroup[]; accounts: TChannel[] };
+
+export type TRealtime = {
+  rpm: number | null;
+  tpm: number | null;
+  account: Record<string, { current_in_use: number; max_capacity: number; waiting_in_queue: number }>;
+  user_monitoring: boolean | null;
+  user: Record<string, { user_id: number; name: string; current_in_use: number; max_capacity: number }>;
+  at: string;
+};
+export type TTodayStats = Record<string, { requests: number; tokens?: number; cost: number; user_cost: number }>;
+export type TGroupUsage = {
+  today: string;
+  by_group: Record<string, { cost: number; actual_cost: number; requests: number }>;
+};
+export type TGroupUsers = {
+  today: string;
+  groups: {
+    group_id: number;
+    group_name: string;
+    users: { user_id: number; email: string; requests: number; cost: number; actual_cost: number }[];
+    error?: string;
+  }[];
+};
+export type TUserRpm = Record<
+  string,
+  { used: number; limit: number; per_group: { group_id: number; group_name?: string; used: number; limit?: number }[] }
+>;
+export type TErrorEvent = {
+  id: number;
+  created_at: string;
+  status_code: number;
+  model: string;
+  requested_model: string;
+  message: string;
+  group_name: string;
+  user_email: string;
+  request_id: string;
+};
+export type TErrorAccount = {
+  account_id: number;
+  account_name: string;
+  count: number;
+  share: number;
+  by_status: Record<string, number>;
+  by_model: Record<string, number>;
+  groups: { group_id: number; group_name: string; count: number }[];
+  latest_at: string;
+  latest_status: number;
+  latest_message: string;
+  recent: TErrorEvent[];
+};
+export type TErrorRanking = {
+  range: string;
+  total: number;
+  processed: number;
+  truncated: boolean;
+  summary: {
+    error_rate: number;
+    upstream_error_rate: number;
+    sla: number;
+    request_count: number;
+    success_count: number;
+    error_count: number;
+    upstream_429: number;
+    upstream_529: number;
+    upstream_other: number;
+    health_score: number | null;
+    generated_at: string | null;
+  } | null;
+  accounts: TErrorAccount[];
+};
+
+export const ERROR_RANGES: [string, string][] = [
+  ["1h", "近 1 小时"],
+  ["6h", "近 6 小时"],
+  ["24h", "近 24 小时"],
+  ["7d", "近 7 天"],
+  ["30d", "近 30 天"],
+];
+
+const tk = (siteId: number | null, ...rest: unknown[]) => ["ops", "traffic", siteId, ...rest] as const;
+
+// 浏览器本地缓存：刷新页面后先显示上次的数据，同时自动拉最新的（修复旧版「刷新后要手动点刷新才有数据」）
+const LS = (siteId: number, name: string) => `ops.traffic.${siteId}.${name}`;
+function readLocal<T>(key: string): T | undefined {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function writeLocal(key: string, v: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(v));
+  } catch {
+    // 存不下就算了，只是少了「秒开」
+  }
+}
+function usePersisted<T>(siteId: number | null, name: string, path: string, opts: { refetchInterval?: number } = {}) {
+  return useQuery({
+    queryKey: tk(siteId, name),
+    queryFn: async () => {
+      const d = await get<T>(`/traffic/${siteId}/${path}`);
+      writeLocal(LS(siteId!, name), d);
+      return d;
+    },
+    enabled: siteId != null,
+    // 本地缓存只作为占位：标记为很旧的数据，挂载时一定会重新拉
+    initialData: () => (siteId == null ? undefined : readLocal<T>(LS(siteId, name))),
+    initialDataUpdatedAt: 0,
+    refetchOnMount: "always",
+    ...opts,
+  });
+}
+
+export const useTrafficSites = () =>
+  useQuery({ queryKey: ["ops", "traffic", "sites"], queryFn: () => get<TrafficSite[]>("/traffic/sites") });
+
+export const useStructure = (siteId: number | null) =>
+  usePersisted<TStructure>(siteId, "structure", "structure", { refetchInterval: 60_000 });
+export const useTodayStats = (siteId: number | null) =>
+  usePersisted<TTodayStats>(siteId, "today-stats", "today-stats", { refetchInterval: 60_000 });
+export const useGroupUsage = (siteId: number | null) =>
+  usePersisted<TGroupUsage>(siteId, "group-usage", "group-usage", { refetchInterval: 60_000 });
+export const useGroupUsers = (siteId: number | null) => usePersisted<TGroupUsers>(siteId, "group-users", "group-users");
+
+// 实时：每 2 秒（页面在后台时暂停）
+export const useRealtime = (siteId: number | null) =>
+  useQuery({
+    queryKey: tk(siteId, "realtime"),
+    queryFn: () => get<TRealtime>(`/traffic/${siteId}/realtime`),
+    enabled: siteId != null,
+    refetchInterval: 2000,
+    retry: false,
+  });
+
+export const useUserRpm = (siteId: number | null, userIds: number[]) => {
+  const ids = userIds.join(",");
+  return useQuery({
+    queryKey: tk(siteId, "user-rpm", ids),
+    queryFn: () => get<TUserRpm>(`/traffic/${siteId}/user-rpm?ids=${ids}`),
+    enabled: siteId != null && !!ids,
+    refetchInterval: 5000,
+    placeholderData: (prev) => prev,
+  });
+};
+
+export const useErrorRanking = (siteId: number | null, range: string) =>
+  useQuery({
+    queryKey: tk(siteId, "errors", range),
+    queryFn: () => get<TErrorRanking>(`/traffic/${siteId}/error-ranking?range=${range}`),
+    enabled: siteId != null,
+    refetchOnMount: "always",
+  });
+
+export const trafficKey = tk;

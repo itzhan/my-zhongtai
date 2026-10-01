@@ -15,7 +15,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { OPS_API, get, qs } from "@/modules/ops/api";
-import { PageHeader, ResponsiveDialog } from "@/modules/ops/components/shared";
+import { PageHeader, Pager, ResponsiveDialog, usePaged } from "@/modules/ops/components/shared";
 import { bigNum, discLabel, moneyFull, num, readErr, ymd } from "@/modules/ops/format";
 import { useCustomers } from "@/modules/ops/hooks";
 import type { S2User } from "@/modules/ops/types";
@@ -184,6 +184,8 @@ export default function BillingPage() {
   };
 
   const t = data?.total;
+  const { rows: userRows, pager: userPager } = usePaged(data?.by_user ?? []);
+  const { rows: modelRows, pager: modelPager } = usePaged(data?.by_model ?? []);
   return (
     <div className="flex flex-col gap-6">
       <PageHeader title="账单" description="按北京时间整天统计；结算金额 = 按用户倍率计算后的实际扣费" />
@@ -376,7 +378,7 @@ export default function BillingPage() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {data.by_user.map((u) => (
+                      {userRows.map((u) => (
                         <TableRow key={u.user_id}>
                           <TableCell>
                             {u.email || `#${u.user_id}`}{" "}
@@ -393,6 +395,7 @@ export default function BillingPage() {
                     </TableBody>
                   </Table>
                 </div>
+                <Pager {...userPager} className="mt-3" />
               </CardContent>
             </Card>
             <Card>
@@ -412,7 +415,7 @@ export default function BillingPage() {
                     </TableHeader>
                     <TableBody>
                       {data.by_model.length ? (
-                        data.by_model.map((m) => (
+                        modelRows.map((m) => (
                           <TableRow key={m.model}>
                             <TableCell>{m.model}</TableCell>
                             <TableCell className="text-right tabular-nums">{num(m.requests)}</TableCell>
@@ -432,6 +435,7 @@ export default function BillingPage() {
                     </TableBody>
                   </Table>
                 </div>
+                <Pager {...modelPager} className="mt-3" />
               </CardContent>
             </Card>
           </div>

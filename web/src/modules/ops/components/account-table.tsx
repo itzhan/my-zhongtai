@@ -23,7 +23,7 @@ import type { Account } from "../types";
 import { AccountStatus, GroupTags, PlatformBadge, Tag } from "./badges";
 import { AccountErrorsDialog, GroupsDialog } from "./dialogs";
 import { GradeBadge, LatencyBar, accountCells } from "./latency-bar";
-import { useConfirm } from "./shared";
+import { Pager, useConfirm, usePaged } from "./shared";
 
 export const MONITOR_RANGES: [string, string][] = [
   ["2h", "2 小时"],
@@ -83,9 +83,11 @@ export function AccountTable({
   const [groupsFor, setGroupsFor] = useState<Account[] | null>(null);
   const [errorsFor, setErrorsFor] = useState<Account | null>(null);
   const rows = useMemo(() => [...accounts].sort((a, b) => a.priority - b.priority || a.id - b.id), [accounts]);
+  const { rows: pageRows, pager } = usePaged(rows, String(rows.length));
+  // 延迟条只查当前页的账号
   const mon = useMonitor(
     range,
-    rows.map((a) => a.id),
+    pageRows.map((a) => a.id),
   );
   useEffect(() => setSel((s) => new Set([...s].filter((id) => rows.some((a) => a.id === id)))), [rows]);
 
@@ -194,8 +196,8 @@ export function AccountTable({
             <TableRow>
               <TableHead className="w-8">
                 <Checkbox
-                  checked={rows.length > 0 && sel.size === rows.length}
-                  onCheckedChange={(v) => setSel(v ? new Set(rows.map((a) => a.id)) : new Set())}
+                  checked={pageRows.length > 0 && pageRows.every((a) => sel.has(a.id))}
+                  onCheckedChange={(v) => setSel(v ? new Set(pageRows.map((a) => a.id)) : new Set())}
                 />
               </TableHead>
               <TableHead>账号</TableHead>
@@ -225,7 +227,7 @@ export function AccountTable({
           </TableHeader>
           <TableBody>
             {rows.length ? (
-              rows.map((a) => {
+              pageRows.map((a) => {
                 const m = mon.data?.accounts[a.id];
                 const limited = !!a.rate_limit_reset_at && new Date(a.rate_limit_reset_at).getTime() > now;
                 return (
@@ -368,6 +370,7 @@ export function AccountTable({
           </TableBody>
         </Table>
       </div>
+      <Pager {...pager} />
       <GroupsDialog
         accounts={groupsFor}
         onClose={() => setGroupsFor(null)}
