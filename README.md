@@ -94,7 +94,7 @@ mkdir -p data                           # 运行数据（不入库）；也可�
 docker compose up -d --build
 ```
 
-之后每次更新：在服务器上执行 `./deploy.sh`（git pull + 重建容器，data 与 .env 不受影响）。
+之后每次更新：在服务器上执行 `./deploy.sh`（git pull，只重建有改动的容器：只改前端时不重启后端；`./deploy.sh --all` 全部重建。data 与 .env 不受影响）。
 
 注意：
 - 敏感信息只放在服务器的 `server/.env` 和 `data/` 里，仓库中只有 `.env.example`；
