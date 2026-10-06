@@ -151,17 +151,30 @@ function writeLocal(key: string, v: unknown) {
     // 存不下就算了，只是少了「秒开」
   }
 }
-function usePersisted<T>(siteId: number | null, name: string, path: string, opts: { refetchInterval?: number } = {}) {
+// valid：数据结构检查，本地缓存坏了（比如存成了 {}）就丢掉，不让页面崩
+function usePersisted<T>(
+  siteId: number | null,
+  name: string,
+  path: string,
+  valid: (d: T) => boolean,
+  opts: { refetchInterval?: number } = {},
+) {
+  const ok = (d: T | undefined): d is T => !!d && typeof d === "object" && valid(d);
   return useQuery({
     queryKey: tk(siteId, name),
     queryFn: async () => {
       const d = await get<T>(`/traffic/${siteId}/${path}`);
+      if (!ok(d)) throw new Error("返回数据格式不对");
       writeLocal(LS(siteId!, name), d);
       return d;
     },
     enabled: siteId != null,
     // 本地缓存只作为占位：标记为很旧的数据，挂载时一定会重新拉
-    initialData: () => (siteId == null ? undefined : readLocal<T>(LS(siteId, name))),
+    initialData: () => {
+      if (siteId == null) return undefined;
+      const d = readLocal<T>(LS(siteId, name));
+      return ok(d) ? d : undefined;
+    },
     initialDataUpdatedAt: 0,
     refetchOnMount: "always",
     ...opts,
@@ -186,12 +199,27 @@ export function useSite() {
 }
 
 export const useStructure = (siteId: number | null) =>
-  usePersisted<TStructure>(siteId, "structure", "structure", { refetchInterval: 60_000 });
+  usePersisted<TStructure>(
+    siteId,
+    "structure",
+    "structure",
+    (d) => Array.isArray(d.groups) && Array.isArray(d.accounts),
+    { refetchInterval: 60_000 },
+  );
 export const useTodayStats = (siteId: number | null) =>
-  usePersisted<TTodayStats>(siteId, "today-stats", "today-stats", { refetchInterval: 60_000 });
+  usePersisted<TTodayStats>(siteId, "today-stats", "today-stats", () => true, { refetchInterval: 60_000 });
 export const useGroupUsage = (siteId: number | null) =>
-  usePersisted<TGroupUsage>(siteId, "group-usage", "group-usage", { refetchInterval: 60_000 });
-export const useGroupUsers = (siteId: number | null) => usePersisted<TGroupUsers>(siteId, "group-users", "group-users");
+  usePersisted<TGroupUsage>(
+    siteId,
+    "group-usage",
+    "group-usage",
+    (d) => typeof (d as Partial<TGroupUsage>).by_group === "object",
+    {
+      refetchInterval: 60_000,
+    },
+  );
+export const useGroupUsers = (siteId: number | null) =>
+  usePersisted<TGroupUsers>(siteId, "group-users", "group-users", (d) => Array.isArray(d.groups));
 
 // 实时：RPM / TPM + 各渠道并发，每 2 秒（页面在后台时暂停）
 export const useRealtime = (siteId: number | null) =>
