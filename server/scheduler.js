@@ -31,14 +31,15 @@ const DEFAULT_CONFIG = {
   routingExpandLoad: 0.7, // 候选账号平均负载超过此值时再加一个
 };
 
-// ops_error_logs 的错误归类：只有 dead / fail / r429 算账号的锅
+// ops_error_logs 的错误归类：只有 dead / fail / r429 算账号的锅；400 一律不算（报错文本命中额度不足等也不算）
 export const ERROR_CLASS_SQL = `CASE
   WHEN e.error_owner = 'client' OR e.error_phase IN ('request', 'auth') OR e.status_code = 499 THEN 'client'
+  WHEN coalesce(e.upstream_status_code, e.status_code) = 400 THEN 'client'
   WHEN coalesce(e.upstream_error_message, e.error_message) ~* '(model_not_found|no available channel for model|model .{0,40}not (found|supported)|不支持该模型|无可用渠道)' THEN 'client'
   WHEN coalesce(e.upstream_status_code, e.status_code) IN (401, 402, 403, 407)
     OR e.error_message ~* '(额度不足|余额不足|insufficient.{0,20}(balance|quota|credit)|credit balance|account.{0,20}(suspended|disabled|banned|deactivated)|invalid.{0,10}api.?key)' THEN 'dead'
   WHEN coalesce(e.upstream_status_code, e.status_code) = 429 THEN 'r429'
-  WHEN coalesce(e.upstream_status_code, e.status_code) IN (400, 404, 405, 413, 415, 422) THEN 'client'
+  WHEN coalesce(e.upstream_status_code, e.status_code) IN (404, 405, 413, 415, 422) THEN 'client'
   WHEN coalesce(e.upstream_status_code, e.status_code) >= 500 OR e.upstream_status_code IS NULL THEN 'fail'
   ELSE 'client' END`;
 
