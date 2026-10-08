@@ -1104,7 +1104,7 @@ app.get("/api/billing/export", async (req, res) => {
     for (const r of sum.by_model) s3.addRow(num(r)).commit();
     s3.commit();
 
-    // 4. 请求明细：按 id 分批读，流式写出
+    // 4. 请求明细：分批读，流式写出
     const s4 = wb.addWorksheet("请求明细");
     s4.columns = [
       { header: "时间(北京)", key: "t", width: 20 }, { header: "用户ID", key: "user_id", width: 9 }, { header: "用户邮箱", key: "email", width: 26 },
@@ -1116,20 +1116,24 @@ app.get("/api/billing/export", async (req, res) => {
       { header: "流式", key: "stream", width: 6 }, { header: "耗时(ms)", key: "duration_ms", width: 10 }, { header: "请求ID", key: "request_id", width: 40 },
     ];
     head(s4);
-    let lastId = 0;
-    for (;;) {
-      const { rows } = await pool.query(
-        `SELECT u.id, to_char(u.created_at AT TIME ZONE '${TZ}', 'YYYY-MM-DD HH24:MI:SS') AS t, u.user_id, us.email, k.name AS key_name, g.name AS group_name, u.model,
-                u.input_tokens, u.output_tokens, u.cache_creation_tokens, u.cache_read_tokens, u.total_cost::float, u.rate_multiplier::float, u.actual_cost::float,
-                u.stream, u.duration_ms, u.request_id
-           FROM usage_logs u LEFT JOIN users us ON us.id = u.user_id LEFT JOIN api_keys k ON k.id = u.api_key_id LEFT JOIN groups g ON g.id = u.group_id
-          WHERE u.user_id = ANY($1) AND u.created_at >= $2 AND u.created_at < $3 AND u.id > $4
-          ORDER BY u.id LIMIT 5000`,
-        [p.userIds, p.start, p.end, lastId]
-      );
-      if (!rows.length) break;
-      for (const r of rows) s4.addRow({ ...r, final: (r.actual_cost || 0) * p.discount, stream: r.stream ? "是" : "否" }).commit();
-      lastId = rows[rows.length - 1].id;
+    // 逐个用户按 (created_at, id) 游标分页，走 (user_id, created_at) 索引；按 id 分页会沿主键扫全表，大表下极慢
+    // 游标时间用文本传回，避免 JS Date 丢掉微秒导致漏行/重行
+    for (const userId of p.userIds) {
+      let lastAt = p.start, lastId = 0;
+      for (;;) {
+        const { rows } = await pool.query(
+          `SELECT u.id, u.created_at::text AS cursor_at, to_char(u.created_at AT TIME ZONE '${TZ}', 'YYYY-MM-DD HH24:MI:SS') AS t, u.user_id, us.email, k.name AS key_name, g.name AS group_name, u.model,
+                  u.input_tokens, u.output_tokens, u.cache_creation_tokens, u.cache_read_tokens, u.total_cost::float, u.rate_multiplier::float, u.actual_cost::float,
+                  u.stream, u.duration_ms, u.request_id
+             FROM usage_logs u LEFT JOIN users us ON us.id = u.user_id LEFT JOIN api_keys k ON k.id = u.api_key_id LEFT JOIN groups g ON g.id = u.group_id
+            WHERE u.user_id = $1 AND u.created_at >= $2 AND u.created_at < $3 AND (u.created_at, u.id) > ($4::timestamptz, $5)
+            ORDER BY u.user_id, u.created_at, u.id LIMIT 5000`,
+          [userId, p.start, p.end, lastAt, lastId]
+        );
+        if (!rows.length) break;
+        for (const r of rows) s4.addRow({ ...r, final: (r.actual_cost || 0) * p.discount, stream: r.stream ? "是" : "否" }).commit();
+        ({ cursor_at: lastAt, id: lastId } = rows[rows.length - 1]);
+      }
     }
     s4.commit();
     await wb.commit();

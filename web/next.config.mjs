@@ -14,6 +14,8 @@ const nextConfig = {
     turbopackFileSystemCacheForDev: false,
     // 构建时最多 2 个 worker，避免吃满内存
     cpus: 2,
+    // rewrites 代理默认 30 秒超时，大账单导出会被中途掐断（下载卡在 99%）
+    proxyTimeout: 600_000,
     optimizePackageImports: ["lucide-react", "date-fns", "radix-ui", "recharts"],
   },
   async redirects() {
