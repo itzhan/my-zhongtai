@@ -6,6 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { scoreOf } from "./monitor.js";
+import { registerSupplierWallets } from "./wallets.js";
 
 export const CATEGORIES = ["gpt", "claude", "aws", "cardshop"];
 const STATUSES = ["active", "paused", "closed"];
@@ -179,6 +180,8 @@ export function registerSuppliers({ app, wrap, httpError, dataDir, jobs }) {
     if (!s) throw httpError(404, "供应商不存在");
     return s;
   };
+  // 供应商余额（new-api / sub2api 钱包额度 + 倍率），见 wallets.js
+  const wallets = registerSupplierWallets({ app, wrap, httpError, db, jobs, mustSupplier });
   const supplierView = (s) => ({
     ...s,
     category: s.category ? s.category.split(",") : [],
@@ -218,7 +221,8 @@ export function registerSuppliers({ app, wrap, httpError, dataDir, jobs }) {
       const monCount = Object.fromEntries(
         db.prepare("SELECT supplier_id, count(*) AS n FROM supplier_monitors GROUP BY supplier_id").all().map((r) => [r.supplier_id, r.n]),
       );
-      return rows.map((s) => ({ ...supplierView(s), monitor_count: monCount[s.id] || 0 }));
+      const wal = wallets.summaryBySupplier();
+      return rows.map((s) => ({ ...supplierView(s), monitor_count: monCount[s.id] || 0, wallet: wal[s.id] || null }));
     }),
   );
 

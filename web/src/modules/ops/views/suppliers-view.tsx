@@ -31,6 +31,7 @@ import {
   SupplierDialog,
   goodsTone,
 } from "@/modules/ops/components/supplier-dialogs";
+import { amt } from "@/modules/ops/components/supplier-wallets";
 import { readErr } from "@/modules/ops/format";
 import { useAccounts, useInvalidate, useMonitor, useSuppliers } from "@/modules/ops/hooks";
 import type { Account, MonitorResp, Supplier } from "@/modules/ops/types";
@@ -186,6 +187,14 @@ export function SuppliersView() {
                   )}
                 </div>
                 <SupplierLineRow s={s} accounts={accounts.data} mon={mon.data} />
+                {s.wallet ? (
+                  <div className="flex items-center gap-2 border-t pt-2 text-xs">
+                    <span className="text-muted-foreground">余额</span>
+                    <span className="font-medium tabular-nums">{amt(s.wallet.actual)}</span>
+                    <span className="text-muted-foreground">· {s.wallet.count} 个 Key</span>
+                    {s.wallet.errors ? <span className="text-danger">· {s.wallet.errors} 个抓取失败</span> : null}
+                  </div>
+                ) : null}
                 {s.monitor_count ? (
                   <div className="text-muted-foreground text-xs">接口监测 {s.monitor_count} 项</div>
                 ) : null}

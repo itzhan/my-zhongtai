@@ -14,6 +14,7 @@ import type {
   MonitorResp,
   Supplier,
   SupplierMonitor,
+  SupplierWallet,
 } from "./types";
 
 export const qk = {
@@ -32,6 +33,7 @@ export const qk = {
   suppliers: (q: string, category: string) => ["ops", "suppliers", q, category] as const,
   supplier: (id: number) => ["ops", "supplier", id] as const,
   supplierMonitors: ["ops", "supplier-monitors"] as const,
+  supplierWallets: (supplierId: number) => ["ops", "supplier-wallets", supplierId] as const,
 };
 
 export const useEnv = () =>
@@ -83,6 +85,11 @@ export const useSupplier = (id: number) =>
     queryKey: qk.supplier(id),
     queryFn: () => get<Supplier & { monitors: SupplierMonitor[] }>(`/suppliers/${id}`),
     retry: false,
+  });
+export const useSupplierWallets = (supplierId = 0) =>
+  useQuery({
+    queryKey: qk.supplierWallets(supplierId),
+    queryFn: () => get<SupplierWallet[]>(`/supplier-wallets${supplierId ? `?supplier_id=${supplierId}` : ""}`),
   });
 export const useSupplierMonitors = () =>
   useQuery({

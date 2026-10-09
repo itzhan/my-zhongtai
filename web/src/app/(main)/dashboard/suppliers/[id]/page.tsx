@@ -5,7 +5,7 @@ import { use, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
-import { ArrowLeft, ExternalLink, Pencil, Plus, Trash2 } from "lucide-react";
+import { ArrowLeft, ExternalLink, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -31,8 +31,9 @@ import {
   SupplierDialog,
   goodsTone,
 } from "@/modules/ops/components/supplier-dialogs";
+import { WalletDialog, WalletTable, amt } from "@/modules/ops/components/supplier-wallets";
 import { readErr, time } from "@/modules/ops/format";
-import { useAccounts, useInvalidate, useMonitor, useSupplier } from "@/modules/ops/hooks";
+import { useAccounts, useInvalidate, useMonitor, useSupplier, useSupplierWallets } from "@/modules/ops/hooks";
 import { useTabTitle, useTabsStore } from "@/stores/tabs/tab-store-provider";
 
 // 一行货物：名称 + 倍率，可改可删
@@ -97,6 +98,9 @@ export default function SupplierPage({ params }: { params: Promise<{ id: string 
   const [confirm, confirmEl] = useConfirm();
   const [editOpen, setEditOpen] = useState(false);
   const [monOpen, setMonOpen] = useState(false);
+  const [walletOpen, setWalletOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const wallets = useSupplierWallets(id);
   const [ng, setNg] = useState({ name: "", rate: "" });
   const removeTab = useTabsStore((st) => st.removeTab);
   useTabTitle(s?.name);
@@ -106,8 +110,20 @@ export default function SupplierPage({ params }: { params: Promise<{ id: string 
   const linkedIds = accounts.data ? supplierAccounts(s, accounts.data).linked.map((x) => x.account.id) : [];
   const changed = () => {
     refetch();
-    invalidate("suppliers", "supplier-monitors");
+    invalidate("suppliers", "supplier-monitors", "supplier-wallets");
   };
+  const refreshWallets = async () => {
+    setRefreshing(true);
+    try {
+      await post("/supplier-wallets/refresh", { supplier_id: id });
+      changed();
+    } catch (e) {
+      toast.error(readErr(e));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+  const walletTotal = (wallets.data ?? []).filter((w) => w.enabled).reduce((a, w) => a + (w.last_actual ?? 0), 0);
   const addGood = async () => {
     if (!ng.name.trim()) return toast.error("先填货物名称");
     try {
@@ -229,6 +245,34 @@ export default function SupplierPage({ params }: { params: Promise<{ id: string 
       </div>
       <Card>
         <CardHeader>
+          <CardTitle>余额</CardTitle>
+          <CardDescription>
+            在供应商站点（new-api / sub2api）的 Key 对应的钱包额度与倍率
+            {wallets.data?.length ? ` · 实际余额合计 ${amt(walletTotal)}` : ""}
+          </CardDescription>
+          <CardAction className="flex gap-2">
+            {wallets.data?.length ? (
+              <Button variant="outline" size="sm" onClick={refreshWallets} disabled={refreshing}>
+                <RefreshCw className={refreshing ? "animate-spin" : ""} />
+                {refreshing ? "抓取中…" : "全部刷新"}
+              </Button>
+            ) : null}
+            <Button variant="outline" size="sm" onClick={() => setWalletOpen(true)}>
+              <Plus />
+              添加
+            </Button>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          {wallets.data ? (
+            <WalletTable wallets={wallets.data} suppliers={[s]} onChanged={changed} />
+          ) : (
+            <Skeleton className="h-24" />
+          )}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
           <CardTitle>线路质量</CardTitle>
           <CardDescription>名下 sub2api 账号在监控大盘里近 24 小时的延迟评级（真实流量，每小时一格）</CardDescription>
           <CardAction>
@@ -261,6 +305,13 @@ export default function SupplierPage({ params }: { params: Promise<{ id: string 
         </CardContent>
       </Card>
       <SupplierDialog open={editOpen} onOpenChange={setEditOpen} supplier={s} onSaved={changed} />
+      <WalletDialog
+        open={walletOpen}
+        onOpenChange={setWalletOpen}
+        suppliers={[s]}
+        presetSupplier={id}
+        onSaved={changed}
+      />
       <MonitorDialog open={monOpen} onOpenChange={setMonOpen} suppliers={[s]} presetSupplier={id} onSaved={changed} />
       {confirmEl}
     </div>

@@ -132,6 +132,29 @@ export type Supplier = {
   goods: { id: number; name: string; rate: string }[];
   links?: { account_id: number; mode: "include" | "exclude" }[];
   monitor_count?: number;
+  wallet?: { count: number; actual: number | null; errors: number } | null;
+};
+
+// 供应商余额：我们在供应商站点（new-api / sub2api）的 Key 对应的钱包额度与倍率
+export type SupplierWallet = {
+  id: number;
+  supplier_id: number;
+  supplier_name?: string;
+  name: string;
+  platform: "newapi" | "sub2api";
+  base_url: string;
+  custom: boolean;
+  custom_ratio: number | null;
+  enabled: boolean;
+  has_key: boolean;
+  key_masked: string;
+  last_wallet: number | null;
+  last_wallet_kind: "" | "wallet" | "token" | "quota" | "subscription";
+  last_ratio: number | null;
+  last_ratio_source: string;
+  last_actual: number | null;
+  last_error: string;
+  last_checked_at: string | null;
 };
 
 export type SupplierSample = {

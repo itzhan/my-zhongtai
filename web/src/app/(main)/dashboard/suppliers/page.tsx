@@ -5,10 +5,12 @@ import { Suspense } from "react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Embedded, PageHeader, useTabParam } from "@/modules/ops/components/shared";
 import { SupplierMonitorView } from "@/modules/ops/views/supplier-monitor-view";
+import { SupplierWalletView } from "@/modules/ops/views/supplier-wallet-view";
 import { SuppliersView } from "@/modules/ops/views/suppliers-view";
 
 const TABS = [
   ["list", "供应商"],
+  ["wallet", "余额"],
   ["monitor", "接口监测"],
 ] as const;
 
@@ -20,7 +22,7 @@ function SuppliersInner() {
   );
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader title="供应商" description="供应商和他们能提供的货 · 线路质量 · 接口监测" />
+      <PageHeader title="供应商" description="供应商和他们能提供的货 · 余额 · 线路质量 · 接口监测" />
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           {TABS.map(([k, l]) => (
@@ -30,7 +32,9 @@ function SuppliersInner() {
           ))}
         </TabsList>
       </Tabs>
-      <Embedded>{tab === "list" ? <SuppliersView /> : <SupplierMonitorView />}</Embedded>
+      <Embedded>
+        {tab === "list" ? <SuppliersView /> : tab === "wallet" ? <SupplierWalletView /> : <SupplierMonitorView />}
+      </Embedded>
     </div>
   );
 }
