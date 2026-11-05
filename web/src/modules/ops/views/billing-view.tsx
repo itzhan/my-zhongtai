@@ -9,6 +9,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -18,6 +19,7 @@ import { OPS_API, get, qs } from "@/modules/ops/api";
 import { PageHeader, Pager, ResponsiveDialog, usePaged } from "@/modules/ops/components/shared";
 import { bigNum, discLabel, moneyFull, num, readErr, ymd } from "@/modules/ops/format";
 import { useCustomers } from "@/modules/ops/hooks";
+import { useOps } from "@/modules/ops/provider";
 import type { S2User } from "@/modules/ops/types";
 
 type Sums = {
@@ -33,6 +35,7 @@ type Summary = {
   total: Sums;
   by_user: (Sums & { user_id: number; email: string })[];
   by_model: (Sums & { model: string })[];
+  by_group: (Sums & { group_id: number | null; group_name: string })[];
   daily: { day: string; cost: number; requests: number }[];
   discount: number;
   final_cost: number;
@@ -148,11 +151,13 @@ function DiscountDialog({
 
 export function BillingView({ presetUsers }: { presetUsers?: { id: number; email: string }[] }) {
   const customers = useCustomers();
+  const { groups } = useOps();
   const [[start, end], setRange] = useState<[string, string]>(() => preset("month"));
   // 从客户详情进来时，预先选好该客户的用户
   const [users, setUsers] = useState<Map<number, string>>(
     () => new Map((presetUsers ?? []).map((u) => [u.id, u.email])),
   );
+  const [groupIds, setGroupIds] = useState<Set<number>>(new Set());
   const [search, setSearch] = useState("");
   const [results, setResults] = useState<S2User[] | null>(null);
   const [discOpen, setDiscOpen] = useState(false);
@@ -173,7 +178,14 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
     return () => clearTimeout(t);
   }, [search]);
 
-  const params = (disc: number) => qs({ start, end, user_ids: [...users.keys()].join(","), discount: disc });
+  const params = (disc: number) =>
+    qs({
+      start,
+      end,
+      user_ids: [...users.keys()].join(","),
+      group_ids: groupIds.size ? [...groupIds].join(",") : undefined,
+      discount: disc,
+    });
   const pull = async (disc: number) => {
     setDiscount(disc);
     setLoading(true);
@@ -189,6 +201,13 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
   const t = data?.total;
   const { rows: userRows, pager: userPager } = usePaged(data?.by_user ?? []);
   const { rows: modelRows, pager: modelPager } = usePaged(data?.by_model ?? []);
+  const { rows: groupRows, pager: groupPager } = usePaged(data?.by_group ?? []);
+  const groupHint = groupIds.size
+    ? `分组：${groups
+        .filter((g) => groupIds.has(g.id))
+        .map((g) => g.name)
+        .join("、")}`
+    : "全部分组";
   return (
     <div className="flex flex-col gap-6">
       <PageHeader title="账单" description="按北京时间整天统计；结算金额 = 按用户倍率计算后的实际扣费" />
@@ -216,6 +235,37 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
                 {l}
               </Button>
             ))}
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <Label>筛选分组</Label>
+              <span className="text-muted-foreground text-xs">
+                {groupIds.size ? `已选 ${groupIds.size} 个` : "未选则导出全部"}
+              </span>
+            </div>
+            <div className="grid max-h-40 gap-2 overflow-y-auto rounded-md border p-2 sm:grid-cols-3">
+              {groups.map((g) => (
+                <label key={g.id} className="flex items-center gap-2 text-sm">
+                  <Checkbox
+                    checked={groupIds.has(g.id)}
+                    onCheckedChange={(x) =>
+                      setGroupIds((s) => {
+                        const n = new Set(s);
+                        if (x) n.add(g.id);
+                        else n.delete(g.id);
+                        return n;
+                      })
+                    }
+                  />
+                  {g.name} <span className="text-muted-foreground text-xs">#{g.id}</span>
+                </label>
+              ))}
+            </div>
+            {groupIds.size ? (
+              <Button size="sm" variant="ghost" className="h-7 px-2" onClick={() => setGroupIds(new Set())}>
+                清空，导出全部
+              </Button>
+            ) : null}
           </div>
           <div className="space-y-2">
             <Label>结算用户</Label>
@@ -309,7 +359,7 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
           <Card>
             <CardHeader>
               <CardDescription>
-                {start} 至 {end} · {users.size} 个用户 ·{" "}
+                {start} 至 {end} · {users.size} 个用户 · {groupHint} ·{" "}
                 {data.discount === 1 ? "应付金额（无折扣）" : `折后应付金额（${discLabel(data.discount)}）`}
               </CardDescription>
               <CardTitle className="text-3xl font-semibold tabular-nums">{moneyFull(data.final_cost)}</CardTitle>
@@ -399,6 +449,51 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
                   </Table>
                 </div>
                 <Pager {...userPager} className="mt-3" />
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>按分组</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="overflow-x-auto rounded-md border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>分组</TableHead>
+                        <TableHead className="text-right">请求</TableHead>
+                        <TableHead className="text-right">结算金额</TableHead>
+                        <TableHead className="text-right">占比</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {data.by_group?.length ? (
+                        groupRows.map((g) => (
+                          <TableRow key={g.group_id ?? "none"}>
+                            <TableCell>
+                              {g.group_name}
+                              {g.group_id != null ? (
+                                <span className="text-muted-foreground text-xs"> #{g.group_id}</span>
+                              ) : null}
+                            </TableCell>
+                            <TableCell className="text-right tabular-nums">{num(g.requests)}</TableCell>
+                            <TableCell className="text-right tabular-nums">{moneyFull(g.cost)}</TableCell>
+                            <TableCell className="text-right tabular-nums">
+                              {t.cost ? `${((g.cost / t.cost) * 100).toFixed(1)}%` : "-"}
+                            </TableCell>
+                          </TableRow>
+                        ))
+                      ) : (
+                        <TableRow>
+                          <TableCell colSpan={4} className="text-muted-foreground py-6 text-center">
+                            无用量
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </div>
+                <Pager {...groupPager} className="mt-3" />
               </CardContent>
             </Card>
             <Card>

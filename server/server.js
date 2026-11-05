@@ -1001,21 +1001,36 @@ function billingParams(q) {
   if (end - start > 370 * 86400e3) throw httpError(400, "单次最多拉取一年");
   const userIds = String(q.user_ids || "").split(",").map(Number).filter(Boolean);
   if (!userIds.length) throw httpError(400, "请至少选择一个用户");
+  const groupIds = String(q.group_ids || "").split(",").map(Number).filter(Boolean);
   const discount = q.discount === undefined || q.discount === "" ? 1 : Number(q.discount);
   if (!(discount > 0 && discount <= 10)) throw httpError(400, "折扣系数无效（例：0.85 表示 85 折）");
-  return { start, end, userIds, discount };
+  return { start, end, userIds, groupIds, discount };
 }
 
-async function billingSummary({ start, end, userIds }) {
+function billingWhere({ start, end, userIds, groupIds }) {
   const args = [userIds, start, end];
-  const where = "u.user_id = ANY($1) AND u.created_at >= $2 AND u.created_at < $3";
+  let where = "u.user_id = ANY($1) AND u.created_at >= $2 AND u.created_at < $3";
+  if (groupIds.length) {
+    args.push(groupIds);
+    where += ` AND u.group_id = ANY($${args.length})`;
+  }
+  return { args, where };
+}
+
+async function billingSummary(p) {
+  const { args, where } = billingWhere(p);
   const sums = `count(*)::int AS requests, coalesce(sum(u.actual_cost),0)::float AS cost, coalesce(sum(u.total_cost),0)::float AS std_cost,
     coalesce(sum(u.input_tokens),0)::bigint AS input, coalesce(sum(u.output_tokens),0)::bigint AS output,
     coalesce(sum(u.cache_creation_tokens),0)::bigint AS cache_write, coalesce(sum(u.cache_read_tokens),0)::bigint AS cache_read`;
-  const [total, byUser, byModel, daily] = await Promise.all([
+  const [total, byUser, byModel, byGroup, daily] = await Promise.all([
     pool.query(`SELECT ${sums} FROM usage_logs u WHERE ${where}`, args),
     pool.query(`SELECT u.user_id, us.email, ${sums} FROM usage_logs u LEFT JOIN users us ON us.id = u.user_id WHERE ${where} GROUP BY 1, 2 ORDER BY cost DESC`, args),
     pool.query(`SELECT u.model, ${sums} FROM usage_logs u WHERE ${where} GROUP BY 1 ORDER BY cost DESC`, args),
+    pool.query(
+      `SELECT u.group_id, coalesce(g.name, '未分组') AS group_name, ${sums}
+         FROM usage_logs u LEFT JOIN groups g ON g.id = u.group_id WHERE ${where} GROUP BY 1, 2 ORDER BY cost DESC`,
+      args
+    ),
     pool.query(
       `SELECT to_char(date_trunc('day', u.created_at AT TIME ZONE '${TZ}'), 'YYYY-MM-DD') AS day, u.user_id, ${sums}
          FROM usage_logs u WHERE ${where} GROUP BY 1, 2 ORDER BY 1, 2`,
@@ -1023,10 +1038,10 @@ async function billingSummary({ start, end, userIds }) {
     ),
   ]);
   // 选中但没有用量的用户也列出来
-  const { rows: users } = await pool.query("SELECT id, email FROM users WHERE id = ANY($1)", [userIds]);
+  const { rows: users } = await pool.query("SELECT id, email FROM users WHERE id = ANY($1)", [p.userIds]);
   const seen = new Set(byUser.rows.map((r) => r.user_id));
   for (const u of users) if (!seen.has(u.id)) byUser.rows.push({ user_id: u.id, email: u.email, requests: 0, cost: 0, std_cost: 0, input: 0, output: 0, cache_write: 0, cache_read: 0 });
-  return { total: total.rows[0], by_user: byUser.rows, by_model: byModel.rows, daily: daily.rows };
+  return { total: total.rows[0], by_user: byUser.rows, by_model: byModel.rows, by_group: byGroup.rows, daily: daily.rows };
 }
 
 app.get("/api/billing/summary", wrap(async (req) => {
@@ -1049,8 +1064,9 @@ app.get("/api/billing/export", async (req, res) => {
     const p = billingParams(req.query);
     const sum = await billingSummary(p);
     const tag = `${req.query.start}_${req.query.end}`;
+    const groupTag = p.groupIds.length ? `_分组${p.groupIds.join("-")}` : "";
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(`账单_${tag}${p.discount !== 1 ? `_${+(p.discount * 10).toFixed(2)}折` : ""}.xlsx`)}`);
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(`账单_${tag}${p.discount !== 1 ? `_${+(p.discount * 10).toFixed(2)}折` : ""}${groupTag}.xlsx`)}`);
     const wb = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res, useStyles: true });
     const head = (ws) => { ws.getRow(1).font = { bold: true }; ws.getRow(1).commit(); };
     const money = "$#,##0.000000";
@@ -1076,12 +1092,16 @@ app.get("/api/billing/export", async (req, res) => {
     totalRow.commit();
     s1.addRow({}).commit();
     const discTxt = p.discount === 1 ? "无折扣" : `${+(p.discount * 10).toFixed(2)} 折（系数 ${p.discount}）`;
+    const groupTxt = p.groupIds.length
+      ? (sum.by_group.map((g) => g.group_name).join("、") || p.groupIds.map((id) => `#${id}`).join("、"))
+      : "全部";
     for (const [k, v, bold] of [
       ["账单区间", `${req.query.start} 00:00 至 ${req.query.end} 24:00（北京时间）`],
+      ["筛选分组", groupTxt],
       ["原结算合计", `$${sum.total.cost.toFixed(6)}`],
       ["折扣", discTxt],
       ["折后应付合计", `$${(sum.total.cost * p.discount).toFixed(2)}`, true],
-      ["说明", "结算金额 = 按用户倍率计算后的实际用量费用；折后金额 = 结算金额 × 折扣系数；标准费用 = 倍率前的原价"],
+      ["说明", "结算金额 = 按用户倍率计算后的实际用量费用；折后金额 = 结算金额 × 折扣系数；标准费用 = 倍率前的原价；未选分组则统计全部"],
     ]) {
       const r = s1.addRow({ user_id: k, email: v });
       if (bold) r.font = { bold: true, size: 13 };
@@ -1097,16 +1117,23 @@ app.get("/api/billing/export", async (req, res) => {
     for (const r of sum.daily) s2.addRow(num({ ...r, email: emailOf[r.user_id] })).commit();
     s2.commit();
 
-    // 3. 按模型
-    const s3 = wb.addWorksheet("按模型");
-    s3.columns = [{ header: "模型", key: "model", width: 30 }, ...tokenCols];
+    // 3. 按分组
+    const s3 = wb.addWorksheet("按分组");
+    s3.columns = [{ header: "分组ID", key: "group_id", width: 10 }, { header: "分组", key: "group_name", width: 24 }, ...tokenCols];
     head(s3);
-    for (const r of sum.by_model) s3.addRow(num(r)).commit();
+    for (const r of sum.by_group) s3.addRow(num(r)).commit();
     s3.commit();
 
-    // 4. 请求明细：分批读，流式写出
-    const s4 = wb.addWorksheet("请求明细");
-    s4.columns = [
+    // 4. 按模型
+    const s4m = wb.addWorksheet("按模型");
+    s4m.columns = [{ header: "模型", key: "model", width: 30 }, ...tokenCols];
+    head(s4m);
+    for (const r of sum.by_model) s4m.addRow(num(r)).commit();
+    s4m.commit();
+
+    // 5. 请求明细：分批读，流式写出
+    const s5 = wb.addWorksheet("请求明细");
+    s5.columns = [
       { header: "时间(北京)", key: "t", width: 20 }, { header: "用户ID", key: "user_id", width: 9 }, { header: "用户邮箱", key: "email", width: 26 },
       { header: "API Key", key: "key_name", width: 18 }, { header: "分组", key: "group_name", width: 16 }, { header: "模型", key: "model", width: 26 },
       { header: "输入", key: "input_tokens", width: 10 }, { header: "输出", key: "output_tokens", width: 10 }, { header: "缓存写", key: "cache_creation_tokens", width: 10 },
@@ -1115,27 +1142,30 @@ app.get("/api/billing/export", async (req, res) => {
       { header: `折后金额($)×${p.discount}`, key: "final", width: 16, style: { numFmt: money } },
       { header: "流式", key: "stream", width: 6 }, { header: "耗时(ms)", key: "duration_ms", width: 10 }, { header: "请求ID", key: "request_id", width: 40 },
     ];
-    head(s4);
+    head(s5);
     // 逐个用户按 (created_at, id) 游标分页，走 (user_id, created_at) 索引；按 id 分页会沿主键扫全表，大表下极慢
     // 游标时间用文本传回，避免 JS Date 丢掉微秒导致漏行/重行
+    const groupFilterSql = p.groupIds.length ? " AND u.group_id = ANY($6)" : "";
     for (const userId of p.userIds) {
       let lastAt = p.start, lastId = 0;
       for (;;) {
+        const detailArgs = [userId, p.start, p.end, lastAt, lastId];
+        if (p.groupIds.length) detailArgs.push(p.groupIds);
         const { rows } = await pool.query(
           `SELECT u.id, u.created_at::text AS cursor_at, to_char(u.created_at AT TIME ZONE '${TZ}', 'YYYY-MM-DD HH24:MI:SS') AS t, u.user_id, us.email, k.name AS key_name, g.name AS group_name, u.model,
                   u.input_tokens, u.output_tokens, u.cache_creation_tokens, u.cache_read_tokens, u.total_cost::float, u.rate_multiplier::float, u.actual_cost::float,
                   u.stream, u.duration_ms, u.request_id
              FROM usage_logs u LEFT JOIN users us ON us.id = u.user_id LEFT JOIN api_keys k ON k.id = u.api_key_id LEFT JOIN groups g ON g.id = u.group_id
-            WHERE u.user_id = $1 AND u.created_at >= $2 AND u.created_at < $3 AND (u.created_at, u.id) > ($4::timestamptz, $5)
+            WHERE u.user_id = $1 AND u.created_at >= $2 AND u.created_at < $3 AND (u.created_at, u.id) > ($4::timestamptz, $5)${groupFilterSql}
             ORDER BY u.user_id, u.created_at, u.id LIMIT 5000`,
-          [userId, p.start, p.end, lastAt, lastId]
+          detailArgs
         );
         if (!rows.length) break;
-        for (const r of rows) s4.addRow({ ...r, final: (r.actual_cost || 0) * p.discount, stream: r.stream ? "是" : "否" }).commit();
+        for (const r of rows) s5.addRow({ ...r, final: (r.actual_cost || 0) * p.discount, stream: r.stream ? "是" : "否" }).commit();
         ({ cursor_at: lastAt, id: lastId } = rows[rows.length - 1]);
       }
     }
-    s4.commit();
+    s5.commit();
     await wb.commit();
   } catch (e) {
     if (!res.headersSent) res.status(e.status || 500).json({ error: e.message });
