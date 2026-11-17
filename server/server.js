@@ -51,6 +51,18 @@ const pool = new pg.Pool({
   database: env("PG_DB", "sub2api"),
   max: 5,
 });
+// 11.6 之前的用量在独立历史库（与 8082 无关）。现网 usage_logs 最早 2026-11-06 08:00+08 = UTC 00:00
+const HIST_UNTIL = new Date(env("PG_HIST_UNTIL", "2026-11-06T00:00:00.000Z"));
+const histPool = env("PG_HIST_HOST")
+  ? new pg.Pool({
+      host: env("PG_HIST_HOST"),
+      port: Number(env("PG_HIST_PORT", 5435)),
+      user: env("PG_HIST_USER", "hist"),
+      password: env("PG_HIST_PASSWORD"),
+      database: env("PG_HIST_DB", "sub2api_hist"),
+      max: 3,
+    })
+  : null;
 
 // ---------- 客户存储（JSON 文件） ----------
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -1029,32 +1041,71 @@ function billingWhere({ start, end, userIds, groupIds }) {
   }
   return { args, where };
 }
+function billingWindows(p) {
+  const out = [];
+  if (histPool && p.start < HIST_UNTIL) out.push({ pool: histPool, start: p.start, end: p.end < HIST_UNTIL ? p.end : HIST_UNTIL });
+  const liveStart = histPool && p.start < HIST_UNTIL ? HIST_UNTIL : p.start;
+  if (liveStart < p.end) out.push({ pool, start: liveStart, end: p.end });
+  return out.length ? out : [{ pool, start: p.start, end: p.end }];
+}
+const SUM_KEYS = ["requests", "cost", "std_cost", "input", "output", "cache_write", "cache_read"];
+function addSums(a, b) {
+  const o = { ...a };
+  for (const k of SUM_KEYS) o[k] = Number(a[k] || 0) + Number(b[k] || 0);
+  return o;
+}
+function mergeBy(rows, keyFn) {
+  const m = new Map();
+  for (const r of rows) {
+    const k = keyFn(r);
+    m.set(k, m.has(k) ? addSums(m.get(k), r) : { ...r });
+  }
+  return [...m.values()];
+}
+async function billingQueryAll(p, sql) {
+  const rows = [];
+  for (const w of billingWindows(p)) {
+    const { args, where } = billingWhere({ ...p, start: w.start, end: w.end });
+    rows.push(...(await w.pool.query(sql(where), args)).rows);
+  }
+  return rows;
+}
 
 async function billingSummary(p) {
-  const { args, where } = billingWhere(p);
   const sums = `count(*)::int AS requests, coalesce(sum(u.actual_cost),0)::float AS cost, coalesce(sum(u.total_cost),0)::float AS std_cost,
     coalesce(sum(u.input_tokens),0)::bigint AS input, coalesce(sum(u.output_tokens),0)::bigint AS output,
     coalesce(sum(u.cache_creation_tokens),0)::bigint AS cache_write, coalesce(sum(u.cache_read_tokens),0)::bigint AS cache_read`;
-  const [total, byUser, byModel, byGroup, daily] = await Promise.all([
-    pool.query(`SELECT ${sums} FROM usage_logs u WHERE ${where}`, args),
-    pool.query(`SELECT u.user_id, us.email, ${sums} FROM usage_logs u LEFT JOIN users us ON us.id = u.user_id WHERE ${where} GROUP BY 1, 2 ORDER BY cost DESC`, args),
-    pool.query(`SELECT u.model, ${sums} FROM usage_logs u WHERE ${where} GROUP BY 1 ORDER BY cost DESC`, args),
-    pool.query(
-      `SELECT u.group_id, coalesce(g.name, '未分组') AS group_name, ${sums}
-         FROM usage_logs u LEFT JOIN groups g ON g.id = u.group_id WHERE ${where} GROUP BY 1, 2 ORDER BY cost DESC`,
-      args
-    ),
-    pool.query(
-      `SELECT to_char(date_trunc('day', u.created_at AT TIME ZONE '${TZ}'), 'YYYY-MM-DD') AS day, u.user_id, ${sums}
-         FROM usage_logs u WHERE ${where} GROUP BY 1, 2 ORDER BY 1, 2`,
-      args
+  const [totalRows, byUser, byModel, byGroup, daily] = await Promise.all([
+    billingQueryAll(p, (where) => `SELECT ${sums} FROM usage_logs u WHERE ${where}`),
+    billingQueryAll(p, (where) => `SELECT u.user_id, ${sums} FROM usage_logs u WHERE ${where} GROUP BY 1`),
+    billingQueryAll(p, (where) => `SELECT u.model, ${sums} FROM usage_logs u WHERE ${where} GROUP BY 1`),
+    billingQueryAll(p, (where) => `SELECT u.group_id, ${sums} FROM usage_logs u WHERE ${where} GROUP BY 1`),
+    billingQueryAll(
+      p,
+      (where) =>
+        `SELECT to_char(date_trunc('day', u.created_at AT TIME ZONE '${TZ}'), 'YYYY-MM-DD') AS day, u.user_id, ${sums}
+           FROM usage_logs u WHERE ${where} GROUP BY 1, 2`,
     ),
   ]);
-  // 选中但没有用量的用户也列出来
+  const total = totalRows.reduce((a, r) => addSums(a, r), { requests: 0, cost: 0, std_cost: 0, input: 0, output: 0, cache_write: 0, cache_read: 0 });
   const { rows: users } = await pool.query("SELECT id, email FROM users WHERE id = ANY($1)", [p.userIds]);
-  const seen = new Set(byUser.rows.map((r) => r.user_id));
-  for (const u of users) if (!seen.has(u.id)) byUser.rows.push({ user_id: u.id, email: u.email, requests: 0, cost: 0, std_cost: 0, input: 0, output: 0, cache_write: 0, cache_read: 0 });
-  return { total: total.rows[0], by_user: byUser.rows, by_model: byModel.rows, by_group: byGroup.rows, daily: daily.rows };
+  const emailOf = Object.fromEntries(users.map((u) => [u.id, u.email]));
+  const { rows: groups } = await pool.query("SELECT id, name FROM groups");
+  const groupName = Object.fromEntries(groups.map((g) => [g.id, g.name]));
+  const byUserMerged = mergeBy(byUser, (r) => r.user_id)
+    .map((r) => ({ ...r, email: emailOf[r.user_id] || `#${r.user_id}` }))
+    .sort((a, b) => b.cost - a.cost);
+  const seen = new Set(byUserMerged.map((r) => r.user_id));
+  for (const u of users) if (!seen.has(u.id)) byUserMerged.push({ user_id: u.id, email: u.email, requests: 0, cost: 0, std_cost: 0, input: 0, output: 0, cache_write: 0, cache_read: 0 });
+  return {
+    total,
+    by_user: byUserMerged,
+    by_model: mergeBy(byModel, (r) => r.model).sort((a, b) => b.cost - a.cost),
+    by_group: mergeBy(byGroup, (r) => r.group_id ?? "none")
+      .map((r) => ({ ...r, group_name: r.group_id == null ? "未分组" : groupName[r.group_id] || `#${r.group_id}` }))
+      .sort((a, b) => b.cost - a.cost),
+    daily: mergeBy(daily, (r) => `${r.day}\t${r.user_id}`).sort((a, b) => a.day.localeCompare(b.day) || a.user_id - b.user_id),
+  };
 }
 
 app.get("/api/billing/summary", wrap(async (req) => {
@@ -1158,24 +1209,43 @@ app.get("/api/billing/export", async (req, res) => {
     head(s5);
     // 逐个用户按 (created_at, id) 游标分页，走 (user_id, created_at) 索引；按 id 分页会沿主键扫全表，大表下极慢
     // 游标时间用文本传回，避免 JS Date 丢掉微秒导致漏行/重行
+    // 历史库没有 users/keys/groups，名称一律用现网对照
     const groupFilterSql = p.groupIds.length ? " AND u.group_id = ANY($6)" : "";
+    const [{ rows: keyRows }, { rows: groupRows }] = await Promise.all([
+      pool.query("SELECT id, name FROM api_keys WHERE user_id = ANY($1)", [p.userIds]),
+      pool.query("SELECT id, name FROM groups"),
+    ]);
+    const keyName = Object.fromEntries(keyRows.map((k) => [k.id, k.name]));
+    const groupNameOf = Object.fromEntries(groupRows.map((g) => [g.id, g.name]));
+    const emailOfLive = Object.fromEntries(sum.by_user.map((u) => [u.user_id, u.email]));
     for (const userId of p.userIds) {
-      let lastAt = p.start, lastId = 0;
-      for (;;) {
-        const detailArgs = [userId, p.start, p.end, lastAt, lastId];
-        if (p.groupIds.length) detailArgs.push(p.groupIds);
-        const { rows } = await pool.query(
-          `SELECT u.id, u.created_at::text AS cursor_at, to_char(u.created_at AT TIME ZONE '${TZ}', 'YYYY-MM-DD HH24:MI:SS') AS t, u.user_id, us.email, k.name AS key_name, g.name AS group_name, u.model,
-                  u.input_tokens, u.output_tokens, u.cache_creation_tokens, u.cache_read_tokens, u.total_cost::float, u.rate_multiplier::float, u.actual_cost::float,
-                  u.stream, u.duration_ms, u.request_id
-             FROM usage_logs u LEFT JOIN users us ON us.id = u.user_id LEFT JOIN api_keys k ON k.id = u.api_key_id LEFT JOIN groups g ON g.id = u.group_id
-            WHERE u.user_id = $1 AND u.created_at >= $2 AND u.created_at < $3 AND (u.created_at, u.id) > ($4::timestamptz, $5)${groupFilterSql}
-            ORDER BY u.user_id, u.created_at, u.id LIMIT 5000`,
-          detailArgs
-        );
-        if (!rows.length) break;
-        for (const r of rows) s5.addRow({ ...r, final: (r.actual_cost || 0) * p.discount, stream: r.stream ? "是" : "否" }).commit();
-        ({ cursor_at: lastAt, id: lastId } = rows[rows.length - 1]);
+      for (const w of billingWindows(p)) {
+        let lastAt = w.start, lastId = 0;
+        for (;;) {
+          const detailArgs = [userId, w.start, w.end, lastAt, lastId];
+          if (p.groupIds.length) detailArgs.push(p.groupIds);
+          const { rows } = await w.pool.query(
+            `SELECT u.id, u.created_at::text AS cursor_at, to_char(u.created_at AT TIME ZONE '${TZ}', 'YYYY-MM-DD HH24:MI:SS') AS t, u.user_id, u.api_key_id, u.group_id, u.model,
+                    u.input_tokens, u.output_tokens, u.cache_creation_tokens, u.cache_read_tokens, u.total_cost::float, u.rate_multiplier::float, u.actual_cost::float,
+                    u.stream, u.duration_ms, u.request_id
+               FROM usage_logs u
+              WHERE u.user_id = $1 AND u.created_at >= $2 AND u.created_at < $3 AND (u.created_at, u.id) > ($4::timestamptz, $5)${groupFilterSql}
+              ORDER BY u.user_id, u.created_at, u.id LIMIT 5000`,
+            detailArgs
+          );
+          if (!rows.length) break;
+          for (const r of rows) {
+            s5.addRow({
+              ...r,
+              email: emailOfLive[r.user_id] || `#${r.user_id}`,
+              key_name: keyName[r.api_key_id] || "",
+              group_name: r.group_id == null ? "未分组" : groupNameOf[r.group_id] || `#${r.group_id}`,
+              final: (r.actual_cost || 0) * p.discount,
+              stream: r.stream ? "是" : "否",
+            }).commit();
+          }
+          ({ cursor_at: lastAt, id: lastId } = rows[rows.length - 1]);
+        }
       }
     }
     s5.commit();
