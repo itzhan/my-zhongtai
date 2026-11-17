@@ -271,11 +271,24 @@ app.get("/api/monitor/user-rpm", wrap(async () =>
 ));
 app.get("/api/env", (req, res) => res.json({ readonly: READONLY, jobs: READONLY ? "observe" : "full" }));
 
+function s2UserView(u) {
+  return { id: u.id, email: u.email, username: u.username, balance: u.balance, status: u.status, allowed_groups: u.allowed_groups || [], last_active_at: u.last_active_at };
+}
 app.get("/api/s2/users", wrap(async (req) => {
+  if (req.query.ids) {
+    const ids = [...new Set(String(req.query.ids).split(",").map(Number).filter(Boolean))].slice(0, 50);
+    return Promise.all(ids.map(async (id) => {
+      try {
+        return s2UserView(await s2("GET", `/admin/users/${id}`));
+      } catch {
+        return { id, email: `#${id}`, allowed_groups: [], missing: true };
+      }
+    }));
+  }
   const q = new URLSearchParams({ page: "1", page_size: "30" });
   if (req.query.search) q.set("search", req.query.search);
   const d = await s2("GET", `/admin/users?${q}`);
-  return d.items.map((u) => ({ id: u.id, email: u.email, username: u.username, balance: u.balance, status: u.status, allowed_groups: u.allowed_groups, last_active_at: u.last_active_at }));
+  return d.items.map(s2UserView);
 }));
 
 app.post("/api/s2/users", wrap(async (req) => {

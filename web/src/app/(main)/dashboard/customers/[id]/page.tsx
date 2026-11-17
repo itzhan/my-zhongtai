@@ -93,7 +93,14 @@ function CustomerInner({ id }: { id: string }) {
           <TabsContent value="billing">
             {tab === "billing" ? (
               <Embedded>
-                <BillingView presetUsers={ov.users.map((u) => ({ id: u.id, email: u.email }))} />
+                <BillingView
+                  customerId={id}
+                  presetUsers={ov.users.map((u) => ({
+                    id: u.id,
+                    email: u.email,
+                    allowed_groups: u.allowed_groups,
+                  }))}
+                />
               </Embedded>
             ) : null}
           </TabsContent>

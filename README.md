@@ -1,6 +1,6 @@
 # 运维中台
 
-在 sub2api（juhecode.cn）之上管理客户、分组、上游账号、智能调度、账单，并提供**延迟监控**与**供应商管理**。
+在 sub2api 之上管理客户、分组、上游账号、智能调度、账单，并提供**延迟监控**与**供应商管理**。
 由原「客户中台」（`../kehu-zhongtai`，纯 JS）迁移而来，界面换成 shadmin（Next.js + shadcn/ui），前后端完全独立。
 
 ```
@@ -79,7 +79,7 @@ NODE_OPTIONS=--max-old-space-size=2048 OPS_API_URL=http://127.0.0.1:3400 pnpm de
 
 ## 部署（服务器通过 GitHub 更新）
 
-仓库根目录的 `docker-compose.yml` 起两个容器：`ops-server`（后端，只在容器网络内，接入 sub2api 的 Docker 网络）和 `ops-web`（前端，对外 3190）。
+仓库根目录的 `docker-compose.yml` 起两个容器：`ops-server`（后端，只在容器网络内，接入 sub2api 的 Docker 网络）和 `ops-web`（前端只绑本机 3190，经 nginx `ops.juhecode.cn` 对外）。
 
 首次部署：
 

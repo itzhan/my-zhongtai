@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { Download, X } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
@@ -18,7 +18,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { OPS_API, get, qs } from "@/modules/ops/api";
 import { PageHeader, Pager, ResponsiveDialog, usePaged } from "@/modules/ops/components/shared";
 import { bigNum, discLabel, moneyFull, num, readErr, ymd } from "@/modules/ops/format";
-import { useCustomers } from "@/modules/ops/hooks";
+import { useCustomerChannels, useCustomers } from "@/modules/ops/hooks";
 import { useOps } from "@/modules/ops/provider";
 import type { S2User } from "@/modules/ops/types";
 
@@ -149,13 +149,22 @@ function DiscountDialog({
   );
 }
 
-export function BillingView({ presetUsers }: { presetUsers?: { id: number; email: string }[] }) {
+type BillUser = { email: string; allowed_groups?: number[] };
+
+export function BillingView({
+  presetUsers,
+  customerId,
+}: {
+  presetUsers?: { id: number; email: string; allowed_groups?: number[] }[];
+  customerId?: string;
+}) {
   const customers = useCustomers();
   const { groups } = useOps();
+  const channels = useCustomerChannels(customerId ?? "", Boolean(customerId));
   const [[start, end], setRange] = useState<[string, string]>(() => preset("month"));
   // 从客户详情进来时，预先选好该客户的用户
-  const [users, setUsers] = useState<Map<number, string>>(
-    () => new Map((presetUsers ?? []).map((u) => [u.id, u.email])),
+  const [users, setUsers] = useState<Map<number, BillUser>>(
+    () => new Map((presetUsers ?? []).map((u) => [u.id, { email: u.email, allowed_groups: u.allowed_groups }])),
   );
   const [groupIds, setGroupIds] = useState<Set<number>>(new Set());
   const [search, setSearch] = useState("");
@@ -177,6 +186,63 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
     );
     return () => clearTimeout(t);
   }, [search]);
+
+  // 搜索/按客户添加时可能没有 allowed_groups，补拉一次
+  const missingGroupPerms = [...users].filter(([, u]) => u.allowed_groups === undefined).map(([id]) => id);
+  useEffect(() => {
+    if (!missingGroupPerms.length) return;
+    let cancelled = false;
+    const ids = missingGroupPerms;
+    get<S2User[]>(`/s2/users?ids=${ids.join(",")}`)
+      .then((list) => {
+        if (cancelled) return;
+        const found = new Map(list.map((u) => [u.id, u]));
+        setUsers((m) => {
+          const n = new Map(m);
+          for (const id of ids) {
+            const cur = n.get(id);
+            if (!cur || cur.allowed_groups !== undefined) continue;
+            const u = found.get(id);
+            n.set(id, { email: cur.email || u?.email || `#${id}`, allowed_groups: u?.allowed_groups ?? [] });
+          }
+          return n;
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setUsers((m) => {
+          const n = new Map(m);
+          for (const id of ids) {
+            const cur = n.get(id);
+            if (cur && cur.allowed_groups === undefined) n.set(id, { ...cur, allowed_groups: [] });
+          }
+          return n;
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [missingGroupPerms.join(",")]);
+
+  // 客户账单：优先用该客户 Key 绑定的分组；否则只用用户 allowed_groups。不列出全站公开分组。
+  const groupsLoading =
+    (users.size > 0 && missingGroupPerms.length > 0) || Boolean(customerId && channels.isLoading);
+  const filterGroups = useMemo(() => {
+    if (!users.size || groupsLoading) return [];
+    if (channels.data?.groups.length) return channels.data.groups;
+    const allowed = new Set<number>();
+    for (const u of users.values()) for (const gid of u.allowed_groups ?? []) allowed.add(gid);
+    return groups.filter((g) => allowed.has(g.id));
+  }, [users, groups, groupsLoading, channels.data]);
+
+  useEffect(() => {
+    if (groupsLoading) return;
+    const ok = new Set(filterGroups.map((g) => g.id));
+    setGroupIds((s) => {
+      const n = new Set([...s].filter((id) => ok.has(id)));
+      return n.size === s.size ? s : n;
+    });
+  }, [filterGroups, groupsLoading]);
 
   const params = (disc: number) =>
     qs({
@@ -203,7 +269,7 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
   const { rows: modelRows, pager: modelPager } = usePaged(data?.by_model ?? []);
   const { rows: groupRows, pager: groupPager } = usePaged(data?.by_group ?? []);
   const groupHint = groupIds.size
-    ? `分组：${groups
+    ? `分组：${filterGroups
         .filter((g) => groupIds.has(g.id))
         .map((g) => g.name)
         .join("、")}`
@@ -240,26 +306,34 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
             <div className="flex items-center justify-between gap-2">
               <Label>筛选分组</Label>
               <span className="text-muted-foreground text-xs">
-                {groupIds.size ? `已选 ${groupIds.size} 个` : "未选则导出全部"}
+                {groupIds.size ? `已选 ${groupIds.size} 个` : "未选则导出全部用量"}
               </span>
             </div>
             <div className="grid max-h-40 gap-2 overflow-y-auto rounded-md border p-2 sm:grid-cols-3">
-              {groups.map((g) => (
-                <label key={g.id} className="flex items-center gap-2 text-sm">
-                  <Checkbox
-                    checked={groupIds.has(g.id)}
-                    onCheckedChange={(x) =>
-                      setGroupIds((s) => {
-                        const n = new Set(s);
-                        if (x) n.add(g.id);
-                        else n.delete(g.id);
-                        return n;
-                      })
-                    }
-                  />
-                  {g.name} <span className="text-muted-foreground text-xs">#{g.id}</span>
-                </label>
-              ))}
+              {!users.size ? (
+                <p className="text-muted-foreground col-span-full text-sm">请先选择结算用户，再筛选其可访问的分组</p>
+              ) : groupsLoading ? (
+                <p className="text-muted-foreground col-span-full text-sm">加载分组权限…</p>
+              ) : filterGroups.length ? (
+                filterGroups.map((g) => (
+                  <label key={g.id} className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={groupIds.has(g.id)}
+                      onCheckedChange={(x) =>
+                        setGroupIds((s) => {
+                          const n = new Set(s);
+                          if (x) n.add(g.id);
+                          else n.delete(g.id);
+                          return n;
+                        })
+                      }
+                    />
+                    {g.name} <span className="text-muted-foreground text-xs">#{g.id}</span>
+                  </label>
+                ))
+              ) : (
+                <p className="text-muted-foreground col-span-full text-sm">所选用户没有可筛选的专属分组</p>
+              )}
             </div>
             {groupIds.size ? (
               <Button size="sm" variant="ghost" className="h-7 px-2" onClick={() => setGroupIds(new Set())}>
@@ -271,12 +345,12 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
             <Label>结算用户</Label>
             <div className="flex flex-wrap gap-1.5">
               {users.size ? (
-                [...users].map(([id, email]) => (
+                [...users].map(([id, u]) => (
                   <span
                     key={id}
                     className="bg-muted inline-flex items-center gap-1 rounded-md py-0.5 pr-1 pl-2 text-sm"
                   >
-                    {email} <span className="text-muted-foreground text-xs">#{id}</span>
+                    {u.email} <span className="text-muted-foreground text-xs">#{id}</span>
                     <button
                       type="button"
                       onClick={() =>
@@ -307,7 +381,12 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
               value={PICK}
               onValueChange={(v) => {
                 const c = customers.data?.find((x) => x.id === v);
-                if (c) setUsers((m) => new Map([...m, ...c.users.map((u) => [u.id, u.email] as [number, string])]));
+                if (c)
+                  setUsers((m) => {
+                    const n = new Map(m);
+                    for (const u of c.users) if (!n.has(u.id)) n.set(u.id, { email: u.email });
+                    return n;
+                  });
               }}
             >
               <SelectTrigger className="w-56">
@@ -338,7 +417,9 @@ export function BillingView({ presetUsers }: { presetUsers?: { id: number; email
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={() => setUsers((m) => new Map(m).set(u.id, u.email))}
+                        onClick={() =>
+                          setUsers((m) => new Map(m).set(u.id, { email: u.email, allowed_groups: u.allowed_groups ?? [] }))
+                        }
                       >
                         选择
                       </Button>
