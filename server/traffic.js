@@ -148,8 +148,14 @@ export function registerTraffic({ app, wrap, httpError, dataDir, readonly, mainK
   const groupsOf = (site) => cached(`${site.id}:groups`, 30_000, () => call(site, "GET", "/admin/groups/all"));
   const accountsOf = (site) =>
     cached(`${site.id}:accounts`, 10_000, async () => {
-      const d = await call(site, "GET", `/admin/accounts?page=1&page_size=1000&timezone=${encodeURIComponent(TZ)}`);
-      return (d.items ?? []).map(accountView);
+      // scoped admin key 超过 page_size=100 会被打回默认 20，必须分页
+      const items = [];
+      for (let page = 1; page <= 30; page++) {
+        const d = await call(site, "GET", `/admin/accounts?page=${page}&page_size=100&timezone=${encodeURIComponent(TZ)}`);
+        items.push(...(d.items ?? []).map(accountView));
+        if (page >= (d.pages || 1) || !(d.items ?? []).length) break;
+      }
+      return items;
     });
 
   // ---------- 监控服务器设置 ----------
