@@ -12,6 +12,7 @@ import { createDetector } from "./detector.js";
 import { registerMonitor } from "./monitor.js";
 import { registerSuppliers } from "./suppliers.js";
 import { registerTraffic } from "./traffic.js";
+import { registerVerifier } from "./verifier.js";
 import ExcelJS from "exceljs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -19,7 +20,7 @@ const env = (k, d) => process.env[k] ?? d;
 
 const PORT = Number(env("PORT", 3190));
 const APP_PASSWORD = env("APP_PASSWORD");
-const SESSION_SECRET = env("SESSION_SECRET", crypto.randomBytes(32).toString("hex"));
+const SESSION_SECRET = env("SESSION_SECRET") || crypto.randomBytes(32).toString("hex");
 const S2_BASE = env("SUB2API_BASE", "http://sub2api-8082:8080/api/v1").replace(/\/$/, "");
 const S2_KEY = env("SUB2API_ADMIN_KEY");
 const DATA_DIR = env("DATA_DIR", path.join(__dirname, "data"));
@@ -141,8 +142,14 @@ function stripAccount(a) {
 }
 const getAccounts = () =>
   cached("accounts", 10000, async () => {
-    const d = await s2("GET", "/admin/accounts?page=1&page_size=1000&sort_by=priority&sort_order=asc");
-    return d.items.map(stripAccount);
+    // scoped admin key 超过 page_size=100 会被打回默认 20，必须分页
+    const items = [];
+    for (let page = 1; page <= 30; page++) {
+      const d = await s2("GET", `/admin/accounts?page=${page}&page_size=100&sort_by=priority&sort_order=asc`);
+      items.push(...(d.items || []).map(stripAccount));
+      if (page >= (d.pages || 1) || !(d.items || []).length) break;
+    }
+    return items;
   });
 async function getUserKeys(userId) {
   const d = await s2("GET", `/admin/users/${userId}/api-keys?page=1&page_size=200`);
@@ -156,28 +163,49 @@ function sign(payload) {
   return `${body}.${mac}`;
 }
 function verify(token) {
-  if (!token) return null;
-  const [body, mac] = token.split(".");
-  if (!body || !mac) return null;
-  const expect = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
-  if (mac.length !== expect.length || !crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(expect))) return null;
-  const p = JSON.parse(Buffer.from(body, "base64url").toString());
-  return p.exp > Date.now() ? p : null;
+  try {
+    if (!token) return null;
+    const [body, mac] = token.split(".");
+    if (!body || !mac) return null;
+    const expect = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
+    if (mac.length !== expect.length || !crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(expect))) return null;
+    const p = JSON.parse(Buffer.from(body, "base64url").toString());
+    return p.exp > Date.now() ? p : null;
+  } catch {
+    return null;
+  }
 }
 function readCookie(req, name) {
   const m = (req.headers.cookie || "").split(/;\s*/).find((c) => c.startsWith(name + "="));
   return m ? decodeURIComponent(m.slice(name.length + 1)) : null;
 }
+// 登录经 Next 反代：X-Forwarded-For 最右侧才是代理看到的真实客户端；取左侧可被请求头伪造，限流形同虚设
+function clientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string" && xff.trim()) {
+    const parts = xff.split(",").map((s) => s.trim()).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1];
+  }
+  return req.socket.remoteAddress || "unknown";
+}
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+const LOGIN_WINDOW_MS = 15 * 60_000;
+const LOGIN_MAX_FAILS = 5;
 const loginAttempts = new Map();
+function pruneLoginAttempts() {
+  if (loginAttempts.size < 2000) return;
+  const cutoff = Date.now() - LOGIN_WINDOW_MS;
+  for (const [k, v] of loginAttempts) if (v.t < cutoff) loginAttempts.delete(k);
+}
 app.post("/api/login", (req, res) => {
-  const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
+  pruneLoginAttempts();
+  const ip = clientIp(req);
   const a = loginAttempts.get(ip) || { n: 0, t: Date.now() };
-  if (Date.now() - a.t > 10 * 60000) Object.assign(a, { n: 0, t: Date.now() });
-  if (a.n >= 10) return res.status(429).json({ error: "尝试次数过多，请 10 分钟后再试" });
+  if (Date.now() - a.t > LOGIN_WINDOW_MS) Object.assign(a, { n: 0, t: Date.now() });
+  if (a.n >= LOGIN_MAX_FAILS) return res.status(429).json({ error: "尝试次数过多，请 15 分钟后再试" });
   const pw = String(req.body?.password || "");
   const ok = pw.length === APP_PASSWORD.length && crypto.timingSafeEqual(Buffer.from(pw), Buffer.from(APP_PASSWORD));
   if (!ok) {
@@ -186,8 +214,8 @@ app.post("/api/login", (req, res) => {
     return res.status(401).json({ error: "密码错误" });
   }
   loginAttempts.delete(ip);
-  const token = sign({ u: "admin", exp: Date.now() + 7 * 86400000 });
-  res.setHeader("Set-Cookie", `ops_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${7 * 86400}`);
+  const token = sign({ u: "admin", exp: Date.now() + 12 * 3600_000 });
+  res.setHeader("Set-Cookie", `ops_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${12 * 3600}`);
   res.json({ ok: true });
 });
 app.post("/api/logout", (req, res) => {
@@ -857,7 +885,11 @@ app.get("/api/proxies", wrap(async () => (await s2("GET", "/admin/proxies/all"))
 app.get("/api/accounts/:id/full", wrap(async (req) => {
   const id = parseInt(req.params.id);
   const a = await s2("GET", `/admin/accounts/${id}`);
-  const { account_groups, groups, ...acc } = a;
+  const { account_groups, groups, credentials, extra, ...acc } = a;
+  const cred = credentials && typeof credentials === "object" ? { ...credentials } : {};
+  for (const k of ["api_key", "access_token", "refresh_token", "session_key", "cookie"]) delete cred[k];
+  acc.credentials = cred;
+  acc.extra = extra && typeof extra === "object" ? extra : {};
   const [stats, errs, perf] = await Promise.all([
     pool.query(
       `SELECT count(*) FILTER (WHERE created_at >= $2)::int AS today_n, coalesce(sum(actual_cost) FILTER (WHERE created_at >= $2), 0)::float AS today_cost,
@@ -1259,6 +1291,7 @@ app.get("/api/billing/export", async (req, res) => {
 registerMonitor({ app, wrap, pool, getAccounts, httpError, ERROR_CLASS_SQL });
 registerSuppliers({ app, wrap, httpError, dataDir: DATA_DIR, jobs: !READONLY });
 registerTraffic({ app, wrap, httpError, dataDir: DATA_DIR, readonly: READONLY, mainKey: S2_KEY });
+registerVerifier({ app, wrap, httpError, dataDir: DATA_DIR, s2, pool, getAccounts, detector });
 
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 

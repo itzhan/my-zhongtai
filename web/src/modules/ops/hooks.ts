@@ -15,6 +15,9 @@ import type {
   Supplier,
   SupplierMonitor,
   SupplierWallet,
+  VerifyAccountInspect,
+  VerifyChannel,
+  VerifyRun,
 } from "./types";
 
 export const qk = {
@@ -34,6 +37,11 @@ export const qk = {
   supplier: (id: number) => ["ops", "supplier", id] as const,
   supplierMonitors: ["ops", "supplier-monitors"] as const,
   supplierWallets: (supplierId: number) => ["ops", "supplier-wallets", supplierId] as const,
+  verifyChannels: ["ops", "verify-channels"] as const,
+  verifyChannel: (code: string) => ["ops", "verify-channel", code] as const,
+  verifyInspect: (id: number) => ["ops", "verify-inspect", id] as const,
+  verifyRuns: (q: string) => ["ops", "verify-runs", q] as const,
+  verifyRun: (id: string) => ["ops", "verify-run", id] as const,
 };
 
 export const useEnv = () =>
@@ -97,6 +105,54 @@ export const useSupplierMonitors = () =>
     queryFn: () => get<SupplierMonitor[]>("/supplier-monitors"),
     refetchInterval: 60_000,
   });
+
+// 渠道鉴定（渠道真伪检测）
+export const useVerifyChannels = () =>
+  useQuery({
+    queryKey: qk.verifyChannels,
+    queryFn: () => get<VerifyChannel[]>("/verify/channels"),
+  });
+
+export const useVerifyChannel = (code: string) =>
+  useQuery({
+    queryKey: qk.verifyChannel(code),
+    queryFn: () => get<VerifyChannel>(`/verify/channels/${encodeURIComponent(code)}`),
+    enabled: Boolean(code),
+  });
+
+export const useVerifyAccountInspect = (accountId: number | null) =>
+  useQuery({
+    queryKey: qk.verifyInspect(accountId ?? 0),
+    queryFn: () => get<VerifyAccountInspect>(`/verify/accounts/${accountId}/inspect`),
+    enabled: Boolean(accountId && accountId > 0),
+    retry: false,
+  });
+
+export const useVerifyRuns = (filters: { channel_code?: string; verdict?: string; q?: string } = {}) => {
+  const query = qs(filters);
+  return useQuery({
+    queryKey: qk.verifyRuns(query),
+    queryFn: () => get<VerifyRun[]>(`/verify/runs${query ? `?${query}` : ""}`),
+    placeholderData: keepPreviousData,
+  });
+};
+
+export function useVerifyRun(runId: string | null) {
+  const qc = useQueryClient();
+  const q = useQuery({
+    queryKey: qk.verifyRun(runId ?? ""),
+    queryFn: () => get<VerifyRun>(`/verify/runs/${runId}`),
+    enabled: Boolean(runId),
+    refetchInterval: (query) => (query.state.data?.status === "running" ? 600 : false),
+  });
+  const status = q.data?.status;
+  useEffect(() => {
+    if (status === "done" || status === "error") {
+      void qc.invalidateQueries({ queryKey: ["ops", "verify-runs"] });
+    }
+  }, [status, qc]);
+  return q;
+}
 
 // 写操作后刷新某一类数据（前缀匹配）
 export function useInvalidate() {

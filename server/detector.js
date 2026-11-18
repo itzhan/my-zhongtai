@@ -258,6 +258,7 @@ export function createDetector({ s2, pool, dataDir, getGroupCfg, allGroupCfgs, g
 
   return {
     get alerts() { return alerts; },
+    getKey: (aid) => keys[aid] || "",
     keyInfo: (aid) => (keys[aid] ? { has_key: true, key_masked: mask(keys[aid]) } : { has_key: false }),
     latest: (aid) => results[aid]?.[0] || null,
     history: (aid) => results[aid] || [],

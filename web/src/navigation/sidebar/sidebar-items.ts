@@ -1,4 +1,4 @@
-import { Activity, Server, Settings, Truck, Users, type LucideIcon } from "lucide-react";
+import { Activity, Server, Settings, ShieldCheck, Truck, Users, type LucideIcon } from "lucide-react";
 
 export interface NavSubItem {
   title: string;
@@ -36,6 +36,7 @@ export const sidebarItems: NavGroup[] = [
     label: "运营",
     items: [
       { title: "渠道配置", url: "/dashboard/channels", icon: Server },
+      { title: "渠道鉴定", url: "/dashboard/verify", icon: ShieldCheck },
       { title: "客户", url: "/dashboard/customers", icon: Users },
       { title: "供应商", url: "/dashboard/suppliers", icon: Truck },
     ],

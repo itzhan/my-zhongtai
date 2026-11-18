@@ -185,3 +185,125 @@ export type SupplierMonitor = {
   samples: SupplierSample[];
   score: Grade;
 };
+
+// 渠道鉴定（渠道真伪检测）
+export type VerifyProtocol = "gemini_native" | "anthropic_messages" | "openai_chat" | "openai_responses";
+export type VerifyVerdict = "pending" | "authentic" | "suspicious" | "fake" | "inconclusive";
+
+export type VerifyProbe = {
+  id: string;
+  name: string;
+  kind: "baseline" | "fingerprint";
+  enabled: boolean;
+  request_desc: string;
+  expect_desc: string;
+  request_body: Record<string, unknown>;
+  fallback_on_200: Record<string, unknown> | null;
+  expect_status: number[];
+  match_mode: "all" | "any";
+  must_match: string[];
+  strong_match: string[];
+  counter_match: string[];
+  pass_200_hint: string;
+};
+
+export type VerifyChannel = {
+  code: string;
+  name: string;
+  platform_hint: string;
+  protocol: VerifyProtocol;
+  summary: string;
+  methodology_md: string;
+  pass_ratio: number;
+  probes: VerifyProbe[];
+  probe_count: number;
+  enabled_probe_count: number;
+  fingerprint_count: number;
+  ready: boolean;
+  version: number;
+  is_builtin: boolean;
+  builtin_version: number;
+  customized: boolean;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type VerifyModelOption = {
+  id: string;
+  requested: string;
+  label: string;
+  source: string;
+};
+
+export type VerifyAccountInspect = {
+  account: {
+    id: number;
+    name: string;
+    platform: string;
+    type: string;
+    status: string;
+    notes: string;
+    group_ids: number[];
+  };
+  base_url: string;
+  supported: boolean;
+  unsupported_reason: string;
+  has_sk: boolean;
+  sk_masked: string;
+  sk_source: string;
+  model_mapping: Record<string, string>;
+  models: VerifyModelOption[];
+};
+
+export type VerifyStep = {
+  id: string;
+  name: string;
+  kind: "baseline" | "fingerprint";
+  request_desc: string;
+  expect_desc: string;
+  expect_status: number[];
+  match_mode: "all" | "any";
+  must_match: string[];
+  strong_match: string[];
+  counter_match: string[];
+  status: "pending" | "running" | "pass" | "fail" | "skip";
+  http_status: number | null;
+  latency_ms: number | null;
+  reason: string;
+  strong_hit: boolean;
+  counter_hit: boolean;
+  param_stripped: boolean;
+  status_rewritten: boolean;
+  matched_patterns: string[];
+  request_url: string;
+  request_body: Record<string, unknown>;
+  response_headers: Record<string, string>;
+  response_snippet: string;
+  fallback_used: boolean;
+};
+
+export type VerifyRun = {
+  id: string;
+  account_id: number;
+  account_name: string;
+  platform: string;
+  base_url: string;
+  sk_masked: string;
+  sk_source: string;
+  channel_code: string;
+  channel_name: string;
+  methodology_version: number;
+  model: string;
+  requested_model: string;
+  status: "running" | "done" | "error";
+  verdict: VerifyVerdict;
+  score: number;
+  matched_count: number;
+  total_probes: number;
+  summary: string;
+  started_at: string;
+  finished_at: string | null;
+  duration_ms: number;
+  steps?: VerifyStep[];
+};
