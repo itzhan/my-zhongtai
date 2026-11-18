@@ -48,6 +48,48 @@ const VERTEX_METHODOLOGY_MD = `### 鉴定原理（Vertex AI Gemini vs AI Studio 
 
 > 若多项异常参数均返回 \`HTTP 200\`，说明上游中转层过滤/重置了 \`generationConfig\` 参数（非纯透传或存在套壳嫌疑）。`;
 
+const AS_VERTEX_COUNTER_PATTERNS = [
+  "cloud\\.google\\.com/vertex-ai",
+  "Unable to submit request because",
+  "2\\.0001 \\(exclusive\\)",
+  "supported range is from \\d+ \\(inclusive\\) to \\d+(?:\\.\\d+)? \\((?:inclusive|exclusive)\\)",
+  "maximum supported value is 2\\. Update the value and try again",
+  "Update the value and try again",
+];
+
+const AS_GEMINI_METHODOLOGY_MD = `### 鉴定原理（AI Studio 真货确认方法论）
+
+确认上游中转后端是 **Google AI Studio（\`generativelanguage.googleapis.com\`）** 原生账户体系，而非 **Vertex AI**（或 Vertex 掺水）。必须直连原生 Gemini 接口（\`/v1beta/models/{model}:generateContent\` + \`x-goog-api-key\`），不能仅测 OpenAI 兼容层。
+
+#### 核心判定标准（按优先级）
+
+1. **错误结构含 \`service\` 字段（最硬证据）**
+   打原生接口故意触发 \`400\`，返回的 JSON \`error.details[].metadata\` 中应出现：
+   \`\`\`json
+   "details": [
+     {
+       "metadata": {
+         "service": "generativelanguage.googleapis.com"
+       }
+     }
+   ]
+   \`\`\`
+2. **\`candidateCount\` 行为（Gemini 3.x 模型特有）**
+   对 Gemini 3.x 系列模型发送 \`candidateCount: 2\`（若支持则自动补发 \`candidateCount: 9\`），AI Studio 常返回：
+   \`"Multiple candidates is not enabled for this model"\`（Vertex 不会返回该文案）。
+3. **排除 Vertex 固定边界文案**
+   使用 \`temperature: 5\` / \`topP: 2\` / \`logprobs\` 探针时，**绝不能**出现以下 Vertex 特征文案：
+   - \`Unable to submit request because ... supported range is from 0 ... to 2.0001 (exclusive)\`
+   - \`maximum supported value is 2. Update the value and try again.\`
+   - 携带 \`cloud.google.com/vertex-ai\` 文档链接的 logprobs 拒绝文案
+
+#### 判定规则与模型差异说明
+
+- 出现 \`service: generativelanguage.googleapis.com\` **且** 无任何 Vertex 特征文案 → 判定为 **真（AI Studio 原生资源）**。
+- 出现 \`Multiple candidates is not enabled for this model\` → 进一步确认为 AI Studio 体系。
+- 只要出现任意 Vertex 特征文案或文档链接 → 直接判定为 **假（Vertex AI 或 Vertex 掺水）**。
+- **Gemini 3.6+ / 4 注意事项**：新一代 Gemini 3.6+/4 模型本身会忽略超界 \`temperature\` / \`topP\` 并返回 \`HTTP 200\`，因此本渠道判定**不会**因这两项返回 \`200\` 而误判为假，只要其它探针（如 \`candidateCount\` / \`logprobs\`）触发 \`service: generativelanguage.googleapis.com\` 且无 Vertex 特征，仍判定为真。`;
+
 const AWSB_METHODOLOGY_MD = `### 鉴定原理（AWS Bedrock 纯透传黄金口径：S1–S8 Thinking 签名校验）
 
 先以 \`thinking: { type: "adaptive" }\`（旧版 4.5/3.x 模型用 \`enabled + budget_tokens\`，5.x 绝不传 \`budget_tokens\` 或 \`temperature/top_p/top_k\`）采集真实 \`thinking\` 块与 \`signature\`，随后保持会话前缀不变，在第二轮对话里逐一构造以下 **8 项单点变异场景**（每场景默认连跑 **2 轮**）：
@@ -101,11 +143,134 @@ export const BUILTIN_CHANNELS = [
     platform_hint: "gemini",
     protocol: "gemini_native",
     sort_order: 3,
-    builtin_version: 1,
-    pass_ratio: 0.8,
-    summary: "AI Studio Gemini (AS Gemini) 渠道真伪检测（待补充专属探针，当前已预留方法论配置位）",
-    methodology_md: "### as gemini 检测方法论（待补充）\n\n后续可补充 AI Studio Files API、参数范围校验等差异化探针。",
-    probes: [],
+    builtin_version: 2,
+    pass_ratio: 0.5,
+    summary: "通过原生 Gemini 接口探测 error.details.metadata.service、candidateCount 限制及反查 Vertex 范围文案，确认是否为纯 AI Studio 资源。",
+    methodology_md: AS_GEMINI_METHODOLOGY_MD,
+    probes: [
+      {
+        id: "as_baseline",
+        name: "基准连通性检查",
+        kind: "baseline",
+        enabled: true,
+        request_desc: "发送原生 generateContent 最小请求（maxOutputTokens: 16），确认上游站点、Key 与模型可用",
+        expect_desc: "HTTP 200 且返回合法 Gemini 原生 JSON（含 candidates / modelVersion）",
+        request_body: {
+          contents: [{ role: "user", parts: [{ text: "Reply with OK only." }] }],
+          generationConfig: { maxOutputTokens: 16 },
+        },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "any",
+        must_match: [],
+        strong_match: [],
+        counter_match: [],
+        pass_200_hint: "",
+      },
+      {
+        id: "as_temperature",
+        name: "temperature: 5（校验报错 service 与排除 Vertex）",
+        kind: "fingerprint",
+        enabled: true,
+        request_desc: "在 generationConfig 里设置 temperature: 5（Gemini 3.6+/4 可能忽略该参数直接返回 200）",
+        expect_desc: "400 错误携带 metadata.service: generativelanguage.googleapis.com 或 AI Studio 范围报错，且绝不含 Vertex 边界文案",
+        request_body: {
+          contents: [{ role: "user", parts: [{ text: "hi" }] }],
+          generationConfig: { temperature: 5 },
+        },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: [
+          "generativelanguage\\.googleapis\\.com",
+          "\\[0\\.0,\\s*2\\.0\\]",
+          "must be in \\[0",
+          "less than or equal to 2",
+        ],
+        strong_match: ["generativelanguage\\.googleapis\\.com"],
+        counter_match: AS_VERTEX_COUNTER_PATTERNS,
+        pass_200_hint: "返回 HTTP 200（Gemini 3.6+/4 模型会忽略超界 temperature，或中转进行了参数裁剪；将结合 candidateCount / logprobs 探针综合判定）",
+      },
+      {
+        id: "as_candidate_count",
+        name: "candidateCount: 2 / 9（多候选限制与 service 字段）",
+        kind: "fingerprint",
+        enabled: true,
+        request_desc: "在 generationConfig 里传 candidateCount: 2（若模型支持多候选返回 200，则自动补发 candidateCount: 9 触发越界校验）",
+        expect_desc: "Gemini 3.x 常直接返回 Multiple candidates is not enabled for this model，且 400 JSON 携带 service: generativelanguage.googleapis.com",
+        request_body: {
+          contents: [{ role: "user", parts: [{ text: "hi" }] }],
+          generationConfig: { candidateCount: 2 },
+        },
+        fallback_on_200: {
+          contents: [{ role: "user", parts: [{ text: "hi" }] }],
+          generationConfig: { candidateCount: 9 },
+        },
+        expect_status: [400],
+        match_mode: "any",
+        must_match: [
+          "Multiple candidates is not enabled for this model",
+          "generativelanguage\\.googleapis\\.com",
+        ],
+        strong_match: [
+          "Multiple candidates is not enabled for this model",
+          "generativelanguage\\.googleapis\\.com",
+        ],
+        counter_match: AS_VERTEX_COUNTER_PATTERNS,
+        pass_200_hint: "两轮 candidateCount（2 与 9）均返回 HTTP 200，说明上游中转过滤/丢弃了 candidateCount 参数",
+      },
+      {
+        id: "as_top_p",
+        name: "topP: 2（超界校验与排除 Vertex）",
+        kind: "fingerprint",
+        enabled: true,
+        request_desc: "在 generationConfig 里设置 topP: 2（Gemini 3.6+/4 可能忽略该参数直接返回 200）",
+        expect_desc: "400 错误携带 generativelanguage.googleapis.com 或 AI Studio 边界校验信息，且不得命中 Vertex range 文案",
+        request_body: {
+          contents: [{ role: "user", parts: [{ text: "hi" }] }],
+          generationConfig: { topP: 2 },
+        },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: [
+          "generativelanguage\\.googleapis\\.com",
+          "\\[0\\.0,\\s*1\\.0\\]",
+          "must be in \\[0",
+        ],
+        strong_match: ["generativelanguage\\.googleapis\\.com"],
+        counter_match: AS_VERTEX_COUNTER_PATTERNS,
+        pass_200_hint: "返回 HTTP 200（Gemini 3.6+/4 可能忽略超界 topP，或中转裁剪了参数；将结合其他探针判定）",
+      },
+      {
+        id: "as_logprobs",
+        name: "logprobs 开关与越界值（排除 Vertex 文档链接）",
+        kind: "fingerprint",
+        enabled: true,
+        request_desc: "先发 responseLogprobs: true（若模型支持返回 200，则自动补发 responseLogprobs: true + logprobs: 99 触发原生 400）",
+        expect_desc: "400 错误包含 Logprobs is not enabled for models/ 或 service: generativelanguage.googleapis.com，且绝不含 Vertex 文档链接",
+        request_body: {
+          contents: [{ role: "user", parts: [{ text: "hi" }] }],
+          generationConfig: { responseLogprobs: true },
+        },
+        fallback_on_200: {
+          contents: [{ role: "user", parts: [{ text: "hi" }] }],
+          generationConfig: { responseLogprobs: true, logprobs: 99 },
+        },
+        expect_status: [400],
+        match_mode: "any",
+        must_match: [
+          "Logprobs is not enabled for models/",
+          "generativelanguage\\.googleapis\\.com",
+        ],
+        strong_match: [
+          "Logprobs is not enabled for models/",
+          "generativelanguage\\.googleapis\\.com",
+        ],
+        counter_match: AS_VERTEX_COUNTER_PATTERNS,
+        pass_200_hint: "两轮 logprobs 探测（responseLogprobs: true 与 logprobs: 99）均返回 HTTP 200，说明中转过滤了 logprobs 参数",
+      },
+    ],
   },
   {
     code: "vertex_gemini",
@@ -588,14 +753,16 @@ export function buildProbeHttpRequest({ baseUrl, apiKey, protocol, model, body }
   if (protocol === "gemini_native") {
     const hasVer = /\/(v1beta|v1|publishers\/google)$/i.test(cleanBase);
     const prefix = hasVer ? cleanBase : `${cleanBase}/v1beta`;
+    const isOfficialGoogle = /googleapis\.com/i.test(cleanBase) || /^AIza/i.test(apiKey);
+    const headers = {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "x-goog-api-key": apiKey,
+    };
+    if (!isOfficialGoogle) headers.Authorization = `Bearer ${apiKey}`;
     return {
       url: `${prefix}/models/${encodeURIComponent(cleanModel)}:generateContent`,
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "x-goog-api-key": apiKey,
-        Authorization: `Bearer ${apiKey}`,
-      },
+      headers,
       body: body ?? {},
     };
   }
@@ -710,9 +877,12 @@ export async function fetchUpstreamModels({ baseUrl, apiKey, fetchImpl = fetch, 
   let authFailed = false;
   let lastError = "";
   for (const c of candidates) {
+    const isOfficialGoogle = /googleapis\.com/i.test(c.url) || /^AIza/i.test(key);
+    const geminiHeaders = { Accept: "application/json", "x-goog-api-key": key };
+    if (!isOfficialGoogle) geminiHeaders.Authorization = `Bearer ${key}`;
     const headers =
       c.kind === "gemini"
-        ? { Accept: "application/json", "x-goog-api-key": key, Authorization: `Bearer ${key}` }
+        ? geminiHeaders
         : {
             Accept: "application/json",
             Authorization: `Bearer ${key}`,
@@ -1029,9 +1199,120 @@ export function computeAwsbVerdict({ steps, channelName }) {
   };
 }
 
-export function computeRunVerdict({ steps, passRatio = 0.8, channelName }) {
+function hasAiStudioService(json, rawText) {
+  const errObj = Array.isArray(json) ? json[0]?.error : json?.error;
+  const details = Array.isArray(errObj?.details) ? errObj.details : [];
+  if (
+    details.some(
+      (d) => String(d?.metadata?.service || "").toLowerCase() === "generativelanguage.googleapis.com",
+    )
+  ) {
+    return true;
+  }
+  return /"service"\s*:\s*"generativelanguage\.googleapis\.com"/i.test(String(rawText || ""));
+}
+
+export function computeAsGeminiVerdict({ steps, channelName = "as gemini" }) {
+  const baseline = steps.find((s) => s.kind === "baseline");
+  if (baseline && baseline.status === "fail") {
+    return {
+      verdict: "inconclusive",
+      score: 0,
+      matched_count: 0,
+      total_probes: steps.filter((s) => s.kind !== "baseline").length,
+      summary: `基准连通性检查失败（${baseline.reason}），无法安全判定 ${channelName} 真伪，请先检查上游站点、Key 或模型是否可用。`,
+    };
+  }
+
+  const fpSteps = steps.filter((s) => s.kind !== "baseline");
+  const total = fpSteps.length;
+  if (!total) {
+    return {
+      verdict: "inconclusive",
+      score: 0,
+      matched_count: 0,
+      total_probes: 0,
+      summary: `渠道「${channelName}」尚未配置指纹探针，无法完成真伪鉴定。`,
+    };
+  }
+
+  const matched = fpSteps.filter((s) => s.status === "pass").length;
+  const counterHit = fpSteps.filter((s) => s.counter_hit);
+  if (counterHit.length > 0) {
+    return {
+      verdict: "fake",
+      score: 0,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（检出 Vertex AI 特征）：「${counterHit.map((s) => s.name).join("、")}」命中 Vertex 原生范围/文档链接文案，实际为 Vertex（或 Vertex 掺水），非纯 AI Studio 资源。`,
+    };
+  }
+
+  const serviceSteps = fpSteps.filter((s) => s.has_as_service);
+  const multiCandSteps = fpSteps.filter((s) => s.has_as_multicand);
+  const hasService = serviceSteps.length > 0;
+  const hasMultiCand = multiCandSteps.length > 0;
+  const ignoredSampling200 = fpSteps.filter(
+    (s) => (s.id === "as_temperature" || s.id === "as_top_p") && s.http_status === 200,
+  );
+
+  if (hasService) {
+    const evidences = [`details.metadata.service = generativelanguage.googleapis.com（${serviceSteps.length} 项触发）`];
+    if (hasMultiCand) evidences.push("Multiple candidates is not enabled for this model（Gemini 3.x 特有）");
+    const ignoreNote = ignoredSampling200.length
+      ? `；「${ignoredSampling200.map((s) => s.name).join("、")}」返回 HTTP 200（符合 Gemini 3.6+/4 忽略超界采样参数特征，不影响判定）`
+      : "";
+    const rewrittenCount = fpSteps.filter((s) => s.status === "pass" && s.status_rewritten).length;
+    const rewriteNote = rewrittenCount ? `；其中 ${rewrittenCount} 项 HTTP 状态码被中转改写` : "";
+    const score = hasMultiCand && matched === total ? 100 : Math.max(90, Math.round((matched / total) * 100));
+    return {
+      verdict: "authentic",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为真（AI Studio 原生资源）：已检出 ${evidences.join(" + ")}，且全程未见 Vertex 特征文案${ignoreNote}${rewriteNote}。`,
+    };
+  }
+
+  const score = Math.round((matched / total) * 100);
+  if (hasMultiCand) {
+    return {
+      verdict: "suspicious",
+      score: Math.max(70, score),
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为疑似 AI Studio / 报错结构不完整：命中 Gemini 3.x 特有文案「Multiple candidates is not enabled for this model」且未见 Vertex 文案，但响应中缺少 details.metadata.service: generativelanguage.googleapis.com 硬字段（疑似网关裁剪了 error.details）。`,
+    };
+  }
+
+  const stripped = fpSteps.filter((s) => s.param_stripped);
+  if (matched >= 2) {
+    const stripNote = stripped.length ? `；「${stripped.map((s) => s.name).join("、")}」返回 HTTP 200` : "";
+    return {
+      verdict: "suspicious",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为疑似 / 非完整透传：未检出 details.metadata.service: generativelanguage.googleapis.com 硬字段，命中 ${matched}/${total} 项特征${stripNote}，建议结合响应详情人工复核。`,
+    };
+  }
+
+  const stripNote = stripped.length ? `，其中 ${stripped.length} 项异常参数返回 HTTP 200（疑似吞参数或 OpenAI 兼容层转译）` : "";
+  return {
+    verdict: "fake",
+    score,
+    matched_count: matched,
+    total_probes: total,
+    summary: `判定为假（未检出 AI Studio 硬特征）：全程未见 service: generativelanguage.googleapis.com 与 AI Studio 专属报错（仅命中 ${matched}/${total} 项）${stripNote}。`,
+  };
+}
+
+export function computeRunVerdict({ steps, passRatio = 0.8, channelName, channelCode }) {
   if (steps.some((s) => String(s.runner || "").startsWith("awsb_"))) {
     return computeAwsbVerdict({ steps, channelName });
+  }
+  if (channelCode === "as_gemini" || steps.some((s) => s.id === "as_candidate_count" || s.id === "as_temperature")) {
+    return computeAsGeminiVerdict({ steps, channelName });
   }
   const baseline = steps.find((s) => s.kind === "baseline");
   if (baseline && baseline.status === "fail") {
@@ -1997,6 +2278,8 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       round_conflict: false,
       has_bedrock_runtime: false,
       msg_id_kind: "",
+      has_as_service: false,
+      has_as_multicand: false,
       request_desc: p.request_desc,
       expect_desc: p.expect_desc,
       expect_status: p.expect_status,
@@ -2084,6 +2367,10 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
           json: attemptRes.json,
           rawText: attemptRes.raw_text,
         });
+        const hasAsService = hasAiStudioService(attemptRes.json, attemptRes.raw_text);
+        const hasAsMulticand = /Multiple candidates is not enabled for this model/i.test(
+          String(attemptRes.raw_text || ""),
+        );
 
         steps[i] = {
           ...steps[i],
@@ -2099,6 +2386,8 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
           param_stripped: evalRes.param_stripped,
           status_rewritten: evalRes.status_rewritten,
           matched_patterns: evalRes.matched_patterns,
+          has_as_service: hasAsService,
+          has_as_multicand: hasAsMulticand,
           request_url: attemptRes.url,
           request_body: attemptRes.request_body,
           response_headers: attemptRes.headers,
@@ -2113,6 +2402,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         steps,
         passRatio: channel.pass_ratio,
         channelName: channel.name,
+        channelCode: channel.code,
       });
       saveRunSteps(runId, steps, {
         status: "done",
