@@ -122,10 +122,10 @@ function buildMarkdownReport(run: VerifyRun): string {
               ? "检测中"
               : "等待中";
     const kindText = s.kind === "baseline" ? "基准" : "指纹";
+    const statusText =
+      s.round_statuses && s.round_statuses.length > 1 ? s.round_statuses.join("/") : String(s.http_status ?? "-");
     const reasonSafe = (s.reason || "-").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
-    lines.push(
-      `| ${s.name} | ${kindText} | ${stText} | ${s.http_status ?? "-"} | ${ms(s.latency_ms)} | ${reasonSafe} |`,
-    );
+    lines.push(`| ${s.name} | ${kindText} | ${stText} | ${statusText} | ${ms(s.latency_ms)} | ${reasonSafe} |`);
   }
   const snippets = (run.steps ?? []).filter((s) => s.response_snippet);
   if (snippets.length) {
@@ -153,8 +153,20 @@ function StepStatusIcon({ status }: { status: VerifyStep["status"] }) {
   }
 }
 
+function formatStepStatusLabel(step: VerifyStep): { text: string; ok: boolean } | null {
+  if (step.round_statuses && step.round_statuses.length > 1) {
+    const ok = step.round_statuses.every((c) => step.expect_status.includes(c));
+    return { text: `HTTP ${step.round_statuses.join(" / ")}`, ok };
+  }
+  if (step.http_status != null) {
+    return { text: `HTTP ${step.http_status}`, ok: step.expect_status.includes(step.http_status) };
+  }
+  return null;
+}
+
 function StepRow({ step }: { step: VerifyStep }) {
   const [open, setOpen] = useState(false);
+  const statusTag = formatStepStatusLabel(step);
   return (
     <>
       <TableRow
@@ -199,12 +211,17 @@ function StepRow({ step }: { step: VerifyStep }) {
                 补发校验
               </Tag>
             ) : null}
+            {step.throttled ? (
+              <Tag tone="warn" className="text-[10px]">
+                限流/日限额
+              </Tag>
+            ) : null}
           </div>
           <p className="text-muted-foreground mt-0.5 text-xs">{step.request_desc}</p>
         </TableCell>
         <TableCell className="font-mono text-xs whitespace-nowrap">
-          {step.http_status != null ? (
-            <Tag tone={step.expect_status.includes(step.http_status) ? "ok" : "warn"}>HTTP {step.http_status}</Tag>
+          {statusTag ? (
+            <Tag tone={statusTag.ok ? "ok" : "warn"}>{statusTag.text}</Tag>
           ) : (
             <span className="text-muted-foreground">-</span>
           )}

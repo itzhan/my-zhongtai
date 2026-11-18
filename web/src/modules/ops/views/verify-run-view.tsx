@@ -61,7 +61,7 @@ function isRecommendedModel(modelId: string, platformHint?: string): boolean {
     case "gemini":
       return m.includes("gemini");
     case "anthropic":
-      return m.includes("claude");
+      return /claude|opus|sonnet|haiku|fable/.test(m);
     case "openai":
       return /^(gpt|o1|o3|o4|codex|chatgpt)/.test(m);
     default:

@@ -38,6 +38,7 @@ function emptyProbe(): VerifyProbe {
     id: `probe_${Date.now().toString(36)}`,
     name: "",
     kind: "fingerprint",
+    rounds: 1,
     enabled: true,
     request_desc: "",
     expect_desc: "",
@@ -187,6 +188,7 @@ function ProbeEditorDialog({
   const [name, setName] = useState("");
   const [id, setId] = useState("");
   const [kind, setKind] = useState<"baseline" | "fingerprint">("fingerprint");
+  const [roundsText, setRoundsText] = useState("1");
   const [enabled, setEnabled] = useState(true);
   const [requestDesc, setRequestDesc] = useState("");
   const [expectDesc, setExpectDesc] = useState("");
@@ -204,6 +206,7 @@ function ProbeEditorDialog({
     setName(probe.name);
     setId(probe.id);
     setKind(probe.kind);
+    setRoundsText(String(probe.rounds ?? 1));
     setEnabled(probe.enabled);
     setRequestDesc(probe.request_desc);
     setExpectDesc(probe.expect_desc);
@@ -258,6 +261,8 @@ function ProbeEditorDialog({
       id: id.trim() || `probe_${Date.now().toString(36)}`,
       name: name.trim(),
       kind,
+      runner: probe?.runner,
+      rounds: Math.min(5, Math.max(1, parseInt(roundsText, 10) || 1)),
       enabled,
       request_desc: requestDesc.trim(),
       expect_desc: expectDesc.trim(),
@@ -282,7 +287,7 @@ function ProbeEditorDialog({
       className="sm:max-w-3xl"
     >
       <div className="space-y-4">
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 sm:grid-cols-4">
           <div className="space-y-1.5 sm:col-span-2">
             <Label>探针名称 *</Label>
             <Input value={name} placeholder="如 temperature: 5" onChange={(e) => setName(e.target.value)} />
@@ -298,6 +303,10 @@ function ProbeEditorDialog({
                 <SelectItem value="baseline">基准连通性</SelectItem>
               </SelectContent>
             </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label>重复轮数 (1~5)</Label>
+            <Input type="number" min={1} max={5} value={roundsText} onChange={(e) => setRoundsText(e.target.value)} />
           </div>
         </div>
         <div className="grid gap-3 sm:grid-cols-3">
@@ -741,6 +750,16 @@ export function VerifyMethodsView({ initialCode }: { initialCode?: string }) {
                         <Tag tone="info" className="font-mono text-[10px]">
                           HTTP {p.expect_status.join("/")}
                         </Tag>
+                        {(p.rounds ?? 1) > 1 ? (
+                          <Badge variant="secondary" className="font-mono text-[10px] font-normal">
+                            ×{p.rounds}轮
+                          </Badge>
+                        ) : null}
+                        {p.runner ? (
+                          <Badge variant="secondary" className="font-mono text-[10px] font-normal">
+                            {p.runner}
+                          </Badge>
+                        ) : null}
                         {p.must_match.length ? (
                           <span className="text-muted-foreground text-[11px]">
                             {p.must_match.length} 条必中 · {p.counter_match.length} 条反例

@@ -48,6 +48,28 @@ const VERTEX_METHODOLOGY_MD = `### 鉴定原理（Vertex AI Gemini vs AI Studio 
 
 > 若多项异常参数均返回 \`HTTP 200\`，说明上游中转层过滤/重置了 \`generationConfig\` 参数（非纯透传或存在套壳嫌疑）。`;
 
+const AWSB_METHODOLOGY_MD = `### 鉴定原理（AWS Bedrock 纯透传黄金口径：S1–S8 Thinking 签名校验）
+
+先以 \`thinking: { type: "adaptive" }\`（旧版 4.5/3.x 模型用 \`enabled + budget_tokens\`，5.x 绝不传 \`budget_tokens\` 或 \`temperature/top_p/top_k\`）采集真实 \`thinking\` 块与 \`signature\`，随后保持会话前缀不变，在第二轮对话里逐一构造以下 **8 项单点变异场景**（每场景默认连跑 **2 轮**）：
+
+| 场景 | 变异操作 | 期望状态码 | 关键特征与原理 |
+| --- | --- | --- | --- |
+| **S1** | 真签名 + 原正文（非流式） | \`200\` | \`id\` 为 \`msg_bdrk_...\` |
+| **S2** | 纯文本伪造签名 | \`400\` | \`Invalid signature\` + \`Bedrock Runtime: InvokeModel\` |
+| **S3** | 真签名中点改 1 字符 | \`400\` | \`Invalid signature\` + \`Bedrock Runtime: InvokeModel\` |
+| **S4** | **真签名 + 换成无关正文** | **\`200\`** | **Bedrock 黄金口径**：只验签名解密与会话前缀，**不校验 thinking 摘要正文**；若报 400 反而说明不是 Bedrock |
+| **S5** | \`signature\` 传空串 \`""\` | \`400\` | \`Invalid signature in thinking block\`（若 200 说明网关洗掉了空签名，非纯透传） |
+| **S6** | 块内不带 \`signature\` 字段 | \`400\` | \`signature: Field required\`（若 200 说明网关洗掉了缺字段块，非纯透传） |
+| **S7** | S3 改 1 字符（流式 \`stream: true\`） | \`400\` | \`Invalid signature\` + \`Bedrock Runtime: InvokeModelWithResponseStream\` |
+| **S8** | S1 原样带回（流式 \`stream: true\`） | \`200\` | 流式 \`message_start\` 的 \`id\` 为 \`msg_bdrk_...\` |
+
+#### 真假判定黄金 5 条
+1. HTTP 口径：\`S1 / S4 / S8 = 200\`，\`S2 / S3 / S5 / S6 / S7 = 400\`（**S4 必为 200**）。
+2. 成功响应 \`id\` 以 \`msg_bdrk_\` 开头（非 \`msg_01...\`）。
+3. 400 报错体携带 \`Bedrock Runtime: InvokeModel\` 或 \`InvokeModelWithResponseStream\`。
+4. S5 报错含 \`Invalid signature\`；S6 报错含 \`signature: Field required\`。
+5. 限流 / 日限额（\`Too many tokens per day\` / \`429\`）不判真假，记为「无法判定」。`;
+
 export const BUILTIN_CHANNELS = [
   {
     code: "ccmax",
@@ -269,11 +291,183 @@ export const BUILTIN_CHANNELS = [
     platform_hint: "anthropic",
     protocol: "anthropic_messages",
     sort_order: 5,
-    builtin_version: 1,
-    pass_ratio: 0.8,
-    summary: "AWS Bedrock Claude 渠道真伪检测（待补充专属探针，当前已预留方法论配置位）",
-    methodology_md: "### aws bedrock 检测方法论（待补充）\n\n后续可结合 `msg_bdrk_`、thinking signature 校验（S5/S6）与 Bedrock 响应头特征配置探针。",
-    probes: [],
+    builtin_version: 2,
+    pass_ratio: 1,
+    summary: "依据 S1–S8 Thinking 签名校验矩阵（含 S4=200 黄金口径、msg_bdrk_ 与 Bedrock Runtime 原生堆栈），鉴别是否为纯透传 AWS Bedrock。",
+    methodology_md: AWSB_METHODOLOGY_MD,
+    probes: [
+      {
+        id: "awsb_seed",
+        name: "采集真实 thinking + signature 素材",
+        kind: "baseline",
+        runner: "awsb_seed",
+        rounds: 1,
+        enabled: true,
+        request_desc: "发最小推理题（5.x 用 adaptive 思考，4.5 及更早用 enabled+budget_tokens）提取真实 thinking 块与 signature",
+        expect_desc: "HTTP 200 且返回非空 signature（优先校验 msg_bdrk_ 消息 ID）",
+        request_body: {
+          max_tokens: 1600,
+          thinking: { type: "adaptive" },
+          messages: [
+            {
+              role: "user",
+              content: "一个三位数，各位数字之和是 18，百位比个位大 2，十位是个位的 2 倍。请算出这个三位数并只输出数字。",
+            },
+          ],
+        },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "any",
+        must_match: [],
+        strong_match: [],
+        counter_match: [],
+        pass_200_hint: "",
+      },
+      {
+        id: "awsb_s1",
+        name: "S1 · 真签名 + 原正文",
+        kind: "fingerprint",
+        runner: "awsb_s1",
+        rounds: 2,
+        enabled: true,
+        request_desc: "第二轮原样带回真 thinking 正文与真 signature（非流式，连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 200 且消息 ID 为 msg_bdrk_...",
+        request_body: { _dynamic: "awsb_s1" },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "any",
+        must_match: [],
+        strong_match: ["msg_bdrk_"],
+        counter_match: ["msg_01"],
+        pass_200_hint: "",
+      },
+      {
+        id: "awsb_s2",
+        name: "S2 · 纯文本伪造签名",
+        kind: "fingerprint",
+        runner: "awsb_s2",
+        rounds: 2,
+        enabled: true,
+        request_desc: "thinking 正文不变，将 signature 替换为纯文本伪造字符串（非流式，连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 Invalid signature（带 Bedrock Runtime: InvokeModel）",
+        request_body: { _dynamic: "awsb_s2" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["Invalid\\s+`?signature`?"],
+        strong_match: ["Bedrock Runtime:\\s*InvokeModel"],
+        counter_match: [],
+        pass_200_hint: "伪造签名仍返回 HTTP 200，说明上游完全不校验 thinking 签名（假 / 套壳）",
+      },
+      {
+        id: "awsb_s3",
+        name: "S3 · 真签名改 1 个字符",
+        kind: "fingerprint",
+        runner: "awsb_s3",
+        rounds: 2,
+        enabled: true,
+        request_desc: "thinking 正文不变，仅翻转真 signature 中间 1 个字符（非流式，连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 Invalid signature（带 Bedrock Runtime: InvokeModel）",
+        request_body: { _dynamic: "awsb_s3" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["Invalid\\s+`?signature`?"],
+        strong_match: ["Bedrock Runtime:\\s*InvokeModel"],
+        counter_match: [],
+        pass_200_hint: "真签名改 1 字符仍返回 HTTP 200，说明上游完全不校验签名有效性（假）",
+      },
+      {
+        id: "awsb_s4",
+        name: "S4 · 真签名 + 无关正文（黄金口径）",
+        kind: "fingerprint",
+        runner: "awsb_s4",
+        rounds: 2,
+        enabled: true,
+        request_desc: "signature 原样不动，仅将 thinking 正文替换为无关文本（非流式，连测 2 轮）",
+        expect_desc: "Bedrock 黄金口径必为两轮 HTTP 200 + msg_bdrk_...（返回 400 反而说明不是 Bedrock）",
+        request_body: { _dynamic: "awsb_s4" },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "any",
+        must_match: [],
+        strong_match: ["msg_bdrk_"],
+        counter_match: ["msg_01"],
+        pass_200_hint: "",
+      },
+      {
+        id: "awsb_s5",
+        name: "S5 · signature 为空串",
+        kind: "fingerprint",
+        runner: "awsb_s5",
+        rounds: 2,
+        enabled: true,
+        request_desc: "thinking 正文不变，signature 传空串 \"\"（非流式，连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 Invalid signature in thinking block（若 200 说明网关洗掉了空签名，非纯透传）",
+        request_body: { _dynamic: "awsb_s5" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["Invalid\\s+`?signature`?"],
+        strong_match: ["Bedrock Runtime:\\s*InvokeModel"],
+        counter_match: [],
+        pass_200_hint: "空签名返回 HTTP 200，说明中转网关将空签名洗掉后重试（非纯透传）",
+      },
+      {
+        id: "awsb_s6",
+        name: "S6 · 缺 signature 字段",
+        kind: "fingerprint",
+        runner: "awsb_s6",
+        rounds: 2,
+        enabled: true,
+        request_desc: "thinking 块中移除 signature 字段（非流式，连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 signature: Field required（若 200 说明网关洗掉了缺字段块，非纯透传）",
+        request_body: { _dynamic: "awsb_s6" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "all",
+        must_match: ["signature", "Field required"],
+        strong_match: ["Bedrock Runtime:\\s*InvokeModel"],
+        counter_match: [],
+        pass_200_hint: "缺 signature 字段返回 HTTP 200，说明中转网关把缺字段思考块洗掉后重试（非纯透传）",
+      },
+      {
+        id: "awsb_s7",
+        name: "S7 · 改 1 字符（流式）",
+        kind: "fingerprint",
+        runner: "awsb_s7",
+        rounds: 2,
+        enabled: true,
+        request_desc: "同 S3（真签名中间改 1 字符），改用 stream: true 流式请求（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 Invalid signature（带 Bedrock Runtime: InvokeModelWithResponseStream）",
+        request_body: { _dynamic: "awsb_s7" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["Invalid\\s+`?signature`?"],
+        strong_match: ["Bedrock Runtime:\\s*InvokeModel"],
+        counter_match: [],
+        pass_200_hint: "流式篡改签名返回 HTTP 200，说明流式链路未校验签名或流式/非流式口径不一致（假）",
+      },
+      {
+        id: "awsb_s8",
+        name: "S8 · 真签名 + 原正文（流式）",
+        kind: "fingerprint",
+        runner: "awsb_s8",
+        rounds: 2,
+        enabled: true,
+        request_desc: "同 S1（原样带回真 thinking 与真 signature），改用 stream: true 流式请求（连测 2 轮）",
+        expect_desc: "两轮均流式成功（HTTP 200），且 message_start 消息 ID 为 msg_bdrk_...",
+        request_body: { _dynamic: "awsb_s8" },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "any",
+        must_match: [],
+        strong_match: ["msg_bdrk_"],
+        counter_match: ["msg_01"],
+        pass_200_hint: "",
+      },
+    ],
   },
   {
     code: "gpt_pool",
@@ -368,6 +562,8 @@ export function normalizeProbes(rawProbes, httpError) {
       id,
       name,
       kind,
+      runner: str(p.runner, 40),
+      rounds: Math.min(5, Math.max(1, parseInt(p.rounds, 10) || 1)),
       enabled: p.enabled !== false,
       request_desc: str(p.request_desc, 400),
       expect_desc: str(p.expect_desc, 400),
@@ -699,7 +895,144 @@ export function evaluateProbeResponse({ probe, protocol, httpStatus, json, rawTe
   };
 }
 
+export function computeAwsbVerdict({ steps, channelName }) {
+  const seed = steps.find((s) => s.runner === "awsb_seed" || s.kind === "baseline");
+  const fpSteps = steps.filter((s) => s.kind !== "baseline");
+  const total = fpSteps.length;
+  const matched = fpSteps.filter((s) => s.status === "pass").length;
+  const score = total ? Math.round((matched / total) * 100) : 0;
+
+  if (steps.some((s) => s.throttled)) {
+    const tStep = steps.find((s) => s.throttled);
+    return {
+      verdict: "inconclusive",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `触发上游限流 / Bedrock 日限额（${tStep?.name || "探测"}：${tStep?.reason || "429 / Too many tokens per day"}），按规则不判真假，请更换模型或稍后重试。`,
+    };
+  }
+
+  if (seed && seed.status === "fail") {
+    if (seed.http_status === 200) {
+      return {
+        verdict: "fake",
+        score: 0,
+        matched_count: 0,
+        total_probes: total,
+        summary: `判定为假（未采集到可校验签名素材）：${seed.reason}`,
+      };
+    }
+    return {
+      verdict: "inconclusive",
+      score: 0,
+      matched_count: 0,
+      total_probes: total,
+      summary: `基准素材采集失败（${seed.reason}），无法安全判定 ${channelName} 真伪。`,
+    };
+  }
+
+  const byRunner = Object.fromEntries(fpSteps.map((s) => [s.runner || s.id, s]));
+  const s1 = byRunner.awsb_s1;
+  const s2 = byRunner.awsb_s2;
+  const s3 = byRunner.awsb_s3;
+  const s4 = byRunner.awsb_s4;
+  const s5 = byRunner.awsb_s5;
+  const s6 = byRunner.awsb_s6;
+  const s7 = byRunner.awsb_s7;
+  const s8 = byRunner.awsb_s8;
+
+  // 1. S4 黄金口径一票否决：真 Bedrock S4 必为 200，返回 400 说明是 Anthropic 直连或自研校验网关
+  if (s4 && (s4.counter_hit || (s4.round_statuses || []).some((c) => c === 400))) {
+    return {
+      verdict: "fake",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（非 AWS Bedrock 口径）：S4「真签名 + 无关正文」返回 HTTP ${(s4.round_statuses || []).join(" / ")}（真 Bedrock 黄金口径必为 200，返回 400 属 Anthropic 直连或自研网关）。`,
+    };
+  }
+
+  // 2. S2 / S3 / S7 返回 200 一票否决：完全不校验签名或流式不验签
+  const noVerify = [s2, s3, s7].filter((s) => s && (s.round_statuses || []).some((c) => c === 200));
+  if (noVerify.length > 0) {
+    return {
+      verdict: "fake",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（完全不校验签名 / 掺假）：「${noVerify.map((s) => s.name).join("、")}」存在 HTTP 200 放行（篡改或伪造签名未被拒绝）。共通过 ${matched}/${total} 项。`,
+    };
+  }
+
+  // 3. 检测是否出现 Anthropic msg_01... ID 且全流程无 Bedrock Runtime 原生错误堆栈
+  const hasMsg01 = steps.some((s) => s.msg_id_kind === "msg_01");
+  const hasBedrockRuntime = fpSteps.some((s) => s.has_bedrock_runtime);
+  const hasBdrkId = steps.some((s) => s.msg_id_kind === "bdrk");
+  if (hasMsg01 && !hasBedrockRuntime) {
+    return {
+      verdict: "fake",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（非 Bedrock 上游）：成功响应消息 ID 为 Anthropic msg_01... 且 400 报错不含 Bedrock Runtime 原生堆栈。`,
+    };
+  }
+
+  // 4. 同场景两轮状态码冲突（如 400 / 200）
+  const conflicted = fpSteps.filter((s) => s.round_conflict);
+  if (conflicted.length > 0) {
+    return {
+      verdict: "fake",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假 / 真假混池：「${conflicted.map((s) => s.name).join("、")}」两轮探测返回状态码不一致（${conflicted.map((s) => (s.round_statuses || []).join("/")).join("；")}），疑似后端混掺非透传节点。`,
+    };
+  }
+
+  // 5. S5 / S6 返回 200：网关洗掉空签名或缺字段后重试，非纯透传
+  const washed = [s5, s6].filter((s) => s && (s.round_statuses || []).some((c) => c === 200));
+  if (washed.length > 0) {
+    return {
+      verdict: "suspicious",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为疑似 / 非纯透传：「${washed.map((s) => s.name).join("、")}」返回 HTTP 200，说明中转网关把空签名/缺 signature 字段洗掉后重试（虽然 S2/S3/S7 验签且 S4=200，但不符合纯透传 AWSB 口径）。`,
+    };
+  }
+
+  // 6. 黄金 5 条逐一核验（全 200/400 状态码一致 + msg_bdrk_ + Bedrock Runtime + S5/S6 原文命中）
+  const allHttpMatch = [s1, s2, s3, s4, s5, s6, s7, s8].every((s) => !s || s.status === "pass");
+  if (allHttpMatch && hasBdrkId && hasBedrockRuntime && !hasMsg01) {
+    return {
+      verdict: "authentic",
+      score: 100,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为真（纯透传 AWS Bedrock）：S1–S8 两轮口径全部命中（S1/S4/S8=200，S2/S3/S5/S6/S7=400），响应 ID 为 msg_bdrk_... 且报错含 Bedrock Runtime 原生堆栈。`,
+    };
+  }
+
+  const missingEvidence = [];
+  if (!hasBdrkId) missingEvidence.push("未见 msg_bdrk_ 消息 ID");
+  if (!hasBedrockRuntime) missingEvidence.push("400 报错未见 Bedrock Runtime 原生堆栈");
+  if (hasMsg01) missingEvidence.push("存在 msg_01 消息 ID");
+  if (!allHttpMatch) missingEvidence.push(`仅 ${matched}/${total} 项完全通过`);
+  return {
+    verdict: matched >= Math.max(1, total - 2) ? "suspicious" : "fake",
+    score,
+    matched_count: matched,
+    total_probes: total,
+    summary: `判定为${matched >= Math.max(1, total - 2) ? "疑似 / 非纯透传" : "假（特征不符）"}：${missingEvidence.join("，")}，请核对各场景响应详情。`,
+  };
+}
+
 export function computeRunVerdict({ steps, passRatio = 0.8, channelName }) {
+  if (steps.some((s) => String(s.runner || "").startsWith("awsb_"))) {
+    return computeAwsbVerdict({ steps, channelName });
+  }
   const baseline = steps.find((s) => s.kind === "baseline");
   if (baseline && baseline.status === "fail") {
     return {
@@ -1116,8 +1449,44 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     };
   }
 
-  async function sendProbeOnce({ baseUrl, apiKey, protocol, model, body }) {
-    const reqSpec = buildProbeHttpRequest({ baseUrl, apiKey, protocol, model, body });
+  function parseAnthropicSse(rawText) {
+    const msg = { id: null, model: null, content: [], stop_reason: null };
+    let sseErr = null;
+    for (const rawLine of String(rawText || "").split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line.startsWith("data:")) continue;
+      const dataStr = line.slice(5).trim();
+      if (!dataStr || dataStr === "[DONE]") continue;
+      const ev = parseJsonSafe(dataStr, null);
+      if (!ev || typeof ev !== "object") continue;
+      if (ev.type === "message_start" && ev.message) {
+        msg.id = ev.message.id || msg.id;
+        msg.model = ev.message.model || msg.model;
+      } else if (ev.type === "content_block_start" && ev.content_block != null) {
+        msg.content[ev.index ?? msg.content.length] = { ...ev.content_block };
+      } else if (ev.type === "content_block_delta" && ev.delta) {
+        const idx = ev.index ?? 0;
+        const b = msg.content[idx] || (msg.content[idx] = {});
+        if (ev.delta.type === "thinking_delta") b.thinking = (b.thinking || "") + (ev.delta.thinking || "");
+        else if (ev.delta.type === "signature_delta") b.signature = (b.signature || "") + (ev.delta.signature || "");
+        else if (ev.delta.type === "text_delta") b.text = (b.text || "") + (ev.delta.text || "");
+      } else if (ev.type === "message_delta") {
+        msg.stop_reason = ev.delta?.stop_reason || msg.stop_reason;
+      } else if (ev.type === "error") {
+        sseErr = ev.error || ev;
+      }
+    }
+    return { msg, sseErr };
+  }
+
+  async function sendProbeOnce({ baseUrl, apiKey, protocol, model, body, stream = false }) {
+    const reqSpec = buildProbeHttpRequest({
+      baseUrl,
+      apiKey,
+      protocol,
+      model,
+      body: stream ? { ...(body ?? {}), stream: true } : body,
+    });
     const started = Date.now();
     let res;
     let rawText = "";
@@ -1150,8 +1519,23 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         };
       }
     }
-    const json = parseJsonSafe(rawText, null);
-    const sanitizedText = redactSecret(rawText, apiKey);
+
+    let effectiveStatus = res.status;
+    let json = parseJsonSafe(rawText, null);
+    let sanitizedText = redactSecret(rawText, apiKey);
+
+    if (stream && (headers["content-type"]?.includes("text/event-stream") || /^\s*(event:|data:)/m.test(rawText))) {
+      const { msg, sseErr } = parseAnthropicSse(rawText);
+      if (sseErr && !msg.stop_reason) {
+        effectiveStatus = res.status >= 400 ? res.status : Number(sseErr.status_code || sseErr.status) || 400;
+        json = { error: sseErr };
+        sanitizedText = redactSecret(JSON.stringify(sseErr, null, 2), apiKey);
+      } else if (msg.id || msg.content.length) {
+        json = msg;
+        sanitizedText = redactSecret(JSON.stringify(msg, null, 2), apiKey);
+      }
+    }
+
     const keepHeaders = {};
     for (const [k, v] of Object.entries(headers)) {
       if (/^(content-type|server|via|cf-ray|x-request-id|x-goog-|x-amzn-|x-amz-|anthropic-)/i.test(k)) {
@@ -1161,7 +1545,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     return {
       url: redactSecret(reqSpec.url, apiKey),
       request_body: reqSpec.body,
-      http_status: res.status,
+      http_status: effectiveStatus,
       headers: keepHeaders,
       raw_text: sanitizedText,
       snippet: sanitizedText.slice(0, MAX_BODY_SNIPPET),
@@ -1182,6 +1566,423 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     db.prepare(`UPDATE verify_runs SET ${fields.join(", ")} WHERE id = ?`).run(...args);
   }
 
+  const OLD_ANTHROPIC_THINKING = /haiku-4-5|sonnet-4-5|opus-4-5|opus-4-1|opus-4-2|sonnet-4-2|claude-3/i;
+  const AWSB_SEED_PROMPT =
+    "一个三位数，各位数字之和是 18，百位比个位大 2，十位是个位的 2 倍。请算出这个三位数并只输出数字。";
+  const AWSB_UNRELATED_THINKING = "这是一段与签名完全无关的伪造思考内容，用来验证签名是否与正文绑定。";
+
+  function awsbThinkingConfig(modelName) {
+    return OLD_ANTHROPIC_THINKING.test(String(modelName || ""))
+      ? { type: "enabled", budget_tokens: 1024 }
+      : { type: "adaptive" };
+  }
+
+  function mutateMiddleChar(sig) {
+    const s = String(sig || "");
+    if (!s) return "X";
+    const mid = Math.floor(s.length / 2);
+    const ch = s[mid];
+    const next = ch === "A" ? "B" : ch === "a" ? "b" : "A";
+    return s.slice(0, mid) + next + s.slice(mid + 1);
+  }
+
+  function isAwsbThrottled(res) {
+    return res.http_status === 429 || /Too many tokens per day|ThrottlingException/i.test(res.raw_text || "");
+  }
+
+  function classifyMsgId(id) {
+    const s = String(id || "");
+    if (!s) return "";
+    if (/^msg_bdrk_/i.test(s)) return "bdrk";
+    if (/^msg_01/i.test(s)) return "msg_01";
+    return "other";
+  }
+
+  function buildAwsbScenarioRequest(runner, awsb) {
+    let thinkingBlock;
+    let stream = false;
+    switch (runner) {
+      case "awsb_s1":
+        thinkingBlock = { type: "thinking", thinking: awsb.origThinking, signature: awsb.origSig };
+        break;
+      case "awsb_s2":
+        thinkingBlock = { type: "thinking", thinking: awsb.origThinking, signature: "forged_plaintext_signature_invalid_000000" };
+        break;
+      case "awsb_s3":
+        thinkingBlock = { type: "thinking", thinking: awsb.origThinking, signature: mutateMiddleChar(awsb.origSig) };
+        break;
+      case "awsb_s4":
+        thinkingBlock = { type: "thinking", thinking: AWSB_UNRELATED_THINKING, signature: awsb.origSig };
+        break;
+      case "awsb_s5":
+        thinkingBlock = { type: "thinking", thinking: awsb.origThinking, signature: "" };
+        break;
+      case "awsb_s6":
+        thinkingBlock = { type: "thinking", thinking: awsb.origThinking };
+        break;
+      case "awsb_s7":
+        thinkingBlock = { type: "thinking", thinking: awsb.origThinking, signature: mutateMiddleChar(awsb.origSig) };
+        stream = true;
+        break;
+      case "awsb_s8":
+        thinkingBlock = { type: "thinking", thinking: awsb.origThinking, signature: awsb.origSig };
+        stream = true;
+        break;
+      default:
+        throw new Error(`未知 AWSB 场景：${runner}`);
+    }
+    const content = [thinkingBlock, ...awsb.textBlocks];
+    return {
+      stream,
+      body: {
+        max_tokens: 1600,
+        thinking: awsb.thinkingCfg,
+        messages: [
+          { role: "user", content: awsb.prompt },
+          { role: "assistant", content },
+          { role: "user", content: "继续，请只回复 OK 两个字母。" },
+        ],
+      },
+    };
+  }
+
+  async function runAwsbStep({ probe, step, runState, ctx, channel, model, onStepUpdate }) {
+    const runner = probe.runner;
+    if (runner === "awsb_seed") {
+      const thinkingCfg = awsbThinkingConfig(model);
+      const baseBody = {
+        max_tokens: 1600,
+        thinking: thinkingCfg,
+        messages: [{ role: "user", content: AWSB_SEED_PROMPT }],
+      };
+      let res = await sendProbeOnce({
+        baseUrl: ctx.base_url,
+        apiKey: ctx.api_key,
+        protocol: channel.protocol,
+        model,
+        body: baseBody,
+      });
+      if (isAwsbThrottled(res)) {
+        return {
+          stepPatch: {
+            status: "fail",
+            throttled: true,
+            http_status: res.http_status,
+            round_statuses: [res.http_status],
+            latency_ms: res.latency_ms,
+            reason: `触发上游限流/日限额（HTTP ${res.http_status}）：${extractResponseMessage(res.json, res.raw_text).slice(0, 140)}`,
+            request_url: res.url,
+            request_body: res.request_body,
+            response_headers: res.headers,
+            response_snippet: res.snippet,
+          },
+          abort: true,
+        };
+      }
+
+      const extractThink = (r) => {
+        const blocks = Array.isArray(r.json?.content) ? r.json.content : [];
+        const tb = blocks.find((b) => b?.type === "thinking" && String(b.signature || "").trim());
+        const textBlocks = blocks
+          .filter((b) => b?.type === "text" && String(b.text || "").trim())
+          .map((b) => ({ type: "text", text: b.text }));
+        return { tb, textBlocks, msgId: r.json?.id || "" };
+      };
+
+      let extracted = res.http_status === 200 ? extractThink(res) : { tb: null, textBlocks: [], msgId: "" };
+      let retriedEffort = false;
+      if (res.http_status === 200 && !extracted.tb && !OLD_ANTHROPIC_THINKING.test(model)) {
+        retriedEffort = true;
+        const r2 = await sendProbeOnce({
+          baseUrl: ctx.base_url,
+          apiKey: ctx.api_key,
+          protocol: channel.protocol,
+          model,
+          body: { ...baseBody, output_config: { effort: "high" } },
+        });
+        if (isAwsbThrottled(r2)) {
+          return {
+            stepPatch: {
+              status: "fail",
+              throttled: true,
+              http_status: r2.http_status,
+              round_statuses: [r2.http_status],
+              latency_ms: r2.latency_ms,
+              reason: `重试采集素材时触发限流/日限额（HTTP ${r2.http_status}）`,
+              request_url: r2.url,
+              request_body: r2.request_body,
+              response_headers: r2.headers,
+              response_snippet: r2.snippet,
+            },
+            abort: true,
+          };
+        }
+        res = r2;
+        if (res.http_status === 200) extracted = extractThink(res);
+      }
+
+      if (res.http_status !== 200) {
+        return {
+          stepPatch: {
+            status: "fail",
+            http_status: res.http_status,
+            round_statuses: [res.http_status],
+            latency_ms: res.latency_ms,
+            reason: `采集素材失败（HTTP ${res.http_status}）：${extractResponseMessage(res.json, res.raw_text).slice(0, 160)}`,
+            request_url: res.url,
+            request_body: res.request_body,
+            response_headers: res.headers,
+            response_snippet: res.snippet,
+          },
+          abort: true,
+        };
+      }
+      if (!extracted.tb) {
+        return {
+          stepPatch: {
+            status: "fail",
+            http_status: res.http_status,
+            round_statuses: [res.http_status],
+            latency_ms: res.latency_ms,
+            reason: `HTTP 200 但响应未返回带 signature 的 thinking 块${retriedEffort ? "（已自动用 effort=high 重试）" : ""}，无法进行 S1–S8 签名校验`,
+            request_url: res.url,
+            request_body: res.request_body,
+            response_headers: res.headers,
+            response_snippet: res.snippet,
+          },
+          abort: true,
+        };
+      }
+
+      const idKind = classifyMsgId(extracted.msgId);
+      runState.awsb = {
+        prompt: AWSB_SEED_PROMPT,
+        thinkingCfg,
+        origThinking: extracted.tb.thinking || "",
+        origSig: extracted.tb.signature,
+        textBlocks: extracted.textBlocks,
+        msgId: extracted.msgId,
+      };
+      return {
+        stepPatch: {
+          status: "pass",
+          http_status: res.http_status,
+          round_statuses: [res.http_status],
+          latency_ms: res.latency_ms,
+          msg_id_kind: idKind,
+          strong_hit: idKind === "bdrk",
+          counter_hit: idKind === "msg_01",
+          reason: `已采集真实 thinking 块（签名长度 ${extracted.tb.signature.length}）· 消息 ID: ${extracted.msgId || "（空）"}`,
+          request_url: res.url,
+          request_body: res.request_body,
+          response_headers: res.headers,
+          response_snippet: res.snippet,
+        },
+        abort: false,
+      };
+    }
+
+    // S1 - S8 签名校验场景
+    const awsb = runState.awsb;
+    if (!awsb) {
+      return {
+        stepPatch: { status: "skip", reason: "前置未获取到 thinking + signature 素材，跳过" },
+        abort: false,
+      };
+    }
+
+    const rounds = Math.max(1, probe.rounds || 2);
+    const reqSpec = buildAwsbScenarioRequest(runner, awsb);
+    const roundResults = [];
+
+    for (let rIdx = 0; rIdx < rounds; rIdx++) {
+      const r = await sendProbeOnce({
+        baseUrl: ctx.base_url,
+        apiKey: ctx.api_key,
+        protocol: channel.protocol,
+        model,
+        body: reqSpec.body,
+        stream: reqSpec.stream,
+      });
+      roundResults.push(r);
+      if (isAwsbThrottled(r)) {
+        return {
+          stepPatch: {
+            status: "fail",
+            throttled: true,
+            http_status: r.http_status,
+            round_statuses: roundResults.map((x) => x.http_status),
+            latency_ms: roundResults.reduce((s, x) => s + (x.latency_ms || 0), 0),
+            reason: `第 ${rIdx + 1} 轮触发限流/日限额（HTTP ${r.http_status}）：${extractResponseMessage(r.json, r.raw_text).slice(0, 140)}`,
+            request_url: r.url,
+            request_body: r.request_body,
+            response_headers: r.headers,
+            response_snippet: r.snippet,
+          },
+          abort: true,
+        };
+      }
+      if (rIdx + 1 < rounds && onStepUpdate) {
+        onStepUpdate({
+          ...step,
+          status: "running",
+          round_statuses: roundResults.map((x) => x.http_status),
+          reason: `第 ${rIdx + 1}/${rounds} 轮完成 (HTTP ${r.http_status})，正在执行第 ${rIdx + 2}/${rounds} 轮…`,
+        });
+      }
+    }
+
+    const statuses = roundResults.map((r) => r.http_status);
+    const totalMs = roundResults.reduce((s, r) => s + (r.latency_ms || 0), 0);
+    const roundConflict = new Set(statuses).size > 1;
+    const last = roundResults[roundResults.length - 1];
+    const combinedSnippet = roundResults
+      .map((r, idx) => `[第 ${idx + 1} 轮 HTTP ${r.http_status} · ${r.latency_ms}ms]\n${r.snippet}`)
+      .join("\n\n")
+      .slice(0, MAX_BODY_SNIPPET);
+
+    const expect200 = probe.expect_status.includes(200);
+    const msgIds = roundResults.map((r) => r.json?.id || "").filter(Boolean);
+    const idKinds = msgIds.map(classifyMsgId);
+    const msgIdKind = idKinds.includes("msg_01") ? "msg_01" : idKinds.includes("bdrk") ? "bdrk" : idKinds[0] || "";
+    const hasBedrockRuntime = roundResults.some((r) => /Bedrock Runtime:\s*InvokeModel/i.test(r.raw_text || ""));
+
+    if (roundConflict) {
+      return {
+        stepPatch: {
+          status: "fail",
+          http_status: last.http_status,
+          round_statuses: statuses,
+          round_conflict: true,
+          latency_ms: totalMs,
+          msg_id_kind: msgIdKind,
+          has_bedrock_runtime: hasBedrockRuntime,
+          reason: `两轮结果不一致（HTTP ${statuses.join(" / ")}），疑似号池混掺或链路不稳定`,
+          request_url: last.url,
+          request_body: last.request_body,
+          response_headers: last.headers,
+          response_snippet: combinedSnippet,
+        },
+        abort: false,
+      };
+    }
+
+    if (expect200) {
+      if (statuses[0] === 200) {
+        if (msgIdKind === "msg_01") {
+          return {
+            stepPatch: {
+              status: "fail",
+              http_status: 200,
+              round_statuses: statuses,
+              latency_ms: totalMs,
+              msg_id_kind: "msg_01",
+              counter_hit: true,
+              reason: `HTTP ${statuses.join(" / ")} 但返回 Anthropic 消息 ID (${msgIds[0]})，非 AWS Bedrock (msg_bdrk_)`,
+              request_url: last.url,
+              request_body: last.request_body,
+              response_headers: last.headers,
+              response_snippet: combinedSnippet,
+            },
+            abort: false,
+          };
+        }
+        return {
+          stepPatch: {
+            status: "pass",
+            http_status: 200,
+            round_statuses: statuses,
+            latency_ms: totalMs,
+            msg_id_kind: msgIdKind,
+            strong_hit: msgIdKind === "bdrk",
+            status_rewritten: msgIdKind !== "bdrk",
+            reason:
+              msgIdKind === "bdrk"
+                ? `HTTP ${statuses.join(" / ")} 全部通过 · 命中 msg_bdrk_ (${msgIds[0]})`
+                : `HTTP ${statuses.join(" / ")} 全部通过（消息 ID: ${msgIds[0] || "无 msg_bdrk_ 前缀"}）`,
+            request_url: last.url,
+            request_body: last.request_body,
+            response_headers: last.headers,
+            response_snippet: combinedSnippet,
+          },
+          abort: false,
+        };
+      }
+      const errMsg = extractResponseMessage(last.json, last.raw_text).slice(0, 160);
+      const isS4Fail = runner === "awsb_s4" && statuses[0] === 400;
+      return {
+        stepPatch: {
+          status: "fail",
+          http_status: last.http_status,
+          round_statuses: statuses,
+          latency_ms: totalMs,
+          msg_id_kind: msgIdKind,
+          has_bedrock_runtime: hasBedrockRuntime,
+          counter_hit: isS4Fail,
+          reason: isS4Fail
+            ? `S4 返回 HTTP ${statuses.join(" / ")}（真 Bedrock 必为 200，返回 400 说明是 Anthropic 直连或自研校验网关）：${errMsg}`
+            : `期望 HTTP 200 但返回 ${statuses.join(" / ")}：${errMsg}`,
+          request_url: last.url,
+          request_body: last.request_body,
+          response_headers: last.headers,
+          response_snippet: combinedSnippet,
+        },
+        abort: false,
+      };
+    }
+
+    // 期望 400 的场景（S2 / S3 / S5 / S6 / S7）
+    if (statuses[0] === 200) {
+      return {
+        stepPatch: {
+          status: "fail",
+          http_status: 200,
+          round_statuses: statuses,
+          latency_ms: totalMs,
+          param_stripped: true,
+          reason: probe.pass_200_hint || `返回 HTTP ${statuses.join(" / ")}，未按预期拒绝非法签名`,
+          request_url: last.url,
+          request_body: last.request_body,
+          response_headers: last.headers,
+          response_snippet: combinedSnippet,
+        },
+        abort: false,
+      };
+    }
+
+    const evals = roundResults.map((r) =>
+      evaluateProbeResponse({
+        probe,
+        protocol: channel.protocol,
+        httpStatus: r.http_status,
+        json: r.json,
+        rawText: r.raw_text,
+      }),
+    );
+    const allPass = evals.every((e) => e.status === "pass");
+    const lastEval = evals[evals.length - 1];
+    return {
+      stepPatch: {
+        status: allPass ? "pass" : "fail",
+        http_status: last.http_status,
+        round_statuses: statuses,
+        latency_ms: totalMs,
+        strong_hit: evals.every((e) => e.strong_hit),
+        has_bedrock_runtime: hasBedrockRuntime,
+        status_rewritten: evals.some((e) => e.status_rewritten),
+        matched_patterns: lastEval.matched_patterns,
+        reason: allPass
+          ? `HTTP ${statuses.join(" / ")} 全部拒绝${hasBedrockRuntime ? " · 含 Bedrock Runtime 原生堆栈" : "（未见 Bedrock Runtime 前缀）"}`
+          : lastEval.reason,
+        request_url: last.url,
+        request_body: last.request_body,
+        response_headers: last.headers,
+        response_snippet: combinedSnippet,
+      },
+      abort: false,
+    };
+  }
+
   async function executeVerifyRun({ runId, ctx, channel, model }) {
     const startedMs = Date.now();
     const enabledProbes = channel.probes.filter((p) => p.enabled !== false);
@@ -1189,6 +1990,13 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       id: p.id,
       name: p.name,
       kind: p.kind,
+      runner: p.runner || "",
+      rounds: p.rounds || 1,
+      round_statuses: [],
+      throttled: false,
+      round_conflict: false,
+      has_bedrock_runtime: false,
+      msg_id_kind: "",
       request_desc: p.request_desc,
       expect_desc: p.expect_desc,
       expect_status: p.expect_status,
@@ -1214,17 +2022,41 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     saveRunSteps(runId, steps);
 
     let abortRemaining = false;
+    let abortReason = "基准连通性失败，跳过该探针";
+    const runState = {};
     try {
       for (let i = 0; i < enabledProbes.length; i++) {
         const probe = enabledProbes[i];
         if (abortRemaining) {
           steps[i].status = "skip";
-          steps[i].reason = "基准连通性失败，跳过该探针";
+          steps[i].reason = abortReason;
           saveRunSteps(runId, steps);
           continue;
         }
         steps[i].status = "running";
         saveRunSteps(runId, steps);
+
+        if (String(probe.runner || "").startsWith("awsb_")) {
+          const out = await runAwsbStep({
+            probe,
+            step: steps[i],
+            runState,
+            ctx,
+            channel,
+            model,
+            onStepUpdate: (updatedStep) => {
+              steps[i] = updatedStep;
+              saveRunSteps(runId, steps);
+            },
+          });
+          steps[i] = { ...steps[i], ...out.stepPatch };
+          if (out.abort) {
+            abortRemaining = true;
+            abortReason = out.stepPatch.throttled ? "触发限流/日限额，终止后续场景" : "前置素材采集失败，跳过该场景";
+          }
+          saveRunSteps(runId, steps);
+          continue;
+        }
 
         let attemptRes = await sendProbeOnce({
           baseUrl: ctx.base_url,
@@ -1257,6 +2089,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
           ...steps[i],
           status: evalRes.status,
           http_status: attemptRes.http_status,
+          round_statuses: attemptRes.http_status != null ? [attemptRes.http_status] : [],
           latency_ms: attemptRes.latency_ms,
           reason: usedFallback
             ? `首次请求返回 HTTP 200（模型支持该开关），已自动补发校验请求：${evalRes.reason}`

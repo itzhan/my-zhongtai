@@ -194,6 +194,8 @@ export type VerifyProbe = {
   id: string;
   name: string;
   kind: "baseline" | "fingerprint";
+  runner?: string;
+  rounds?: number;
   enabled: boolean;
   request_desc: string;
   expect_desc: string;
@@ -260,6 +262,10 @@ export type VerifyStep = {
   id: string;
   name: string;
   kind: "baseline" | "fingerprint";
+  runner?: string;
+  rounds?: number;
+  round_statuses?: number[];
+  throttled?: boolean;
   request_desc: string;
   expect_desc: string;
   expect_status: number[];
