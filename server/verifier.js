@@ -456,6 +456,111 @@ export function buildProbeHttpRequest({ baseUrl, apiKey, protocol, model, body }
   };
 }
 
+export function normalizeUpstreamBase(raw) {
+  return String(raw || "")
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/(chat\/completions|messages|responses|models)$/i, "");
+}
+
+function extractModelsFromPayload(json) {
+  if (!json || typeof json !== "object") return null;
+  let items = null;
+  if (Array.isArray(json.data)) items = json.data;
+  else if (Array.isArray(json.models)) items = json.models;
+  else if (Array.isArray(json)) items = json;
+  if (!items) return null;
+
+  const out = [];
+  const seen = new Set();
+  for (const item of items) {
+    if (item && typeof item === "object" && Array.isArray(item.supportedGenerationMethods) && item.supportedGenerationMethods.length > 0) {
+      if (!item.supportedGenerationMethods.includes("generateContent")) continue;
+    }
+    const rawId = typeof item === "string" ? item : item?.id || item?.name;
+    const id = str(rawId, 150).replace(/^models\//i, "");
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+export async function fetchUpstreamModels({ baseUrl, apiKey, fetchImpl = fetch, timeoutMs = 15_000, httpError }) {
+  const err = (status, msg) => (httpError ? httpError(status, msg) : Object.assign(new Error(msg), { status }));
+  const cleanBase = normalizeUpstreamBase(baseUrl);
+  if (!/^https?:\/\/[^/\s]+/i.test(cleanBase)) throw err(400, "上游站点 URL 需以 http:// 或 https:// 开头");
+  const key = str(apiKey, 1000);
+  if (!key) throw err(400, "请先提供 API Key 再获取上游模型");
+
+  const rootNoVer = cleanBase.replace(/\/(v1beta|v1)$/i, "");
+  const isV1Beta = /\/v1beta$/i.test(cleanBase);
+  const candidates = [];
+  const addCand = (url, tag, kind) => {
+    if (!candidates.some((c) => c.url === url)) candidates.push({ url, tag, kind });
+  };
+
+  if (isV1Beta) {
+    addCand(`${cleanBase}/models`, "/v1beta/models", "gemini");
+    addCand(`${rootNoVer}/v1/models`, "/v1/models", "openai");
+  } else {
+    addCand(`${rootNoVer}/v1/models`, "/v1/models", "openai");
+    addCand(`${rootNoVer}/v1beta/models`, "/v1beta/models", "gemini");
+    if (cleanBase !== rootNoVer && !/\/v1$/i.test(cleanBase)) {
+      addCand(`${cleanBase}/models`, "/models", "openai");
+    }
+  }
+
+  let authFailed = false;
+  let lastError = "";
+  for (const c of candidates) {
+    const headers =
+      c.kind === "gemini"
+        ? { Accept: "application/json", "x-goog-api-key": key, Authorization: `Bearer ${key}` }
+        : {
+            Accept: "application/json",
+            Authorization: `Bearer ${key}`,
+            "x-api-key": key,
+            "api-key": key,
+            "anthropic-version": "2023-06-01",
+          };
+    try {
+      const res = await fetchImpl(c.url, { method: "GET", headers, signal: AbortSignal.timeout(timeoutMs) });
+      const text = await res.text();
+      const json = parseJsonSafe(text, null);
+      if (res.status === 401 || res.status === 403) {
+        authFailed = true;
+        lastError = `HTTP ${res.status} ${redactSecret(extractResponseMessage(json, text), key).slice(0, 120)}`;
+        continue;
+      }
+      if (!res.ok) {
+        lastError = `HTTP ${res.status} ${redactSecret(extractResponseMessage(json, text), key).slice(0, 120)}`;
+        continue;
+      }
+      const ids = extractModelsFromPayload(json);
+      if (ids && ids.length > 0) {
+        ids.sort((a, b) => a.localeCompare(b));
+        return {
+          models: ids.map((id) => ({ id, requested: id, label: id, source: c.tag })),
+          endpoint: c.tag,
+          count: ids.length,
+        };
+      }
+      if (ids && ids.length === 0) {
+        lastError = `${c.tag} 返回模型列表为空`;
+      } else {
+        lastError = `${c.tag} 返回格式不是标准的模型列表`;
+      }
+    } catch (e) {
+      const aborted = e?.name === "TimeoutError" || e?.name === "AbortError";
+      lastError = aborted ? "请求超时" : redactSecret(e?.cause?.message || e?.message || e, key);
+    }
+  }
+
+  if (authFailed) throw err(400, "上游鉴权失败（HTTP 401/403），请检查 URL 或 API Key");
+  throw err(502, `获取上游模型失败：${lastError || "接口无响应"}（仍可手动输入模型名称）`);
+}
+
 function testPatterns(patterns, text) {
   const matched = [];
   const missed = [];
@@ -866,7 +971,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     if (!full) throw httpError(404, "账号不存在");
     const listItem = accounts.find((a) => a.id === accountId);
     const creds = parseCredsObject(full.credentials);
-    const baseUrl = str(creds.base_url, 500).replace(/\/+$/, "");
+    const baseUrl = normalizeUpstreamBase(str(creds.base_url, 500));
     const mapping = creds.model_mapping && typeof creds.model_mapping === "object" ? creds.model_mapping : {};
 
     // 多级读取明文 SK（绝不回传前端，只用于后端向供应商站点发起检测）
@@ -939,8 +1044,11 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       } catch {}
     }
 
-    // 聚合账号可用模型（模型映射 > sub2api 账号模型接口 > 近 7 日日志）
-    const [s2Models, recentLogs] = await Promise.all([
+    // 聚合账号可用模型（模型映射 > 上游标准模型接口 > sub2api 账号模型接口 > 近 7 日日志）
+    const [upstreamRes, s2Models, recentLogs] = await Promise.all([
+      baseUrl && apiKey
+        ? fetchUpstreamModels({ baseUrl, apiKey, fetchImpl, timeoutMs: 8000 }).catch(() => null)
+        : Promise.resolve(null),
       s2("GET", `/admin/accounts/${accountId}/models`).catch(() => []),
       pool
         ? pool
@@ -973,6 +1081,9 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     };
     for (const [reqName, upName] of Object.entries(mapping)) {
       pushModel(upName || reqName, reqName, "模型映射");
+    }
+    for (const m of upstreamRes?.models ?? []) {
+      pushModel(m.id, m.id, "上游模型");
     }
     for (const item of Array.isArray(s2Models) ? s2Models : []) {
       const rawId = typeof item === "string" ? item : item?.id || item?.name;
@@ -1297,7 +1408,48 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     }),
   );
 
-  // ---------- 账号站点 / SK / 可用模型解析 ----------
+  // ---------- 账号站点 / SK / 可用模型解析 & 标准上游模型拉取 ----------
+  app.post(
+    "/api/verify/fetch-models",
+    wrap(async (req) => {
+      const b = req.body || {};
+      if (parseInt(b.account_id, 10) > 0) {
+        const accountId = parseInt(b.account_id, 10);
+        const ctx = await resolveAccountContext(accountId, str(b.api_key_override || b.api_key, 1000));
+        if (!ctx.supported) throw httpError(400, ctx.unsupported_reason);
+        if (!ctx.has_sk) throw httpError(400, "该账号尚未配置可用 SK，请先填写测试 SK");
+        const fetched = await fetchUpstreamModels({
+          baseUrl: ctx.base_url,
+          apiKey: ctx.api_key,
+          fetchImpl,
+          httpError,
+        });
+        const merged = [];
+        const seen = new Set();
+        for (const [reqName, upName] of Object.entries(ctx.model_mapping || {})) {
+          const up = str(upName || reqName, 150);
+          const key = `${up}::${reqName}`;
+          if (!up || seen.has(key)) continue;
+          seen.add(key);
+          merged.push({ id: up, requested: reqName, label: reqName === up ? up : `${up}（映射自 ${reqName}）`, source: "模型映射" });
+        }
+        for (const m of fetched.models) {
+          const key = `${m.id}::${m.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          merged.push(m);
+        }
+        return { models: merged, endpoint: fetched.endpoint, count: merged.length };
+      }
+      return fetchUpstreamModels({
+        baseUrl: b.base_url,
+        apiKey: b.api_key || b.api_key_override,
+        fetchImpl,
+        httpError,
+      });
+    }),
+  );
+
   app.get(
     "/api/verify/accounts/:id/inspect",
     wrap(async (req) => {
@@ -1330,7 +1482,6 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     "/api/verify/runs",
     wrap(async (req) => {
       const b = req.body || {};
-      const accountId = parseInt(b.account_id, 10);
       const channelRow = mustChannel(b.channel_code);
       const channel = channelView(channelRow);
       const enabledFp = channel.probes.filter((p) => p.kind !== "baseline" && p.enabled !== false);
@@ -1338,16 +1489,44 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         throw httpError(400, `渠道「${channel.name}」尚未配置启用的特征探针，请先在「方法论配置」中添加探针`);
       }
 
-      const apiKeyOverride = str(b.api_key_override, 1000);
-      if (apiKeyOverride && b.save_key) {
-        db.prepare(
-          "INSERT INTO verify_account_keys (account_id, api_key, updated_at) VALUES (?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET api_key = excluded.api_key, updated_at = excluded.updated_at",
-        ).run(accountId, apiKeyOverride, nowIso());
+      const isManual = b.mode === "manual" || (!parseInt(b.account_id, 10) && Boolean(b.base_url));
+      let ctx;
+      if (isManual) {
+        const cleanBaseUrl = normalizeUpstreamBase(str(b.base_url, 500));
+        if (!/^https?:\/\/[^/\s]+/i.test(cleanBaseUrl)) {
+          throw httpError(400, "请输入合法的上游站点 URL（需以 http:// 或 https:// 开头）");
+        }
+        const manualKey = str(b.api_key || b.api_key_override, 1000);
+        if (!manualKey) throw httpError(400, "请输入测试 API Key (SK)");
+        let host = cleanBaseUrl;
+        try {
+          host = new URL(cleanBaseUrl).host;
+        } catch {}
+        const targetName = str(b.target_name, 80) || `手动检测 (${host})`;
+        ctx = {
+          account: {
+            id: 0,
+            name: targetName,
+            platform: channel.platform_hint || "",
+          },
+          base_url: cleanBaseUrl,
+          api_key: manualKey,
+          sk_masked: maskSecret(manualKey),
+          sk_source: "manual",
+          model_mapping: {},
+        };
+      } else {
+        const accountId = parseInt(b.account_id, 10);
+        const apiKeyOverride = str(b.api_key_override, 1000);
+        if (apiKeyOverride && b.save_key && Number.isInteger(accountId) && accountId > 0) {
+          db.prepare(
+            "INSERT INTO verify_account_keys (account_id, api_key, updated_at) VALUES (?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET api_key = excluded.api_key, updated_at = excluded.updated_at",
+          ).run(accountId, apiKeyOverride, nowIso());
+        }
+        ctx = await resolveAccountContext(accountId, apiKeyOverride);
+        if (!ctx.supported) throw httpError(400, ctx.unsupported_reason);
+        if (!ctx.has_sk) throw httpError(400, "未能从该账号读取到 SK（api_key），请在界面上补充输入测试 SK 后重试");
       }
-
-      const ctx = await resolveAccountContext(accountId, apiKeyOverride);
-      if (!ctx.supported) throw httpError(400, ctx.unsupported_reason);
-      if (!ctx.has_sk) throw httpError(400, "未能从该账号读取到 SK（api_key），请在界面上补充输入测试 SK 后重试");
 
       const rawModel = str(b.model, 150);
       if (!rawModel) throw httpError(400, "请选择或输入用于测试的模型");

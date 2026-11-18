@@ -94,7 +94,9 @@ function buildMarkdownReport(run: VerifyRun): string {
     `# 渠道真伪鉴定报告 · ${run.channel_name}`,
     "",
     `- **结论**：${meta.label}（置信度评分 ${run.score} 分，特征命中 ${run.matched_count}/${run.total_probes}）`,
-    `- **测试账号**：${run.account_name} (#${run.account_id})`,
+    run.account_id > 0
+      ? `- **测试账号**：${run.account_name} (#${run.account_id})`
+      : `- **检测目标**：${run.account_name}（手动输入 URL 预检）`,
     `- **上游站点**：${run.base_url}`,
     `- **脱敏 SK**：\`${run.sk_masked}\`（来源：${getSkSourceLabel(run.sk_source)}）`,
     `- **测试模型**：${run.model}${run.requested_model && run.requested_model !== run.model ? `（映射自 ${run.requested_model}）` : ""}`,
@@ -360,9 +362,16 @@ export function VerifyReportCard({
 
         <div className="grid gap-3 rounded-lg border p-3.5 text-xs sm:grid-cols-2 lg:grid-cols-3">
           <div>
-            <div className="text-muted-foreground">检测账号</div>
-            <div className="mt-0.5 font-medium">
-              {run.account_name} <span className="text-muted-foreground font-mono">#{run.account_id}</span>
+            <div className="text-muted-foreground">{run.account_id > 0 ? "检测账号" : "检测目标"}</div>
+            <div className="mt-0.5 flex flex-wrap items-center gap-1.5 font-medium">
+              <span>{run.account_name}</span>
+              {run.account_id > 0 ? (
+                <span className="text-muted-foreground font-mono">#{run.account_id}</span>
+              ) : (
+                <Tag tone="info" className="text-[10px]">
+                  手动 URL
+                </Tag>
+              )}
             </div>
           </div>
           <div>

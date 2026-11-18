@@ -13,19 +13,29 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { cn } from "@/lib/utils";
 
 import { del } from "../api";
+import { Tag } from "../components/badges";
 import { Pager, StatCards, useConfirm, usePaged } from "../components/shared";
 import { VerifyReportDialog, VerifyVerdictBadge } from "../components/verify-report";
 import { ago, ms, readErr, time } from "../format";
 import { useInvalidate, useVerifyChannels, useVerifyRuns } from "../hooks";
-import type { VerifyRun } from "../types";
+import type { VerifyPreset, VerifyRun } from "../types";
 
 const ALL = "all";
 
-export function VerifyHistoryView({
-  onRerunPreset,
-}: {
-  onRerunPreset: (preset: { accountId: number; channelCode: string; model: string }) => void;
-}) {
+function toPreset(r: VerifyRun): VerifyPreset {
+  if (r.account_id > 0) {
+    return { mode: "account", accountId: r.account_id, channelCode: r.channel_code, model: r.model };
+  }
+  return {
+    mode: "manual",
+    baseUrl: r.base_url,
+    targetName: r.account_name,
+    channelCode: r.channel_code,
+    model: r.model,
+  };
+}
+
+export function VerifyHistoryView({ onRerunPreset }: { onRerunPreset: (preset: VerifyPreset) => void }) {
   const invalidate = useInvalidate();
   const [confirm, confirmEl] = useConfirm();
   const [kw, setKw] = useState("");
@@ -153,9 +163,15 @@ export function VerifyHistoryView({
                         <div className="text-muted-foreground">{ago(r.started_at)}</div>
                       </TableCell>
                       <TableCell className="max-w-56">
-                        <div className="truncate font-medium">
-                          {r.account_name}{" "}
-                          <span className="text-muted-foreground font-mono text-xs">#{r.account_id}</span>
+                        <div className="flex items-center gap-1.5 font-medium">
+                          <span className="truncate">{r.account_name}</span>
+                          {r.account_id > 0 ? (
+                            <span className="text-muted-foreground shrink-0 font-mono text-xs">#{r.account_id}</span>
+                          ) : (
+                            <Tag tone="info" className="shrink-0 text-[10px]">
+                              手动
+                            </Tag>
+                          )}
                         </div>
                         <div className="text-muted-foreground truncate font-mono text-[11px]" title={r.base_url}>
                           {r.base_url}
@@ -185,13 +201,7 @@ export function VerifyHistoryView({
                             size="sm"
                             variant="ghost"
                             className="h-7 px-2"
-                            onClick={() =>
-                              onRerunPreset({
-                                accountId: r.account_id,
-                                channelCode: r.channel_code,
-                                model: r.model,
-                              })
-                            }
+                            onClick={() => onRerunPreset(toPreset(r))}
                           >
                             <RotateCw className="size-3.5" />
                             复测
@@ -228,7 +238,7 @@ export function VerifyHistoryView({
         onOpenChange={(o) => !o && setViewRunId(null)}
         onRerun={(r) => {
           setViewRunId(null);
-          onRerunPreset({ accountId: r.account_id, channelCode: r.channel_code, model: r.model });
+          onRerunPreset(toPreset(r));
         }}
       />
       {confirmEl}

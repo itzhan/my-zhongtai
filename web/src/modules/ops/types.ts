@@ -307,3 +307,13 @@ export type VerifyRun = {
   duration_ms: number;
   steps?: VerifyStep[];
 };
+
+export type VerifyFetchModelsResp = {
+  models: VerifyModelOption[];
+  endpoint: string;
+  count: number;
+};
+
+export type VerifyPreset =
+  | { mode: "account"; accountId: number; channelCode: string; model: string }
+  | { mode: "manual"; baseUrl: string; targetName: string; channelCode: string; model: string };

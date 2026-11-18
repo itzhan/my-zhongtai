@@ -4,6 +4,7 @@ import { Suspense, useState } from "react";
 
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Embedded, PageHeader, useTabParam } from "@/modules/ops/components/shared";
+import type { VerifyPreset } from "@/modules/ops/types";
 import { VerifyHistoryView } from "@/modules/ops/views/verify-history-view";
 import { VerifyMethodsView } from "@/modules/ops/views/verify-methods-view";
 import { VerifyRunView } from "@/modules/ops/views/verify-run-view";
@@ -20,7 +21,7 @@ function VerifyInner() {
     "run",
   );
   const [methodCode, setMethodCode] = useState<string | undefined>(undefined);
-  const [presetRun, setPresetRun] = useState<{ accountId: number; channelCode: string; model: string } | null>(null);
+  const [presetRun, setPresetRun] = useState<VerifyPreset | null>(null);
 
   return (
     <div className="flex flex-col gap-6">

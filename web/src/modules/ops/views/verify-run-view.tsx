@@ -1,8 +1,20 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Check, ChevronsUpDown, KeyRound, Play, RefreshCw, Search, Settings2, Sparkles } from "lucide-react";
+import {
+  Check,
+  ChevronsUpDown,
+  Download,
+  Globe,
+  KeyRound,
+  Play,
+  RefreshCw,
+  Search,
+  Server,
+  Settings2,
+  Sparkles,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +26,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 
 import { post, put } from "../api";
@@ -22,9 +35,10 @@ import { VerifyReportCard } from "../components/verify-report";
 import { readErr } from "../format";
 import { useAccounts, useInvalidate, useVerifyAccountInspect, useVerifyChannels, useVerifyRun } from "../hooks";
 import { useOps } from "../provider";
-import type { Account, VerifyChannel } from "../types";
+import type { Account, VerifyChannel, VerifyFetchModelsResp, VerifyModelOption, VerifyPreset } from "../types";
 
 const MAX_ACCOUNT_DROPDOWN = 40;
+const URL_RE = /^https?:\/\/[^/\s]+/i;
 
 function protocolLabel(p: string): string {
   switch (p) {
@@ -38,6 +52,20 @@ function protocolLabel(p: string): string {
       return "OpenAI Responses";
     default:
       return p;
+  }
+}
+
+function isRecommendedModel(modelId: string, platformHint?: string): boolean {
+  const m = modelId.toLowerCase();
+  switch (platformHint) {
+    case "gemini":
+      return m.includes("gemini");
+    case "anthropic":
+      return m.includes("claude");
+    case "openai":
+      return /^(gpt|o1|o3|o4|codex|chatgpt)/.test(m);
+    default:
+      return false;
   }
 }
 
@@ -136,11 +164,13 @@ function AccountSearchPicker({
 
 function ModelPicker({
   models,
+  platformHint,
   value,
   onChange,
   disabled,
 }: {
-  models: { id: string; requested: string; label: string; source: string }[];
+  models: VerifyModelOption[];
+  platformHint?: string;
   value: string;
   onChange: (modelId: string, requested: string) => void;
   disabled: boolean;
@@ -153,6 +183,37 @@ function ModelPicker({
     return models.filter((m) => `${m.id} ${m.requested} ${m.source}`.toLowerCase().includes(q));
   }, [models, kw]);
 
+  const { recommended, others } = useMemo(() => {
+    if (!platformHint) return { recommended: [] as VerifyModelOption[], others: filtered };
+    const rec: VerifyModelOption[] = [];
+    const rest: VerifyModelOption[] = [];
+    for (const m of filtered) {
+      if (isRecommendedModel(m.id, platformHint)) rec.push(m);
+      else rest.push(m);
+    }
+    return { recommended: rec, others: rest };
+  }, [filtered, platformHint]);
+
+  const renderItem = (m: VerifyModelOption) => (
+    <CommandItem
+      key={`${m.id}::${m.requested}`}
+      value={`${m.id}::${m.requested}`}
+      onSelect={() => {
+        onChange(m.id, m.requested);
+        setOpen(false);
+      }}
+      className="flex items-center justify-between gap-2"
+    >
+      <div className="flex min-w-0 items-center gap-1.5">
+        <Check className={cn("size-3.5 shrink-0", value === m.id ? "opacity-100" : "opacity-0")} />
+        <span className="truncate font-mono text-xs">{m.label}</span>
+      </div>
+      <Badge variant="secondary" className="shrink-0 text-[10px] font-normal">
+        {m.source}
+      </Badge>
+    </CommandItem>
+  );
+
   return (
     <div className="flex flex-col gap-2 sm:flex-row">
       <Popover open={open} onOpenChange={setOpen}>
@@ -161,42 +222,35 @@ function ModelPicker({
             type="button"
             variant="outline"
             disabled={disabled}
-            className="w-full justify-between font-normal sm:w-72"
+            className="w-full justify-between font-normal sm:w-80"
           >
             <span className="truncate">
-              {models.length ? `从账号模型中选择 (${models.length})` : "账号未配置模型列表"}
+              {models.length ? `从上游可用模型中选择 (${models.length})` : "暂未拉取到模型列表（可手输）"}
             </span>
             <ChevronsUpDown className="ml-2 size-4 shrink-0 opacity-50" />
           </Button>
         </PopoverTrigger>
-        <PopoverContent className="w-80 p-0" align="start">
+        <PopoverContent className="w-96 p-0" align="start">
           <Command shouldFilter={false}>
-            <CommandInput placeholder="搜索账号可用模型…" value={kw} onValueChange={setKw} />
-            <CommandList className="max-h-64">
+            <CommandInput placeholder="搜索可用模型 ID…" value={kw} onValueChange={setKw} />
+            <CommandList className="max-h-72">
               {filtered.length === 0 ? (
                 <CommandEmpty>无匹配模型，可在右侧直接输入模型名</CommandEmpty>
               ) : (
-                <CommandGroup>
-                  {filtered.map((m) => (
-                    <CommandItem
-                      key={`${m.id}::${m.requested}`}
-                      value={`${m.id}::${m.requested}`}
-                      onSelect={() => {
-                        onChange(m.id, m.requested);
-                        setOpen(false);
-                      }}
-                      className="flex items-center justify-between gap-2"
+                <>
+                  {recommended.length ? (
+                    <CommandGroup heading={`匹配当前渠道的模型 (${recommended.length})`}>
+                      {recommended.map(renderItem)}
+                    </CommandGroup>
+                  ) : null}
+                  {others.length ? (
+                    <CommandGroup
+                      heading={recommended.length ? `其他可用模型 (${others.length})` : `可用模型 (${others.length})`}
                     >
-                      <div className="flex min-w-0 items-center gap-1.5">
-                        <Check className={cn("size-3.5 shrink-0", value === m.id ? "opacity-100" : "opacity-0")} />
-                        <span className="truncate font-mono text-xs">{m.label}</span>
-                      </div>
-                      <Badge variant="secondary" className="shrink-0 text-[10px] font-normal">
-                        {m.source}
-                      </Badge>
-                    </CommandItem>
-                  ))}
-                </CommandGroup>
+                      {others.map(renderItem)}
+                    </CommandGroup>
+                  ) : null}
+                </>
               )}
             </CommandList>
           </Command>
@@ -218,33 +272,60 @@ export function VerifyRunView({
   presetRun,
 }: {
   onOpenMethods: (channelCode?: string) => void;
-  presetRun?: { accountId: number; channelCode: string; model: string } | null;
+  presetRun?: VerifyPreset | null;
 }) {
   const invalidate = useInvalidate();
   const accountsQ = useAccounts();
   const channelsQ = useVerifyChannels();
 
-  const [accountId, setAccountId] = useState<number | null>(presetRun?.accountId ?? null);
+  const [inputMode, setInputMode] = useState<"account" | "manual">(presetRun?.mode ?? "account");
+  const [accountId, setAccountId] = useState<number | null>(presetRun?.mode === "account" ? presetRun.accountId : null);
+  const [manualUrl, setManualUrl] = useState<string>(presetRun?.mode === "manual" ? presetRun.baseUrl : "");
+  const [manualKey, setManualKey] = useState<string>("");
+  const [manualName, setManualName] = useState<string>(presetRun?.mode === "manual" ? presetRun.targetName : "");
+
   const [channelCode, setChannelCode] = useState<string>(presetRun?.channelCode ?? "vertex_gemini");
   const [model, setModel] = useState<string>(presetRun?.model ?? "");
   const [requestedModel, setRequestedModel] = useState<string>("");
   const [customSkOpen, setCustomSkOpen] = useState(false);
   const [customSk, setCustomSk] = useState("");
   const [saveSk, setSaveSk] = useState(true);
+
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [fetchStatusText, setFetchStatusText] = useState<string>("");
+  const [fetchErrorText, setFetchErrorText] = useState<string>("");
+  const [accountModelsOverride, setAccountModelsOverride] = useState<VerifyModelOption[] | null>(null);
+  const [manualModels, setManualModels] = useState<VerifyModelOption[]>([]);
+
   const [starting, setStarting] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
-  const initedAccountRef = useRef<number | null>(presetRun?.model ? presetRun.accountId : null);
+  const initedAccountRef = useRef<number | null>(
+    presetRun?.mode === "account" && presetRun.model ? presetRun.accountId : null,
+  );
+  const lastManualAutoFetchRef = useRef<string>("");
 
   useEffect(() => {
     if (!presetRun) return;
-    initedAccountRef.current = presetRun.model ? presetRun.accountId : null;
-    setAccountId(presetRun.accountId);
+    setInputMode(presetRun.mode);
     setChannelCode(presetRun.channelCode);
     setModel(presetRun.model);
     setRequestedModel("");
+    setFetchStatusText("");
+    setFetchErrorText("");
+    if (presetRun.mode === "account") {
+      initedAccountRef.current = presetRun.model ? presetRun.accountId : null;
+      setAccountId(presetRun.accountId);
+      setAccountModelsOverride(null);
+    } else {
+      initedAccountRef.current = null;
+      setManualUrl(presetRun.baseUrl);
+      setManualName(presetRun.targetName);
+      setManualModels([]);
+      lastManualAutoFetchRef.current = "";
+    }
   }, [presetRun]);
 
-  const inspectQ = useVerifyAccountInspect(accountId);
+  const inspectQ = useVerifyAccountInspect(inputMode === "account" ? accountId : null);
   const runQ = useVerifyRun(activeRunId);
 
   const channels = useMemo(() => channelsQ.data ?? [], [channelsQ.data]);
@@ -253,7 +334,7 @@ export function VerifyRunView({
     [channels, channelCode],
   );
 
-  // 切换账号时同步重置模型或自动选中账号首个可用模型
+  // 切换账号时同步重置模型与覆盖模型列表
   const handleSelectAccount = (id: number) => {
     initedAccountRef.current = null;
     setAccountId(id);
@@ -261,13 +342,90 @@ export function VerifyRunView({
     setRequestedModel("");
     setCustomSk("");
     setCustomSkOpen(false);
+    setAccountModelsOverride(null);
+    setFetchStatusText("");
+    setFetchErrorText("");
   };
 
+  // 拉取标准上游模型列表
+  const fetchModelsFromUpstream = useCallback(
+    async ({ silent }: { silent: boolean }) => {
+      if (inputMode === "account") {
+        if (!accountId) return;
+        setFetchingModels(true);
+        setFetchErrorText("");
+        try {
+          const r = await post<VerifyFetchModelsResp>("/verify/fetch-models", {
+            account_id: accountId,
+            api_key_override: customSk.trim() || undefined,
+          });
+          setAccountModelsOverride(r.models);
+          setFetchStatusText(`已从上游 ${r.endpoint} 获取 ${r.count} 个可用模型`);
+          if (!silent) toast.success(`已拉取 ${r.count} 个模型`);
+        } catch (e) {
+          const msg = readErr(e);
+          setFetchErrorText(msg);
+          if (!silent) toast.error(msg);
+        } finally {
+          setFetchingModels(false);
+        }
+        return;
+      }
+
+      const url = manualUrl.trim();
+      const key = manualKey.trim();
+      if (!URL_RE.test(url) || !key) {
+        if (!silent) toast.error("请先填写合法的上游站点 URL 与 API Key");
+        return;
+      }
+      setFetchingModels(true);
+      setFetchErrorText("");
+      try {
+        const r = await post<VerifyFetchModelsResp>("/verify/fetch-models", {
+          base_url: url,
+          api_key: key,
+        });
+        setManualModels(r.models);
+        setFetchStatusText(`已从上游 ${r.endpoint} 获取 ${r.count} 个可用模型`);
+        const pick = r.models.find((m) => isRecommendedModel(m.id, selectedChannel?.platform_hint)) ?? r.models[0];
+        if (!model.trim() && pick) {
+          setModel(pick.id);
+          setRequestedModel(pick.requested);
+        }
+        if (!silent) toast.success(`已拉取 ${r.count} 个模型`);
+      } catch (e) {
+        const msg = readErr(e);
+        setFetchErrorText(msg);
+        if (!silent) toast.error(msg);
+      } finally {
+        setFetchingModels(false);
+      }
+    },
+    [inputMode, accountId, customSk, manualUrl, manualKey, model, selectedChannel?.platform_hint],
+  );
+
+  // 手动模式：输入完整 URL + Key 后自动防抖 600ms 拉取一次标准模型列表
   useEffect(() => {
-    if (!inspectQ.data) return;
+    if (inputMode !== "manual") return;
+    const url = manualUrl.trim();
+    const key = manualKey.trim();
+    if (!URL_RE.test(url) || key.length < 6) return;
+    const sig = `${url}|${key}`;
+    if (lastManualAutoFetchRef.current === sig) return;
+    const timer = setTimeout(() => {
+      lastManualAutoFetchRef.current = sig;
+      void fetchModelsFromUpstream({ silent: true });
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [inputMode, manualUrl, manualKey, fetchModelsFromUpstream]);
+
+  useEffect(() => {
+    if (inputMode !== "account" || !inspectQ.data) return;
     if (initedAccountRef.current === inspectQ.data.account.id) return;
     initedAccountRef.current = inspectQ.data.account.id;
-    const firstModel = inspectQ.data.models[0];
+    const firstModel =
+      inspectQ.data.models.find((m) => isRecommendedModel(m.id, selectedChannel?.platform_hint)) ??
+      inspectQ.data.models[0];
     if (firstModel) {
       setModel(firstModel.id);
       setRequestedModel(firstModel.requested);
@@ -275,7 +433,7 @@ export function VerifyRunView({
     if (!inspectQ.data.has_sk) {
       setCustomSkOpen(true);
     }
-  }, [inspectQ.data]);
+  }, [inputMode, inspectQ.data, selectedChannel?.platform_hint]);
 
   const accounts = accountsQ.data ?? [];
   const selectedAccount = accounts.find((a) => a.id === accountId) ?? null;
@@ -287,6 +445,7 @@ export function VerifyRunView({
       toast.success(customSk.trim() ? "已保存该账号测试 SK" : "已清除本地覆盖 SK");
       setCustomSk("");
       setCustomSkOpen(false);
+      setAccountModelsOverride(null);
       invalidate("verify-inspect");
     } catch (e) {
       toast.error(readErr(e));
@@ -294,19 +453,46 @@ export function VerifyRunView({
   };
 
   const startVerify = async () => {
-    if (!accountId) return toast.error("请先搜索并选择要鉴定的账号");
     if (!selectedChannel) return toast.error("请选择渠道类型");
     if (!selectedChannel.ready) {
       return toast.error(`渠道「${selectedChannel.name}」尚未配置启用的特征探针，请先到「方法论配置」添加探针`);
     }
     const trimmedModel = model.trim();
     if (!trimmedModel) return toast.error("请选择或输入测试模型");
+
+    if (inputMode === "manual") {
+      const url = manualUrl.trim();
+      const key = manualKey.trim();
+      if (!URL_RE.test(url)) return toast.error("请输入合法的上游站点 URL（以 http:// 或 https:// 开头）");
+      if (!key) return toast.error("请输入测试 API Key (SK)");
+      setStarting(true);
+      try {
+        const r = await post<{ id: string }>("/verify/runs", {
+          mode: "manual",
+          base_url: url,
+          api_key: key,
+          target_name: manualName.trim() || undefined,
+          channel_code: selectedChannel.code,
+          model: trimmedModel,
+        });
+        setActiveRunId(r.id);
+        invalidate("verify-runs");
+      } catch (e) {
+        toast.error(readErr(e));
+      } finally {
+        setStarting(false);
+      }
+      return;
+    }
+
+    if (!accountId) return toast.error("请先搜索并选择要鉴定的账号");
     const override = customSk.trim();
     if (!inspectQ.data?.has_sk && !override) return toast.error("未能自动读取该账号的 SK，请先填写测试 SK");
 
     setStarting(true);
     try {
       const r = await post<{ id: string }>("/verify/runs", {
+        mode: "account",
         account_id: accountId,
         channel_code: selectedChannel.code,
         model: trimmedModel,
@@ -329,7 +515,12 @@ export function VerifyRunView({
   };
 
   const inspect = inspectQ.data;
+  const availableModels = inputMode === "manual" ? manualModels : (accountModelsOverride ?? inspect?.models ?? []);
   const isRunning = runQ.data?.status === "running";
+  const targetReady =
+    inputMode === "manual"
+      ? URL_RE.test(manualUrl.trim()) && Boolean(manualKey.trim())
+      : Boolean(accountId && inspect?.supported);
 
   return (
     <div className="flex flex-col gap-6">
@@ -340,111 +531,204 @@ export function VerifyRunView({
             发起渠道鉴定
           </CardTitle>
           <CardDescription>
-            选择账号后自动提取上游站点地址与 SK（仅后端使用并全程脱敏），按所选渠道的方法论逐项探测真伪。
+            支持从平台已有账号发起鉴定，或直接输入未录入站点的 URL 与 Key 进行预检；标准拉取上游可用模型列表，全程脱敏。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
-          {/* Step 1: 搜索选择账号 */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <Label className="text-sm font-medium">1. 搜索并选择平台账号</Label>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-7 px-2 text-xs"
-                onClick={() => accountsQ.refetch()}
-                disabled={accountsQ.isFetching}
+          {/* Step 1: 检测目标来源（平台账号 / 手动 URL + Key） */}
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Label className="text-sm font-medium">1. 选择检测对象</Label>
+              <Tabs
+                value={inputMode}
+                onValueChange={(v) => {
+                  const next = v as "account" | "manual";
+                  setInputMode(next);
+                  setFetchStatusText("");
+                  setFetchErrorText("");
+                }}
               >
-                <RefreshCw className={cn("size-3", accountsQ.isFetching && "animate-spin")} />
-                刷新账号
-              </Button>
+                <TabsList className="h-8">
+                  <TabsTrigger value="account" className="h-6 px-3 text-xs">
+                    <Server className="size-3.5" />
+                    选择平台账号
+                  </TabsTrigger>
+                  <TabsTrigger value="manual" className="h-6 px-3 text-xs">
+                    <Globe className="size-3.5" />
+                    直接输入 URL 与 Key
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
             </div>
-            <AccountSearchPicker
-              accounts={accounts}
-              value={accountId}
-              onChange={handleSelectAccount}
-              loading={accountsQ.isLoading}
-            />
 
-            {accountId ? (
-              inspectQ.isLoading ? (
-                <Skeleton className="h-20 w-full" />
-              ) : inspectQ.isError ? (
-                <div className="border-danger/30 bg-danger/5 text-danger rounded-lg border px-3 py-2 text-xs">
-                  读取账号配置失败：{readErr(inspectQ.error)}
+            {inputMode === "account" ? (
+              <div className="space-y-2">
+                <div className="flex items-center justify-end">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={() => accountsQ.refetch()}
+                    disabled={accountsQ.isFetching}
+                  >
+                    <RefreshCw className={cn("size-3", accountsQ.isFetching && "animate-spin")} />
+                    刷新账号
+                  </Button>
                 </div>
-              ) : inspect ? (
-                <div className="bg-muted/30 space-y-3 rounded-lg border p-3.5 text-xs">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-medium">{inspect.account.name}</span>
-                      <span className="text-muted-foreground font-mono">#{inspect.account.id}</span>
-                      {selectedAccount ? <AccountStatus a={selectedAccount} /> : null}
+                <AccountSearchPicker
+                  accounts={accounts}
+                  value={accountId}
+                  onChange={handleSelectAccount}
+                  loading={accountsQ.isLoading}
+                />
+
+                {accountId ? (
+                  inspectQ.isLoading ? (
+                    <Skeleton className="h-20 w-full" />
+                  ) : inspectQ.isError ? (
+                    <div className="border-danger/30 bg-danger/5 text-danger rounded-lg border px-3 py-2 text-xs">
+                      读取账号配置失败：{readErr(inspectQ.error)}
                     </div>
+                  ) : inspect ? (
+                    <div className="bg-muted/30 space-y-3 rounded-lg border p-3.5 text-xs">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-medium">{inspect.account.name}</span>
+                          <span className="text-muted-foreground font-mono">#{inspect.account.id}</span>
+                          {selectedAccount ? <AccountStatus a={selectedAccount} /> : null}
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          onClick={() => setCustomSkOpen((v) => !v)}
+                        >
+                          <KeyRound className="size-3.5" />
+                          {customSkOpen ? "收起 SK 设置" : "更换 / 覆盖测试 SK"}
+                        </Button>
+                      </div>
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <div>
+                          <span className="text-muted-foreground">上游站点地址：</span>
+                          {inspect.supported ? (
+                            <span className="font-mono break-all">{inspect.base_url}</span>
+                          ) : (
+                            <span className="text-danger">{inspect.unsupported_reason}</span>
+                          )}
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">检测 SK：</span>
+                          {inspect.has_sk ? (
+                            <span className="text-success font-mono">{inspect.sk_masked}（已就绪）</span>
+                          ) : (
+                            <span className="text-warning">未自动读取到明文 SK，请在下方填入测试 SK</span>
+                          )}
+                        </div>
+                      </div>
+                      {customSkOpen ? (
+                        <div className="bg-background space-y-2 rounded-md border p-3">
+                          <Label htmlFor="verify-sk-input" className="text-xs">
+                            手动填入 / 覆盖该账号测试 SK
+                          </Label>
+                          <div className="flex flex-wrap gap-2">
+                            <Input
+                              id="verify-sk-input"
+                              type="password"
+                              autoComplete="off"
+                              className="h-8 flex-1 font-mono text-xs"
+                              placeholder={inspect.has_sk ? "留空则继续使用自动读取的 SK" : "输入 sk-… 或上游 API Key"}
+                              value={customSk}
+                              onChange={(e) => setCustomSk(e.target.value)}
+                            />
+                            {customSk.trim() ? (
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                className="h-8"
+                                onClick={saveStandaloneKey}
+                              >
+                                仅保存 SK
+                              </Button>
+                            ) : inspect.sk_source === "saved_key" ? (
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                className="h-8"
+                                onClick={saveStandaloneKey}
+                              >
+                                清除覆盖 SK
+                              </Button>
+                            ) : null}
+                          </div>
+                          <label className="text-muted-foreground flex items-center gap-2 text-xs">
+                            <Checkbox checked={saveSk} onCheckedChange={(v) => setSaveSk(!!v)} />
+                            启动检测时同时记住该 SK，下次选此账号自动复用
+                          </label>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null
+                ) : null}
+              </div>
+            ) : (
+              <div className="bg-muted/20 space-y-3 rounded-lg border p-4">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="manual-url" className="text-xs">
+                      上游站点 URL *
+                    </Label>
+                    <Input
+                      id="manual-url"
+                      placeholder="https://api.example.com（可带或不带 /v1）"
+                      className="font-mono text-xs"
+                      value={manualUrl}
+                      onChange={(e) => setManualUrl(e.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="manual-name" className="text-xs">
+                      备注名称（可选，方便历史记录识别）
+                    </Label>
+                    <Input
+                      id="manual-name"
+                      placeholder="如 某供应商-Vertex 试测（留空自动按域名命名）"
+                      className="text-xs"
+                      value={manualName}
+                      onChange={(e) => setManualName(e.target.value)}
+                    />
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="manual-key" className="text-xs">
+                    测试 API Key (SK) *
+                  </Label>
+                  <div className="flex flex-col gap-2 sm:flex-row">
+                    <Input
+                      id="manual-key"
+                      type="password"
+                      autoComplete="off"
+                      placeholder="sk-… 或供应商 API Key（仅用于本次测试与拉取模型，报告中会自动脱敏）"
+                      className="flex-1 font-mono text-xs"
+                      value={manualKey}
+                      onChange={(e) => setManualKey(e.target.value)}
+                    />
                     <Button
                       type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 px-2 text-xs"
-                      onClick={() => setCustomSkOpen((v) => !v)}
+                      variant="outline"
+                      disabled={fetchingModels || !URL_RE.test(manualUrl.trim()) || !manualKey.trim()}
+                      onClick={() => fetchModelsFromUpstream({ silent: false })}
                     >
-                      <KeyRound className="size-3.5" />
-                      {customSkOpen ? "收起 SK 设置" : "更换 / 覆盖测试 SK"}
+                      <Download className={cn("size-4", fetchingModels && "animate-pulse")} />
+                      {fetchingModels ? "拉取中…" : "获取模型列表"}
                     </Button>
                   </div>
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    <div>
-                      <span className="text-muted-foreground">上游站点地址：</span>
-                      {inspect.supported ? (
-                        <span className="font-mono break-all">{inspect.base_url}</span>
-                      ) : (
-                        <span className="text-danger">{inspect.unsupported_reason}</span>
-                      )}
-                    </div>
-                    <div>
-                      <span className="text-muted-foreground">检测 SK：</span>
-                      {inspect.has_sk ? (
-                        <span className="text-success font-mono">{inspect.sk_masked}（已就绪）</span>
-                      ) : (
-                        <span className="text-warning">未自动读取到明文 SK，请在下方填入测试 SK</span>
-                      )}
-                    </div>
-                  </div>
-                  {customSkOpen ? (
-                    <div className="bg-background space-y-2 rounded-md border p-3">
-                      <Label htmlFor="verify-sk-input" className="text-xs">
-                        手动填入 / 覆盖该账号测试 SK
-                      </Label>
-                      <div className="flex flex-wrap gap-2">
-                        <Input
-                          id="verify-sk-input"
-                          type="password"
-                          autoComplete="off"
-                          className="h-8 flex-1 font-mono text-xs"
-                          placeholder={inspect.has_sk ? "留空则继续使用自动读取的 SK" : "输入 sk-… 或上游 API Key"}
-                          value={customSk}
-                          onChange={(e) => setCustomSk(e.target.value)}
-                        />
-                        {customSk.trim() ? (
-                          <Button type="button" size="sm" variant="outline" className="h-8" onClick={saveStandaloneKey}>
-                            仅保存 SK
-                          </Button>
-                        ) : inspect.sk_source === "saved_key" ? (
-                          <Button type="button" size="sm" variant="outline" className="h-8" onClick={saveStandaloneKey}>
-                            清除覆盖 SK
-                          </Button>
-                        ) : null}
-                      </div>
-                      <label className="text-muted-foreground flex items-center gap-2 text-xs">
-                        <Checkbox checked={saveSk} onCheckedChange={(v) => setSaveSk(!!v)} />
-                        启动检测时同时记住该 SK，下次选此账号自动复用
-                      </label>
-                    </div>
-                  ) : null}
                 </div>
-              ) : null
-            ) : null}
+              </div>
+            )}
           </div>
 
           {/* Step 2: 选择渠道类型 */}
@@ -524,20 +808,40 @@ export function VerifyRunView({
 
           {/* Step 3: 选择测试模型 */}
           <div className="space-y-2">
-            <Label className="text-sm font-medium">3. 选择测试模型（从账号可用模型中选择或手动输入）</Label>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Label className="text-sm font-medium">3. 选择测试模型（标准拉取上游可用模型或直接输入）</Label>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-xs"
+                disabled={fetchingModels || !targetReady}
+                onClick={() => fetchModelsFromUpstream({ silent: false })}
+              >
+                <RefreshCw className={cn("size-3", fetchingModels && "animate-spin")} />
+                {fetchingModels ? "拉取上游模型中…" : "拉取上游模型"}
+              </Button>
+            </div>
             <ModelPicker
-              models={inspect?.models ?? []}
+              models={availableModels}
+              platformHint={selectedChannel?.platform_hint}
               value={model}
-              disabled={!accountId || inspectQ.isLoading}
+              disabled={inputMode === "account" ? !accountId || inspectQ.isLoading : false}
               onChange={(mId, reqId) => {
                 setModel(mId);
                 setRequestedModel(reqId);
               }}
             />
-            <p className="text-muted-foreground text-xs">
-              模型列表自动汇总自该账号的「模型映射」、「sub2api 账号模型接口」与「近 7
-              日实际调用」；选中映射模型时会自动发送上游映射名。
-            </p>
+            {fetchStatusText ? (
+              <p className="text-success text-xs">{fetchStatusText}</p>
+            ) : fetchErrorText ? (
+              <p className="text-warning text-xs">{fetchErrorText}</p>
+            ) : (
+              <p className="text-muted-foreground text-xs">
+                自动通过标准接口（<code className="font-mono">GET /v1/models</code> 与{" "}
+                <code className="font-mono">GET /v1beta/models</code>）拉取上游真实可用模型；也支持直接填写任意模型名。
+              </p>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
@@ -553,7 +857,7 @@ export function VerifyRunView({
             <Button
               type="button"
               size="lg"
-              disabled={starting || isRunning || !accountId || !selectedChannel?.ready || !inspect?.supported}
+              disabled={starting || isRunning || !targetReady || !selectedChannel?.ready || !model.trim()}
               onClick={startVerify}
             >
               <Play className="size-4" />
