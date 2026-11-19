@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
@@ -80,13 +80,22 @@ export function Embedded({ children }: { children: ReactNode }) {
 }
 
 // 页面内 tab 记在地址栏 ?tab=，刷新、分享链接都能回到同一个 tab（使用的页面需包一层 <Suspense>）
+// 选中态先写本地 state：只靠 router.replace 时，Next 的 searchParams 更新可能不触发重渲染，点了 tab 没反应
 export function useTabParam<T extends string>(tabs: readonly T[], fallback: T): [T, (t: string) => void] {
   const params = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
   const cur = params.get("tab");
-  const tab = tabs.includes(cur as T) ? (cur as T) : fallback;
-  const setTab = (t: string) => router.replace(t === fallback ? pathname : `${pathname}?tab=${t}`, { scroll: false });
+  const fromUrl = tabs.includes(cur as T) ? (cur as T) : fallback;
+  const [tab, setTabState] = useState(fromUrl);
+  useEffect(() => {
+    setTabState(fromUrl);
+  }, [fromUrl]);
+  const setTab = (t: string) => {
+    const next = tabs.includes(t as T) ? (t as T) : fallback;
+    setTabState(next);
+    router.replace(next === fallback ? pathname : `${pathname}?tab=${next}`, { scroll: false });
+  };
   return [tab, setTab];
 }
 
