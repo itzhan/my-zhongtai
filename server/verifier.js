@@ -90,6 +90,33 @@ const AS_GEMINI_METHODOLOGY_MD = `### 鉴定原理（AI Studio 真货确认方�
 - 只要出现任意 Vertex 特征文案或文档链接 → 直接判定为 **假（Vertex AI 或 Vertex 掺水）**。
 - **Gemini 3.6+ / 4 注意事项**：新一代 Gemini 3.6+/4 模型本身会忽略超界 \`temperature\` / \`topP\` 并返回 \`HTTP 200\`，因此本渠道判定**不会**因这两项返回 \`200\` 而误判为假，只要其它探针（如 \`candidateCount\` / \`logprobs\`）触发 \`service: generativelanguage.googleapis.com\` 且无 Vertex 特征，仍判定为真。`;
 
+const AZ_GPT_METHODOLOGY_MD = `### 鉴定原理（OpenAI / Azure Responses \`reasoning.encrypted_content\` S0–S5 校验）
+
+本方法论直接向 \`POST /v1/responses\` 发起探测（非 \`/v1/chat/completions\`），利用 GPT 5.x / 6.x / o 系列模型在 Responses API 下返回的加密思考块 \`encrypted_content\`（典型前缀 \`gAAAAA\`，长度约 1500–1700 字符），通过加密续接记忆与篡改/伪造拦截区分 **纯透传真源**、**清洗错误体网关** 与 **假/未校验上游**。
+
+#### 采集与请求规范
+1. **先取真 blob**：首轮使用纯字符串 \`input\` + \`reasoning: { summary: "auto" }\` + \`include: ["reasoning.encrypted_content"]\`（实测纯字符串 \`input\` 比消息数组更稳定产出 reasoning 块），在思考中植入会话代号 **\`AR-5\`**。若拿不到 \`encrypted_content\`，则立即停止后续 S1–S5。
+2. **每场景默认连跑 2 轮**，排除 429 限流、余额不足与模型名不存在导致的误判。
+3. **勿与 AWSB S4 混淆**：AWSB 的 S4 期望为 \`200\`；本套 Responses 校验中 **S2–S5（含 S4="AAAA"）全部期望 \`400 invalid_encrypted_content\`**。
+
+#### S0–S5 测试矩阵
+
+| 场景 | 请求操作 | 真源期望 | 原理与防作假 |
+| --- | --- | --- | --- |
+| **S0** | 不带 \`reasoning\` 发送基础请求 | \`200\`（2 轮） | 确认 \`POST /v1/responses\` 基础可用 |
+| **Seed** | 纯字符串 \`input\` + \`include: ["reasoning.encrypted_content"]\` 记住 \`AR-5\` | \`200\` + \`gAAAAA...\` | 采集真实 \`rs_...\` 与 \`encrypted_content\` 密文块 |
+| **S1** | 明文历史不含 \`AR-5\`，原样回传真 \`encrypted_content\` | \`200\` 且答出 \`AR-5\`（2 轮） | 仅靠解密思考块续接记忆，防止「仅 HTTP 200 但普通对话乱答」 |
+| **S2** | 真 blob 中点翻转 1 个字符 | \`400 invalid_encrypted_content\` | 验证后端是否严格校验加密签名，防止单比特篡改不验 |
+| **S3** | \`encrypted_content: "x"\` | \`400 invalid_encrypted_content\` | 检测是否被网关/假源静默吞掉伪造思考块 |
+| **S4** | \`encrypted_content: "AAAA"\` | \`400 invalid_encrypted_content\` | 排除 Base64 伪块绕过或清洗重试 |
+| **S5** | 1500 字符随机 \`base64url\` 串 | \`400 invalid_encrypted_content\` | 防止按长度放行的浅层假校验 |
+
+#### 判定标准
+- **真（官方 OpenAI / 真 Azure 纯透传）**：\`S0=200\`、\`S1=200 且答出 AR-5\`、\`S2–S5 全部 400\`、客户端可见 \`code: "invalid_encrypted_content"\`（或 \`could not be decrypted or parsed\`），且真 blob 具备 \`gAAAAA\` 前缀。
+- **疑似（上游真源但网关清洗错误体，非纯透传）**：\`S0/S1(AR-5)\` 通过且 \`S2–S5\` 全返回 \`400\`，但客户端只收到 \`upstream_error\` / \`Upstream request failed\` 等被网关重写后的报错，未原样透传 \`invalid_encrypted_content\`（此类情况网关上游极可能为真源，可在渠道自身日志核对）。
+- **假 / 未校验**：\`S2–S5\` 任意一轮返回 \`HTTP 200\`（吞掉伪块或遇到 \`invalid_encrypted_content\` 自动清洗重试变 200）、或拿不到真 blob / \`S1\` 答不出 \`AR-5\`。
+- **无法判定**：限流、余额不足、账号鉴权失败或不支持 Responses reasoning 的旧模型错误。`;
+
 const AWSB_METHODOLOGY_MD = `### 鉴定原理（AWS Bedrock 纯透传黄金口径：S1–S8 Thinking 签名校验）
 
 先以 \`thinking: { type: "adaptive" }\`（旧版 4.5/3.x 模型用 \`enabled + budget_tokens\`，5.x 绝不传 \`budget_tokens\` 或 \`temperature/top_p/top_k\`）采集真实 \`thinking\` 块与 \`signature\`，随后保持会话前缀不变，在第二轮对话里逐一构造以下 **8 项单点变异场景**（每场景默认连跑 **2 轮**）：
@@ -129,13 +156,144 @@ export const BUILTIN_CHANNELS = [
     code: "az_gpt",
     name: "az gpt",
     platform_hint: "openai",
-    protocol: "openai_chat",
+    protocol: "openai_responses",
     sort_order: 2,
-    builtin_version: 1,
-    pass_ratio: 0.8,
-    summary: "Azure OpenAI (AZ GPT) 渠道真伪检测（待补充专属探针，当前已预留方法论配置位）",
-    methodology_md: "### az gpt 检测方法论（待补充）\n\n后续可补充 Azure 特有部署错误、内容审查特征或响应头探针。",
-    probes: [],
+    builtin_version: 2,
+    pass_ratio: 1,
+    summary: "通过 OpenAI Responses (/v1/responses) S0–S5 reasoning.encrypted_content 加密块续接（AR-5 记忆校验）与篡改拦截矩阵，鉴别官方 OpenAI / 真 Azure 纯透传、清洗网关与假源。",
+    methodology_md: AZ_GPT_METHODOLOGY_MD,
+    probes: [
+      {
+        id: "az_s0",
+        name: "S0 · 不带 reasoning 基础连通",
+        kind: "fingerprint",
+        runner: "resp_enc_s0",
+        rounds: 2,
+        enabled: true,
+        request_desc: "向 POST /v1/responses 发送不带 reasoning 的最小纯字符串请求（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 200 且包含合法 Responses 输出结构",
+        request_body: { input: "请只回复 OK 两个字母。" },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "any",
+        must_match: [],
+        strong_match: [],
+        counter_match: [],
+        pass_200_hint: "",
+      },
+      {
+        id: "az_seed",
+        name: "采集真实 encrypted_content（植入代号 AR-5）",
+        kind: "baseline",
+        runner: "resp_enc_seed",
+        rounds: 1,
+        enabled: true,
+        request_desc: "纯字符串 input + reasoning: { summary: \"auto\" } + include: [\"reasoning.encrypted_content\"]，在思考中记住会话代号 AR-5 并提取真 blob",
+        expect_desc: "HTTP 200 且拿到前缀为 gAAAAA、长度 1500+ 字符的 reasoning.encrypted_content（取不到即终止）",
+        request_body: {
+          input: "请先思考并计算 137 × 29 的结果，同时在内部思考中牢记本轮会话代号 AR-5。思考完成后对外正式回复请只输出 READY，不要提及代号。",
+          reasoning: { summary: "auto" },
+          include: ["reasoning.encrypted_content"],
+        },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "any",
+        must_match: [],
+        strong_match: ["gAAAAA"],
+        counter_match: [],
+        pass_200_hint: "",
+      },
+      {
+        id: "az_s1",
+        name: "S1 · 真 blob 原样回传（核验答出 AR-5）",
+        kind: "fingerprint",
+        runner: "resp_enc_s1",
+        rounds: 2,
+        enabled: true,
+        request_desc: "首轮明文历史脱敏（不含 AR-5），原样带回真 encrypted_content 追问会话代号（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 200 且正确答出 AR-5（证明真 blob 确实被上游解密续接）",
+        request_body: { _dynamic: "resp_enc_s1" },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "all",
+        must_match: ["AR-?5"],
+        strong_match: ["AR-?5"],
+        counter_match: [],
+        pass_200_hint: "",
+      },
+      {
+        id: "az_s2",
+        name: "S2 · 真 blob 改 1 个字符",
+        kind: "fingerprint",
+        runner: "resp_enc_s2",
+        rounds: 2,
+        enabled: true,
+        request_desc: "仅将真 encrypted_content 中点翻转 1 个字符后回传（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 且带 invalid_encrypted_content / could not be decrypted or parsed",
+        request_body: { _dynamic: "resp_enc_s2" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["invalid_encrypted_content", "could not be decrypted or parsed"],
+        strong_match: ["invalid_encrypted_content"],
+        counter_match: [],
+        pass_200_hint: "真 blob 篡改 1 字符仍返回 HTTP 200，说明上游不校验加密块或网关清洗重试（假）",
+      },
+      {
+        id: "az_s3",
+        name: "S3 · 伪造短串 \"x\"",
+        kind: "fingerprint",
+        runner: "resp_enc_s3",
+        rounds: 2,
+        enabled: true,
+        request_desc: "将 reasoning.encrypted_content 替换为伪造短串 \"x\"（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 invalid_encrypted_content",
+        request_body: { _dynamic: "resp_enc_s3" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["invalid_encrypted_content", "could not be decrypted or parsed"],
+        strong_match: ["invalid_encrypted_content"],
+        counter_match: [],
+        pass_200_hint: "伪造 encrypted_content=\"x\" 返回 HTTP 200，伪造内容被吞掉，未打到真源（假）",
+      },
+      {
+        id: "az_s4",
+        name: "S4 · 伪造串 \"AAAA\"",
+        kind: "fingerprint",
+        runner: "resp_enc_s4",
+        rounds: 2,
+        enabled: true,
+        request_desc: "将 reasoning.encrypted_content 替换为 \"AAAA\"（连测 2 轮；注意 Responses 下 S4 期望为 400）",
+        expect_desc: "两轮均返回 HTTP 400 invalid_encrypted_content",
+        request_body: { _dynamic: "resp_enc_s4" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["invalid_encrypted_content", "could not be decrypted or parsed"],
+        strong_match: ["invalid_encrypted_content"],
+        counter_match: [],
+        pass_200_hint: "伪造 encrypted_content=\"AAAA\" 返回 HTTP 200（Responses 校验下 S4 必为 400，返回 200 为假）",
+      },
+      {
+        id: "az_s5",
+        name: "S5 · 1500 字符随机串",
+        kind: "fingerprint",
+        runner: "resp_enc_s5",
+        rounds: 2,
+        enabled: true,
+        request_desc: "将 reasoning.encrypted_content 替换为 1500 字符随机 base64url 串（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 invalid_encrypted_content",
+        request_body: { _dynamic: "resp_enc_s5" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["invalid_encrypted_content", "could not be decrypted or parsed"],
+        strong_match: ["invalid_encrypted_content"],
+        counter_match: [],
+        pass_200_hint: "1500 字符伪造随机串返回 HTTP 200，说明完全未解密校验（假）",
+      },
+    ],
   },
   {
     code: "as_gemini",
@@ -784,46 +942,75 @@ export function buildProbeHttpRequest({ baseUrl, apiKey, protocol, model, body }
       body: { model: cleanModel, ...(body ?? {}) },
     };
   }
-  if (protocol === "openai_responses") {
-    const url = /\/responses$/i.test(cleanBase)
-      ? cleanBase
-      : /\/v1$/i.test(cleanBase)
-        ? `${cleanBase}/responses`
-        : `${cleanBase}/v1/responses`;
+  if (protocol === "openai_responses" || protocol === "openai_chat") {
+    const qIdx = cleanBase.indexOf("?");
+    const baseNoQuery = (qIdx >= 0 ? cleanBase.slice(0, qIdx) : cleanBase).replace(/\/+$/, "");
+    const querySuffix = qIdx >= 0 ? cleanBase.slice(qIdx) : "";
+    let hostname = "";
+    let pathname = "";
+    try {
+      const parsed = new URL(baseNoQuery);
+      hostname = parsed.hostname;
+      pathname = parsed.pathname.replace(/\/+$/, "");
+    } catch {}
+    const isOfficialAzure =
+      /\.(openai\.azure|cognitiveservices\.azure)\.com$/i.test(hostname) ||
+      /\.(openai\.azure|cognitiveservices\.azure)\.com/i.test(baseNoQuery);
+    const isJwt = /^eyJ[A-Za-z0-9_-]+\./.test(apiKey);
+    const headers = {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "api-key": apiKey,
+    };
+    if (!(isOfficialAzure && !isJwt)) {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
+
+    if (protocol === "openai_responses") {
+      let urlPath;
+      if (/\/responses$/i.test(baseNoQuery)) {
+        urlPath = baseNoQuery;
+      } else if (/\/v1$/i.test(baseNoQuery)) {
+        urlPath = `${baseNoQuery}/responses`;
+      } else if (isOfficialAzure) {
+        if (!pathname) {
+          urlPath = `${baseNoQuery}/openai/v1/responses`;
+        } else if (/\/openai$/i.test(pathname)) {
+          urlPath = querySuffix ? `${baseNoQuery}/responses` : `${baseNoQuery}/v1/responses`;
+        } else {
+          urlPath = `${baseNoQuery}/v1/responses`;
+        }
+      } else {
+        urlPath = `${baseNoQuery}/v1/responses`;
+      }
+      return {
+        url: `${urlPath}${querySuffix}`,
+        headers,
+        body: { model: cleanModel, ...(body ?? {}) },
+      };
+    }
+
+    const chatPath = /\/chat\/completions$/i.test(baseNoQuery)
+      ? baseNoQuery
+      : /\/v1$/i.test(baseNoQuery)
+        ? `${baseNoQuery}/chat/completions`
+        : `${baseNoQuery}/v1/chat/completions`;
     return {
-      url,
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "api-key": apiKey,
-      },
+      url: `${chatPath}${querySuffix}`,
+      headers,
       body: { model: cleanModel, ...(body ?? {}) },
     };
   }
-  // openai_chat
-  const url = /\/chat\/completions$/i.test(cleanBase)
-    ? cleanBase
-    : /\/v1$/i.test(cleanBase)
-      ? `${cleanBase}/chat/completions`
-      : `${cleanBase}/v1/chat/completions`;
-  return {
-    url,
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      "api-key": apiKey,
-    },
-    body: { model: cleanModel, ...(body ?? {}) },
-  };
 }
 
 export function normalizeUpstreamBase(raw) {
-  return String(raw || "")
-    .trim()
+  const s = String(raw || "").trim();
+  const qIdx = s.indexOf("?");
+  const pathPart = (qIdx >= 0 ? s.slice(0, qIdx) : s)
     .replace(/\/+$/, "")
     .replace(/\/(chat\/completions|messages|responses|models)$/i, "");
+  const queryPart = qIdx >= 0 ? s.slice(qIdx) : "";
+  return `${pathPart}${queryPart}`;
 }
 
 function extractModelsFromPayload(json) {
@@ -856,21 +1043,32 @@ export async function fetchUpstreamModels({ baseUrl, apiKey, fetchImpl = fetch, 
   const key = str(apiKey, 1000);
   if (!key) throw err(400, "请先提供 API Key 再获取上游模型");
 
-  const rootNoVer = cleanBase.replace(/\/(v1beta|v1)$/i, "");
-  const isV1Beta = /\/v1beta$/i.test(cleanBase);
+  const qIdx = cleanBase.indexOf("?");
+  const baseNoQuery = (qIdx >= 0 ? cleanBase.slice(0, qIdx) : cleanBase).replace(/\/+$/, "");
+  const querySuffix = qIdx >= 0 ? cleanBase.slice(qIdx) : "";
+  const rootNoVer = baseNoQuery.replace(/\/(v1beta|v1)$/i, "");
+  const isV1Beta = /\/v1beta$/i.test(baseNoQuery);
+  const isOfficialAzure = /\.(openai\.azure|cognitiveservices\.azure)\.com/i.test(baseNoQuery);
   const candidates = [];
   const addCand = (url, tag, kind) => {
     if (!candidates.some((c) => c.url === url)) candidates.push({ url, tag, kind });
   };
 
+  if (isOfficialAzure) {
+    try {
+      const origin = new URL(baseNoQuery).origin;
+      addCand(`${origin}/openai/v1/models${querySuffix}`, "/openai/v1/models", "openai");
+    } catch {}
+    if (querySuffix) addCand(`${rootNoVer}/models${querySuffix}`, "/models", "openai");
+  }
   if (isV1Beta) {
-    addCand(`${cleanBase}/models`, "/v1beta/models", "gemini");
+    addCand(`${baseNoQuery}/models`, "/v1beta/models", "gemini");
     addCand(`${rootNoVer}/v1/models`, "/v1/models", "openai");
   } else {
     addCand(`${rootNoVer}/v1/models`, "/v1/models", "openai");
     addCand(`${rootNoVer}/v1beta/models`, "/v1beta/models", "gemini");
-    if (cleanBase !== rootNoVer && !/\/v1$/i.test(cleanBase)) {
-      addCand(`${cleanBase}/models`, "/models", "openai");
+    if (baseNoQuery !== rootNoVer && !/\/v1$/i.test(baseNoQuery)) {
+      addCand(`${baseNoQuery}/models`, "/models", "openai");
     }
   }
 
@@ -878,18 +1076,18 @@ export async function fetchUpstreamModels({ baseUrl, apiKey, fetchImpl = fetch, 
   let lastError = "";
   for (const c of candidates) {
     const isOfficialGoogle = /googleapis\.com/i.test(c.url) || /^AIza/i.test(key);
+    const isCandAzure = /\.(openai\.azure|cognitiveservices\.azure)\.com/i.test(c.url);
+    const isJwt = /^eyJ[A-Za-z0-9_-]+\./.test(key);
     const geminiHeaders = { Accept: "application/json", "x-goog-api-key": key };
     if (!isOfficialGoogle) geminiHeaders.Authorization = `Bearer ${key}`;
-    const headers =
-      c.kind === "gemini"
-        ? geminiHeaders
-        : {
-            Accept: "application/json",
-            Authorization: `Bearer ${key}`,
-            "x-api-key": key,
-            "api-key": key,
-            "anthropic-version": "2023-06-01",
-          };
+    const openaiHeaders = {
+      Accept: "application/json",
+      "x-api-key": key,
+      "api-key": key,
+      "anthropic-version": "2023-06-01",
+    };
+    if (!(isCandAzure && !isJwt)) openaiHeaders.Authorization = `Bearer ${key}`;
+    const headers = c.kind === "gemini" ? geminiHeaders : openaiHeaders;
     try {
       const res = await fetchImpl(c.url, { method: "GET", headers, signal: AbortSignal.timeout(timeoutMs) });
       const text = await res.text();
@@ -1307,9 +1505,200 @@ export function computeAsGeminiVerdict({ steps, channelName = "as gemini" }) {
   };
 }
 
+export function extractResponsesPayload(json, rawText) {
+  const root = json && typeof json === "object" ? json : null;
+  const output = Array.isArray(root?.output) ? root.output : [];
+  let blob = "";
+  let reasoningId = "";
+  const texts = [];
+  for (const item of output) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "reasoning" || item.encrypted_content) {
+      if (!blob && item.encrypted_content) blob = String(item.encrypted_content);
+      if (!reasoningId && item.id) reasoningId = String(item.id);
+    }
+    const content = item.content;
+    if (typeof content === "string") texts.push(content);
+    else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (typeof part === "string") texts.push(part);
+        else if (part?.text) texts.push(String(part.text));
+      }
+    }
+  }
+  if (!blob) {
+    const m = String(rawText || "").match(/"encrypted_content"\s*:\s*"([^"\\]+)"/);
+    if (m) blob = m[1];
+  }
+  return { blob, reasoningId, text: texts.join("\n").trim() };
+}
+
+export function responseHasInvalidEnc(json, rawText) {
+  const err = json?.error && typeof json.error === "object" ? json.error : json;
+  if (String(err?.code || "") === "invalid_encrypted_content") return true;
+  return /invalid_encrypted_content|could not be decrypted or parsed/i.test(String(rawText || ""));
+}
+
+function isRespEncEnvError(res) {
+  const msg = `${extractResponseMessage(res?.json, res?.raw_text)}\n${res?.raw_text || ""}`;
+  if (/invalid_encrypted_content|could not be decrypted or parsed/i.test(msg)) return false;
+  const status = res?.http_status;
+  if (status === 429 || status === 401 || status === 403) return true;
+  if (/insufficient_quota|exceeded your current quota|billing_hard_limit|rate[_ ]limit|too many requests|Too many tokens/i.test(msg)) {
+    return true;
+  }
+  if (/model_not_found|does not exist|unknown model|invalid model|not supported.*reasoning|reasoning.*not supported|does not support reasoning/i.test(msg)) {
+    return true;
+  }
+  if (status === 404 && /model|responses/i.test(msg)) return true;
+  return false;
+}
+
+function respEncAnswerHasAr5(text) {
+  return /AR-?5/i.test(String(text || ""));
+}
+
+export function computeRespEncVerdict({ steps, channelName = "az gpt" }) {
+  const fpSteps = steps.filter((s) => s.kind !== "baseline");
+  const total = fpSteps.length;
+  const matched = fpSteps.filter((s) => s.status === "pass").length;
+  const score = total ? Math.round((matched / total) * 100) : 0;
+  const byRunner = Object.fromEntries(steps.map((s) => [s.runner || s.id, s]));
+  const s0 = byRunner.resp_enc_s0;
+  const seed = byRunner.resp_enc_seed;
+  const s1 = byRunner.resp_enc_s1;
+  const tamper = ["resp_enc_s2", "resp_enc_s3", "resp_enc_s4", "resp_enc_s5"].map((k) => byRunner[k]).filter(Boolean);
+
+  const envStep = steps.find((s) => s.env_error || s.throttled);
+  if (envStep) {
+    return {
+      verdict: "inconclusive",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `无法判定（限流 / 鉴权 / 模型不支持 Responses reasoning）：${envStep.name || "探测"} — ${envStep.reason || "环境错误"}`,
+    };
+  }
+
+  if (seed?.no_blob_200 || (seed?.status === "fail" && seed.http_status === 200 && !seed.blob_len)) {
+    return {
+      verdict: "fake",
+      score: 0,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（未拿到 reasoning.encrypted_content）：${seed.reason || "HTTP 200 但没有加密思考块"}`,
+    };
+  }
+  if (seed && seed.status !== "pass") {
+    return {
+      verdict: "inconclusive",
+      score: 0,
+      matched_count: 0,
+      total_probes: total,
+      summary: `无法判定：真 blob 采集失败（${seed.reason || "seed 未通过"}），不能据此认定 ${channelName} 为假。`,
+    };
+  }
+
+  const swallowed = tamper.filter((s) => s.any_200 || (s.round_statuses || []).some((c) => c === 200));
+  if (swallowed.length > 0) {
+    return {
+      verdict: "fake",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（未校验 encrypted_content）：「${swallowed.map((s) => s.name).join("、")}」返回 HTTP 200，伪造/篡改块被吞掉。`,
+    };
+  }
+  if (s1?.s1_wrong_answer || (s1?.status === "fail" && (s1.round_statuses || []).every((c) => c === 200) && !s1.s1_ar5_ok)) {
+    return {
+      verdict: "fake",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（真 blob 回传后未答出 AR-5）：${s1.reason || "明文历史不含代号，上游没有解密续接"}`,
+    };
+  }
+
+  const unstable = [s0, s1, ...tamper].filter((s) => s?.round_conflict);
+  if (unstable.length > 0) {
+    return {
+      verdict: "inconclusive",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `无法判定：「${unstable.map((s) => s.name).join("、")}」两轮状态不一致（${unstable.map((s) => (s.round_statuses || []).join("/")).join("；")}），疑似抖动或混池，请重试。`,
+    };
+  }
+
+  if (s1 && s1.status !== "pass" && s1.status !== "skip" && !(s1.round_statuses || []).includes(200)) {
+    return {
+      verdict: "inconclusive",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `无法判定：真 blob 回传未得到 HTTP 200（${(s1.round_statuses || []).join(" / ") || "无状态"}），不能确认是否解密续接，也不按「答不出 AR-5」判假。${s1.reason || ""}`,
+    };
+  }
+
+  const s0ok = !s0 || s0.status === "pass";
+  const s1ok = Boolean(s1 && s1.status === "pass" && s1.s1_ar5_ok);
+  const allTamper400 =
+    tamper.length === 4 && tamper.every((s) => (s.round_statuses || []).length > 0 && (s.round_statuses || []).every((c) => c === 400));
+  const allHaveCode = tamper.every((s) => s.has_invalid_enc_code);
+  const prefixOk = Boolean(seed?.blob_prefix_ok);
+
+  if (s0ok && s1ok && allTamper400 && allHaveCode && prefixOk) {
+    return {
+      verdict: "authentic",
+      score: 100,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为真（官方 OpenAI / 真 Azure 纯透传）：S0=200，S1=200 且答出 AR-5，S2–S5 全部 400 且带 invalid_encrypted_content，真 blob 前缀 gAAAAA（${seed.blob_len} 字符）。`,
+    };
+  }
+  if (s0ok && s1ok && allTamper400 && !allHaveCode) {
+    return {
+      verdict: "suspicious",
+      score: Math.max(score, 70),
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为疑似（上游像真源，但网关清洗了错误体）：S0/S1(AR-5) 通过且 S2–S5 全部 400，客户端未见 invalid_encrypted_content / could not be decrypted or parsed，只看到被改写的报错。请在渠道日志核对，不要据此判假。`,
+    };
+  }
+  if (s1ok && allTamper400 && allHaveCode && !prefixOk) {
+    return {
+      verdict: "suspicious",
+      score: Math.max(score, 80),
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为疑似：加密续接与篡改拦截均符合真源，但 encrypted_content 不是 gAAAAA 前缀（长度 ${seed?.blob_len || 0}），建议人工看原文。`,
+    };
+  }
+  if (s1ok && allTamper400 && allHaveCode && !s0ok) {
+    return {
+      verdict: "suspicious",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为疑似：S1–S5 符合真源，但 S0 未稳定返回 200（${s0?.reason || "失败"}）。`,
+    };
+  }
+
+  return {
+    verdict: matched >= 2 ? "suspicious" : "fake",
+    score,
+    matched_count: matched,
+    total_probes: total,
+    summary: `判定为${matched >= 2 ? "疑似" : "假"}（Responses encrypted_content 口径未凑齐）：通过 ${matched}/${total}。S0=${s0?.status || "无"}，S1=${s1?.status || "无"}，篡改场景 ${tamper.filter((s) => s.status === "pass").length}/${tamper.length}。`,
+  };
+}
+
 export function computeRunVerdict({ steps, passRatio = 0.8, channelName, channelCode }) {
   if (steps.some((s) => String(s.runner || "").startsWith("awsb_"))) {
     return computeAwsbVerdict({ steps, channelName });
+  }
+  if (steps.some((s) => String(s.runner || "").startsWith("resp_enc_"))) {
+    return computeRespEncVerdict({ steps, channelName });
   }
   if (channelCode === "as_gemini" || steps.some((s) => s.id === "as_candidate_count" || s.id === "as_temperature")) {
     return computeAsGeminiVerdict({ steps, channelName });
@@ -1819,7 +2208,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
 
     const keepHeaders = {};
     for (const [k, v] of Object.entries(headers)) {
-      if (/^(content-type|server|via|cf-ray|x-request-id|x-goog-|x-amzn-|x-amz-|anthropic-)/i.test(k)) {
+      if (/^(content-type|server|via|cf-ray|x-request-id|x-goog-|x-amzn-|x-amz-|anthropic-|x-ms-|apim-|openai-)/i.test(k)) {
         keepHeaders[k] = redactSecret(v, apiKey);
       }
     }
@@ -2264,6 +2653,259 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     };
   }
 
+  const RESP_ENC_FOLLOWUP = "请只输出你在内部思考里记住的会话代号，不要解释、不要复述题目。";
+
+  function randomB64url(len) {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const bytes = crypto.randomBytes(len);
+    let out = "";
+    for (let i = 0; i < len; i++) out += alphabet[bytes[i] % alphabet.length];
+    return out;
+  }
+
+  function respEncBlobFor(runner, blob) {
+    if (runner === "resp_enc_s1") return blob;
+    if (runner === "resp_enc_s2") return mutateMiddleChar(blob);
+    if (runner === "resp_enc_s3") return "x";
+    if (runner === "resp_enc_s4") return "AAAA";
+    if (runner === "resp_enc_s5") return randomB64url(1500);
+    return blob;
+  }
+
+  function buildRespEncReplay(blob, assistantText, reasoningId) {
+    const reasoning = { type: "reasoning", encrypted_content: blob, summary: [] };
+    if (reasoningId) reasoning.id = reasoningId;
+    const safeAssistant = respEncAnswerHasAr5(assistantText) ? "READY" : assistantText || "READY";
+    return {
+      input: [
+        reasoning,
+        { role: "assistant", content: [{ type: "output_text", text: safeAssistant }] },
+        { role: "user", content: RESP_ENC_FOLLOWUP },
+      ],
+    };
+  }
+
+  function respEncRoundSnippet(roundResults) {
+    return roundResults
+      .map((r, idx) => `[第 ${idx + 1} 轮 HTTP ${r.http_status} · ${r.latency_ms}ms]\n${r.snippet}`)
+      .join("\n\n")
+      .slice(0, MAX_BODY_SNIPPET);
+  }
+
+  async function runRespEncStep({ probe, step, runState, ctx, channel, model, onStepUpdate }) {
+    const runner = probe.runner;
+    const sendBody = async (body) =>
+      sendProbeOnce({
+        baseUrl: ctx.base_url,
+        apiKey: ctx.api_key,
+        protocol: channel.protocol,
+        model,
+        body,
+      });
+
+    if (runner === "resp_enc_seed") {
+      const res = await sendBody(probe.request_body);
+      if (isRespEncEnvError(res)) {
+        return {
+          stepPatch: {
+            status: "fail",
+            env_error: true,
+            throttled: res.http_status === 429,
+            http_status: res.http_status,
+            round_statuses: [res.http_status],
+            latency_ms: res.latency_ms,
+            reason: `采集真 blob 时遇到环境错误（HTTP ${res.http_status}）：${extractResponseMessage(res.json, res.raw_text).slice(0, 160)}`,
+            request_url: res.url,
+            request_body: res.request_body,
+            response_headers: res.headers,
+            response_snippet: res.snippet,
+          },
+          abort: true,
+        };
+      }
+      const extracted = extractResponsesPayload(res.json, res.raw_text);
+      if (res.http_status !== 200 || !extracted.blob) {
+        const noBlob = res.http_status === 200;
+        return {
+          stepPatch: {
+            status: "fail",
+            no_blob_200: noBlob,
+            http_status: res.http_status,
+            round_statuses: [res.http_status],
+            latency_ms: res.latency_ms,
+            reason: noBlob
+              ? "HTTP 200 但响应没有 reasoning.encrypted_content，无法继续 S1–S5"
+              : `采集真 blob 失败（HTTP ${res.http_status}）：${extractResponseMessage(res.json, res.raw_text).slice(0, 160)}`,
+            request_url: res.url,
+            request_body: res.request_body,
+            response_headers: res.headers,
+            response_snippet: res.snippet,
+          },
+          abort: true,
+        };
+      }
+      const assistantText = respEncAnswerHasAr5(extracted.text) ? "READY" : extracted.text || "READY";
+      runState.respEnc = {
+        blob: extracted.blob,
+        reasoningId: extracted.reasoningId,
+        assistantText,
+      };
+      const prefixOk = extracted.blob.startsWith("gAAAAA");
+      return {
+        stepPatch: {
+          status: "pass",
+          http_status: 200,
+          round_statuses: [200],
+          latency_ms: res.latency_ms,
+          blob_len: extracted.blob.length,
+          blob_prefix_ok: prefixOk,
+          strong_hit: prefixOk,
+          reason: `已采集 encrypted_content（${extracted.blob.length} 字符${prefixOk ? "，前缀 gAAAAA" : "，前缀不是 gAAAAA"}）${extracted.reasoningId ? ` · ${extracted.reasoningId}` : ""}`,
+          request_url: res.url,
+          request_body: res.request_body,
+          response_headers: res.headers,
+          response_snippet: res.snippet,
+        },
+        abort: false,
+      };
+    }
+
+    if (runner !== "resp_enc_s0") {
+      if (!runState.respEnc?.blob) {
+        return {
+          stepPatch: { status: "skip", reason: "前置未拿到 encrypted_content，跳过" },
+          abort: false,
+        };
+      }
+    }
+
+    const body =
+      runner === "resp_enc_s0"
+        ? probe.request_body
+        : buildRespEncReplay(
+            respEncBlobFor(runner, runState.respEnc.blob),
+            runState.respEnc.assistantText,
+            runState.respEnc.reasoningId,
+          );
+    const rounds = Math.max(1, probe.rounds || (runner === "resp_enc_s0" ? 2 : 2));
+    const roundResults = [];
+    for (let rIdx = 0; rIdx < rounds; rIdx++) {
+      const r = await sendBody(body);
+      roundResults.push(r);
+      if (isRespEncEnvError(r)) {
+        return {
+          stepPatch: {
+            status: "fail",
+            env_error: true,
+            throttled: r.http_status === 429,
+            http_status: r.http_status,
+            round_statuses: roundResults.map((x) => x.http_status),
+            latency_ms: roundResults.reduce((sum, x) => sum + (x.latency_ms || 0), 0),
+            reason: `第 ${rIdx + 1} 轮环境错误（HTTP ${r.http_status}）：${extractResponseMessage(r.json, r.raw_text).slice(0, 140)}`,
+            request_url: r.url,
+            request_body: r.request_body,
+            response_headers: r.headers,
+            response_snippet: r.snippet,
+          },
+          abort: true,
+        };
+      }
+      if (rIdx + 1 < rounds && onStepUpdate) {
+        onStepUpdate({
+          ...step,
+          status: "running",
+          round_statuses: roundResults.map((x) => x.http_status),
+          reason: `第 ${rIdx + 1}/${rounds} 轮完成 (HTTP ${r.http_status})，正在执行第 ${rIdx + 2}/${rounds} 轮…`,
+        });
+      }
+    }
+
+    const statuses = roundResults.map((r) => r.http_status);
+    const last = roundResults[roundResults.length - 1];
+    const totalMs = roundResults.reduce((sum, r) => sum + (r.latency_ms || 0), 0);
+    const roundConflict = new Set(statuses).size > 1;
+    const basePatch = {
+      http_status: last.http_status,
+      round_statuses: statuses,
+      round_conflict: roundConflict,
+      latency_ms: totalMs,
+      request_url: last.url,
+      request_body: last.request_body,
+      response_headers: last.headers,
+      response_snippet: respEncRoundSnippet(roundResults),
+    };
+    if (roundConflict) {
+      return {
+        stepPatch: {
+          ...basePatch,
+          status: "fail",
+          any_200: statuses.includes(200),
+          reason: `两轮结果不一致（HTTP ${statuses.join(" / ")}），本场景不作真假结论`,
+        },
+        abort: false,
+      };
+    }
+
+    if (runner === "resp_enc_s0") {
+      const ok = statuses.every((c) => c === 200) && roundResults.every((r) => r.json && (r.json.id || r.json.output));
+      return {
+        stepPatch: {
+          ...basePatch,
+          status: ok ? "pass" : "fail",
+          reason: ok
+            ? `HTTP ${statuses.join(" / ")}，Responses 基础请求可用`
+            : `S0 期望 HTTP 200 的 Responses 输出，实际 ${statuses.join(" / ")}：${extractResponseMessage(last.json, last.raw_text).slice(0, 140)}`,
+        },
+        abort: false,
+      };
+    }
+
+    if (runner === "resp_enc_s1") {
+      const answers = roundResults.map((r) => {
+        const parsed = extractResponsesPayload(r.json, r.raw_text);
+        return respEncAnswerHasAr5(parsed.text);
+      });
+      const all200 = statuses.every((c) => c === 200);
+      const allAr5 = answers.every(Boolean);
+      return {
+        stepPatch: {
+          ...basePatch,
+          status: all200 && allAr5 ? "pass" : "fail",
+          s1_ar5_ok: all200 && allAr5,
+          s1_wrong_answer: all200 && !allAr5,
+          reason:
+            all200 && allAr5
+              ? `HTTP ${statuses.join(" / ")}，明文不含 AR-5 的情况下答出了会话代号`
+              : all200
+                ? `HTTP 200 但未答出 AR-5，真 blob 没有被解密续接`
+                : `S1 期望 HTTP 200，实际 ${statuses.join(" / ")}：${extractResponseMessage(last.json, last.raw_text).slice(0, 140)}`,
+        },
+        abort: false,
+      };
+    }
+
+    const all400 = statuses.every((c) => c === 400);
+    const allCode = roundResults.every((r) => responseHasInvalidEnc(r.json, r.raw_text));
+    const any200 = statuses.some((c) => c === 200);
+    return {
+      stepPatch: {
+        ...basePatch,
+        status: all400 && allCode ? "pass" : "fail",
+        any_200: any200,
+        param_stripped: any200,
+        has_invalid_enc_code: all400 && allCode,
+        reason: any200
+          ? probe.pass_200_hint || `伪造/篡改 encrypted_content 仍返回 HTTP ${statuses.join(" / ")}`
+          : all400 && allCode
+            ? `HTTP ${statuses.join(" / ")}，均返回 invalid_encrypted_content`
+            : all400
+              ? `HTTP 400 但客户端未见 invalid_encrypted_content（疑似网关清洗错误体）：${extractResponseMessage(last.json, last.raw_text).slice(0, 140)}`
+              : `期望 HTTP 400 invalid_encrypted_content，实际 ${statuses.join(" / ")}：${extractResponseMessage(last.json, last.raw_text).slice(0, 140)}`,
+      },
+      abort: false,
+    };
+  }
+
   async function executeVerifyRun({ runId, ctx, channel, model }) {
     const startedMs = Date.now();
     const enabledProbes = channel.probes.filter((p) => p.enabled !== false);
@@ -2280,6 +2922,14 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       msg_id_kind: "",
       has_as_service: false,
       has_as_multicand: false,
+      env_error: false,
+      no_blob_200: false,
+      blob_len: 0,
+      blob_prefix_ok: false,
+      s1_ar5_ok: false,
+      s1_wrong_answer: false,
+      any_200: false,
+      has_invalid_enc_code: false,
       request_desc: p.request_desc,
       expect_desc: p.expect_desc,
       expect_status: p.expect_status,
@@ -2336,6 +2986,30 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
           if (out.abort) {
             abortRemaining = true;
             abortReason = out.stepPatch.throttled ? "触发限流/日限额，终止后续场景" : "前置素材采集失败，跳过该场景";
+          }
+          saveRunSteps(runId, steps);
+          continue;
+        }
+
+        if (String(probe.runner || "").startsWith("resp_enc_")) {
+          const out = await runRespEncStep({
+            probe,
+            step: steps[i],
+            runState,
+            ctx,
+            channel,
+            model,
+            onStepUpdate: (updatedStep) => {
+              steps[i] = updatedStep;
+              saveRunSteps(runId, steps);
+            },
+          });
+          steps[i] = { ...steps[i], ...out.stepPatch };
+          if (out.abort) {
+            abortRemaining = true;
+            abortReason = out.stepPatch.env_error || out.stepPatch.throttled
+              ? "限流/鉴权/模型不支持，终止后续场景"
+              : "未采集到 encrypted_content，跳过后续场景";
           }
           saveRunSteps(runId, steps);
           continue;
