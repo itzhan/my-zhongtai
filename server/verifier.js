@@ -1,5 +1,6 @@
 // 渠道鉴定（渠道真伪检测）：管理各上游渠道的方法论与特征探针，
-// 按账号提取上游站点 + SK + 可用模型，直连上游站点逐项执行探针并实时产出检测报告。
+// 按账号提取上游站点 + SK + 可用模型，直连上游站点执行探针并实时产出检测报告。
+// 前置探针（基准 / 素材采集）先跑；通过后其余场景并行，避免一个一个等。
 // 存储：DATA_DIR/ops.db（node:sqlite），与 sub2api 解耦；只读模式下同样可用（不修改线上 sub2api）。
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -2954,123 +2955,170 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     }));
     saveRunSteps(runId, steps);
 
-    let abortRemaining = false;
-    let abortReason = "基准连通性失败，跳过该探针";
+    // 同一家族内：前置失败才跳过后续。不同家族互不影响。并发别开太高，避免把上游打进 429。
+    const PROBE_CONCURRENCY = 6;
+    const aborted = { generic: false, awsb: false, resp_enc: false };
+    const abortWhy = {
+      generic: "基准连通性失败，跳过该探针",
+      awsb: "前置素材采集失败，跳过该场景",
+      resp_enc: "未采集到 encrypted_content，跳过后续场景",
+    };
     const runState = {};
-    try {
-      for (let i = 0; i < enabledProbes.length; i++) {
-        const probe = enabledProbes[i];
-        if (abortRemaining) {
-          steps[i].status = "skip";
-          steps[i].reason = abortReason;
-          saveRunSteps(runId, steps);
-          continue;
+    const probeFamily = (probe) => {
+      const runner = String(probe.runner || "");
+      if (runner.startsWith("awsb_")) return "awsb";
+      if (runner.startsWith("resp_enc_")) return "resp_enc";
+      return "generic";
+    };
+    const noteAbort = (family, reason) => {
+      aborted[family] = true;
+      if (reason) abortWhy[family] = reason;
+    };
+    async function mapPool(indexes, fn) {
+      let cursor = 0;
+      const workers = Math.min(PROBE_CONCURRENCY, indexes.length);
+      const worker = async () => {
+        for (;;) {
+          const n = cursor++;
+          if (n >= indexes.length) return;
+          await fn(indexes[n]);
         }
-        steps[i].status = "running";
+      };
+      if (workers > 0) await Promise.all(Array.from({ length: workers }, () => worker()));
+    }
+    async function runProbeAt(i) {
+      const probe = enabledProbes[i];
+      const family = probeFamily(probe);
+      if (aborted[family]) {
+        steps[i].status = "skip";
+        steps[i].reason = abortWhy[family];
         saveRunSteps(runId, steps);
+        return;
+      }
+      steps[i].status = "running";
+      saveRunSteps(runId, steps);
 
-        if (String(probe.runner || "").startsWith("awsb_")) {
-          const out = await runAwsbStep({
-            probe,
-            step: steps[i],
-            runState,
-            ctx,
-            channel,
-            model,
-            onStepUpdate: (updatedStep) => {
-              steps[i] = updatedStep;
-              saveRunSteps(runId, steps);
-            },
-          });
-          steps[i] = { ...steps[i], ...out.stepPatch };
-          if (out.abort) {
-            abortRemaining = true;
-            abortReason = out.stepPatch.throttled ? "触发限流/日限额，终止后续场景" : "前置素材采集失败，跳过该场景";
-          }
-          saveRunSteps(runId, steps);
-          continue;
+      if (String(probe.runner || "").startsWith("awsb_")) {
+        const out = await runAwsbStep({
+          probe,
+          step: steps[i],
+          runState,
+          ctx,
+          channel,
+          model,
+          onStepUpdate: (updatedStep) => {
+            steps[i] = updatedStep;
+            saveRunSteps(runId, steps);
+          },
+        });
+        steps[i] = { ...steps[i], ...out.stepPatch };
+        if (out.abort) {
+          noteAbort(
+            "awsb",
+            out.stepPatch.throttled ? "触发限流/日限额，终止后续场景" : "前置素材采集失败，跳过该场景",
+          );
         }
+        saveRunSteps(runId, steps);
+        return;
+      }
 
-        if (String(probe.runner || "").startsWith("resp_enc_")) {
-          const out = await runRespEncStep({
-            probe,
-            step: steps[i],
-            runState,
-            ctx,
-            channel,
-            model,
-            onStepUpdate: (updatedStep) => {
-              steps[i] = updatedStep;
-              saveRunSteps(runId, steps);
-            },
-          });
-          steps[i] = { ...steps[i], ...out.stepPatch };
-          if (out.abort) {
-            abortRemaining = true;
-            abortReason = out.stepPatch.env_error || out.stepPatch.throttled
+      if (String(probe.runner || "").startsWith("resp_enc_")) {
+        const out = await runRespEncStep({
+          probe,
+          step: steps[i],
+          runState,
+          ctx,
+          channel,
+          model,
+          onStepUpdate: (updatedStep) => {
+            steps[i] = updatedStep;
+            saveRunSteps(runId, steps);
+          },
+        });
+        steps[i] = { ...steps[i], ...out.stepPatch };
+        if (out.abort) {
+          noteAbort(
+            "resp_enc",
+            out.stepPatch.env_error || out.stepPatch.throttled
               ? "限流/鉴权/模型不支持，终止后续场景"
-              : "未采集到 encrypted_content，跳过后续场景";
-          }
-          saveRunSteps(runId, steps);
-          continue;
+              : "未采集到 encrypted_content，跳过后续场景",
+          );
         }
+        saveRunSteps(runId, steps);
+        return;
+      }
 
-        let attemptRes = await sendProbeOnce({
+      let attemptRes = await sendProbeOnce({
+        baseUrl: ctx.base_url,
+        apiKey: ctx.api_key,
+        protocol: channel.protocol,
+        model,
+        body: probe.request_body,
+      });
+      let usedFallback = false;
+      if (probe.kind === "fingerprint" && attemptRes.http_status === 200 && probe.fallback_on_200) {
+        usedFallback = true;
+        attemptRes = await sendProbeOnce({
           baseUrl: ctx.base_url,
           apiKey: ctx.api_key,
           protocol: channel.protocol,
           model,
-          body: probe.request_body,
+          body: probe.fallback_on_200,
         });
-        let usedFallback = false;
-        if (probe.kind === "fingerprint" && attemptRes.http_status === 200 && probe.fallback_on_200) {
-          usedFallback = true;
-          attemptRes = await sendProbeOnce({
-            baseUrl: ctx.base_url,
-            apiKey: ctx.api_key,
-            protocol: channel.protocol,
-            model,
-            body: probe.fallback_on_200,
-          });
-        }
-
-        const evalRes = evaluateProbeResponse({
-          probe,
-          protocol: channel.protocol,
-          httpStatus: attemptRes.http_status,
-          json: attemptRes.json,
-          rawText: attemptRes.raw_text,
-        });
-        const hasAsService = hasAiStudioService(attemptRes.json, attemptRes.raw_text);
-        const hasAsMulticand = /Multiple candidates is not enabled for this model/i.test(
-          String(attemptRes.raw_text || ""),
-        );
-
-        steps[i] = {
-          ...steps[i],
-          status: evalRes.status,
-          http_status: attemptRes.http_status,
-          round_statuses: attemptRes.http_status != null ? [attemptRes.http_status] : [],
-          latency_ms: attemptRes.latency_ms,
-          reason: usedFallback
-            ? `首次请求返回 HTTP 200（模型支持该开关），已自动补发校验请求：${evalRes.reason}`
-            : evalRes.reason,
-          strong_hit: evalRes.strong_hit,
-          counter_hit: evalRes.counter_hit,
-          param_stripped: evalRes.param_stripped,
-          status_rewritten: evalRes.status_rewritten,
-          matched_patterns: evalRes.matched_patterns,
-          has_as_service: hasAsService,
-          has_as_multicand: hasAsMulticand,
-          request_url: attemptRes.url,
-          request_body: attemptRes.request_body,
-          response_headers: attemptRes.headers,
-          response_snippet: attemptRes.snippet,
-          fallback_used: usedFallback,
-        };
-        if (probe.kind === "baseline" && evalRes.status === "fail") abortRemaining = true;
-        saveRunSteps(runId, steps);
       }
+
+      const evalRes = evaluateProbeResponse({
+        probe,
+        protocol: channel.protocol,
+        httpStatus: attemptRes.http_status,
+        json: attemptRes.json,
+        rawText: attemptRes.raw_text,
+      });
+      const hasAsService = hasAiStudioService(attemptRes.json, attemptRes.raw_text);
+      const hasAsMulticand = /Multiple candidates is not enabled for this model/i.test(
+        String(attemptRes.raw_text || ""),
+      );
+
+      steps[i] = {
+        ...steps[i],
+        status: evalRes.status,
+        http_status: attemptRes.http_status,
+        round_statuses: attemptRes.http_status != null ? [attemptRes.http_status] : [],
+        latency_ms: attemptRes.latency_ms,
+        reason: usedFallback
+          ? `首次请求返回 HTTP 200（模型支持该开关），已自动补发校验请求：${evalRes.reason}`
+          : evalRes.reason,
+        strong_hit: evalRes.strong_hit,
+        counter_hit: evalRes.counter_hit,
+        param_stripped: evalRes.param_stripped,
+        status_rewritten: evalRes.status_rewritten,
+        matched_patterns: evalRes.matched_patterns,
+        has_as_service: hasAsService,
+        has_as_multicand: hasAsMulticand,
+        request_url: attemptRes.url,
+        request_body: attemptRes.request_body,
+        response_headers: attemptRes.headers,
+        response_snippet: attemptRes.snippet,
+        fallback_used: usedFallback,
+      };
+      if (probe.kind === "baseline" && evalRes.status === "fail") noteAbort("generic");
+      saveRunSteps(runId, steps);
+    }
+    try {
+      const hasGenericBaseline = enabledProbes.some((p) => probeFamily(p) === "generic" && p.kind === "baseline");
+      const wave1 = [];
+      const wave2 = [];
+      for (let i = 0; i < enabledProbes.length; i++) {
+        const probe = enabledProbes[i];
+        const runner = String(probe.runner || "");
+        const waitsForGate =
+          (runner.startsWith("awsb_") && runner !== "awsb_seed") ||
+          (runner.startsWith("resp_enc_") && runner !== "resp_enc_seed" && runner !== "resp_enc_s0") ||
+          (probeFamily(probe) === "generic" && probe.kind !== "baseline" && hasGenericBaseline);
+        (waitsForGate ? wave2 : wave1).push(i);
+      }
+      await mapPool(wave1, runProbeAt);
+      await mapPool(wave2, runProbeAt);
 
       const final = computeRunVerdict({
         steps,
