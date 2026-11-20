@@ -40,6 +40,7 @@ export const qk = {
   verifyChannels: ["ops", "verify-channels"] as const,
   verifyChannel: (code: string) => ["ops", "verify-channel", code] as const,
   verifyInspect: (id: number) => ["ops", "verify-inspect", id] as const,
+  verifyInspectBatch: (ids: string) => ["ops", "verify-inspect", "batch", ids] as const,
   verifyRuns: (q: string) => ["ops", "verify-runs", q] as const,
   verifyRun: (id: string) => ["ops", "verify-run", id] as const,
 };
@@ -127,6 +128,16 @@ export const useVerifyAccountInspect = (accountId: number | null) =>
     enabled: Boolean(accountId && accountId > 0),
     retry: false,
   });
+
+export const useVerifyAccountsInspect = (ids: number[]) => {
+  const key = [...ids].sort((a, b) => a - b).join(",");
+  return useQuery({
+    queryKey: qk.verifyInspectBatch(key),
+    queryFn: () => get<VerifyAccountInspect[]>(`/verify/accounts/inspect?ids=${key}`),
+    enabled: ids.length > 0,
+    retry: false,
+  });
+};
 
 export const useVerifyRuns = (filters: { channel_code?: string; verdict?: string; q?: string } = {}) => {
   const query = qs(filters);

@@ -1966,7 +1966,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     return row;
   };
 
-  async function resolveAccountContext(accountId, apiKeyOverride = "") {
+  async function resolveAccountContext(accountId, apiKeyOverride = "", opts = {}) {
     if (!Number.isInteger(accountId) || accountId <= 0) throw httpError(400, "账号 ID 无效");
     const [accounts, full] = await Promise.all([
       getAccounts().catch(() => []),
@@ -1974,9 +1974,22 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     ]);
     if (!full) throw httpError(404, "账号不存在");
     const listItem = accounts.find((a) => a.id === accountId);
+    // 受限管理密钥的账号详情只带 model_mapping，base_url / api_key 要从库里补
+    let dbCreds = {};
+    if (pool) {
+      try {
+        const { rows } = await pool.query("SELECT credentials FROM accounts WHERE id = $1", [accountId]);
+        dbCreds = parseCredsObject(rows?.[0]?.credentials);
+      } catch {}
+    }
     const creds = parseCredsObject(full.credentials);
-    const baseUrl = normalizeUpstreamBase(str(creds.base_url, 500));
-    const mapping = creds.model_mapping && typeof creds.model_mapping === "object" ? creds.model_mapping : {};
+    const baseUrl = normalizeUpstreamBase(str(creds.base_url || dbCreds.base_url, 500));
+    const mapping =
+      creds.model_mapping && typeof creds.model_mapping === "object" && Object.keys(creds.model_mapping).length
+        ? creds.model_mapping
+        : dbCreds.model_mapping && typeof dbCreds.model_mapping === "object"
+          ? dbCreds.model_mapping
+          : {};
 
     // 多级读取明文 SK（绝不回传前端，只用于后端向供应商站点发起检测）
     let apiKey = str(apiKeyOverride, 1000);
@@ -1988,15 +2001,9 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         skSource = "saved_key";
       }
     }
-    if (!apiKey && pool) {
-      try {
-        const { rows } = await pool.query("SELECT credentials FROM accounts WHERE id = $1", [accountId]);
-        const dbCreds = parseCredsObject(rows?.[0]?.credentials);
-        if (dbCreds.api_key) {
-          apiKey = String(dbCreds.api_key).trim();
-          skSource = "db";
-        }
-      } catch {}
+    if (!apiKey && dbCreds.api_key) {
+      apiKey = String(dbCreds.api_key).trim();
+      skSource = "db";
     }
     if (!apiKey) {
       try {
@@ -2050,7 +2057,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
 
     // 聚合账号可用模型（模型映射 > 上游标准模型接口 > sub2api 账号模型接口 > 近 7 日日志）
     const [upstreamRes, s2Models, recentLogs] = await Promise.all([
-      baseUrl && apiKey
+      !opts.skipUpstream && baseUrl && apiKey
         ? fetchUpstreamModels({ baseUrl, apiKey, fetchImpl, timeoutMs: 8000 }).catch(() => null)
         : Promise.resolve(null),
       s2("GET", `/admin/accounts/${accountId}/models`).catch(() => []),
@@ -2110,7 +2117,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       },
       base_url: baseUrl,
       supported: Boolean(baseUrl),
-      unsupported_reason: baseUrl ? "" : "该账号在 sub2api 里没有 base_url（非 apikey 上游中转类型暂不支持）",
+      unsupported_reason: baseUrl ? "" : "没有读到该账号的上游地址（管理接口不返回 base_url）",
       api_key: apiKey,
       has_sk: Boolean(apiKey),
       sk_masked: maskSecret(apiKey),
@@ -3292,6 +3299,45 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         fetchImpl,
         httpError,
       });
+    }),
+  );
+
+  const INSPECT_BATCH_MAX = 10;
+
+  app.get(
+    "/api/verify/accounts/inspect",
+    wrap(async (req) => {
+      const ids = [
+        ...new Set(
+          String(req.query.ids || "")
+            .split(",")
+            .map((s) => parseInt(s, 10))
+            .filter((n) => Number.isInteger(n) && n > 0),
+        ),
+      ];
+      if (!ids.length) throw httpError(400, "ids 必填");
+      if (ids.length > INSPECT_BATCH_MAX) throw httpError(400, `一次最多选择 ${INSPECT_BATCH_MAX} 个账号`);
+      return Promise.all(
+        ids.map(async (id) => {
+          try {
+            const ctx = await resolveAccountContext(id, "", { skipUpstream: true });
+            const { api_key: _drop, ...safe } = ctx;
+            return safe;
+          } catch (e) {
+            return {
+              account: { id, name: `#${id}`, platform: "", type: "", status: "", notes: "", group_ids: [] },
+              base_url: "",
+              supported: false,
+              unsupported_reason: e.message || "读取失败",
+              has_sk: false,
+              sk_masked: "",
+              sk_source: "",
+              model_mapping: {},
+              models: [],
+            };
+          }
+        }),
+      );
     }),
   );
 

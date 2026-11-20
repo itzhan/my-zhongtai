@@ -33,11 +33,19 @@ import { post, put } from "../api";
 import { AccountStatus, PlatformBadge, Tag } from "../components/badges";
 import { VerifyReportCard } from "../components/verify-report";
 import { readErr } from "../format";
-import { useAccounts, useInvalidate, useVerifyAccountInspect, useVerifyChannels, useVerifyRun } from "../hooks";
+import {
+  useAccounts,
+  useInvalidate,
+  useVerifyAccountInspect,
+  useVerifyAccountsInspect,
+  useVerifyChannels,
+  useVerifyRun,
+} from "../hooks";
 import { useOps } from "../provider";
 import type { Account, VerifyChannel, VerifyFetchModelsResp, VerifyModelOption, VerifyPreset } from "../types";
 
 const MAX_ACCOUNT_DROPDOWN = 40;
+const MAX_VERIFY_ACCOUNTS = 10;
 const URL_RE = /^https?:\/\/[^/\s]+/i;
 
 function protocolLabel(p: string): string {
@@ -76,15 +84,15 @@ function AccountSearchPicker({
   loading,
 }: {
   accounts: Account[];
-  value: number | null;
-  onChange: (id: number) => void;
+  value: number[];
+  onChange: (ids: number[]) => void;
   loading: boolean;
 }) {
   const { groupName } = useOps();
   const [open, setOpen] = useState(false);
   const [kw, setKw] = useState("");
 
-  const selected = useMemo(() => accounts.find((a) => a.id === value) ?? null, [accounts, value]);
+  const selected = useMemo(() => accounts.filter((a) => value.includes(a.id)), [accounts, value]);
   const filtered = useMemo(() => {
     const q = kw.trim().toLowerCase();
     if (!q) return accounts;
@@ -105,12 +113,14 @@ function AccountSearchPicker({
           aria-expanded={open}
           className="h-auto min-h-10 w-full justify-between px-3 py-2 text-left font-normal"
         >
-          {selected ? (
+          {selected.length === 1 && selected[0] ? (
             <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <span className="truncate font-medium">{selected.name}</span>
-              <span className="text-muted-foreground font-mono text-xs">#{selected.id}</span>
-              <PlatformBadge platform={selected.platform} />
+              <span className="truncate font-medium">{selected[0].name}</span>
+              <span className="text-muted-foreground font-mono text-xs">#{selected[0].id}</span>
+              <PlatformBadge platform={selected[0].platform} />
             </div>
+          ) : selected.length > 1 ? (
+            <span className="truncate font-medium">已选 {selected.length} 个账号</span>
           ) : (
             <span className="text-muted-foreground flex items-center gap-2">
               <Search className="size-4" />
@@ -135,14 +145,15 @@ function AccountSearchPicker({
                     key={a.id}
                     value={String(a.id)}
                     onSelect={() => {
-                      onChange(a.id);
-                      setOpen(false);
+                      if (value.includes(a.id)) onChange(value.filter((id) => id !== a.id));
+                      else if (value.length >= MAX_VERIFY_ACCOUNTS) toast.error(`一次最多选 ${MAX_VERIFY_ACCOUNTS} 个账号`);
+                      else onChange([...value, a.id]);
                     }}
                     className="flex items-center justify-between gap-2 py-2"
                   >
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-1.5">
-                        <Check className={cn("size-3.5 shrink-0", value === a.id ? "opacity-100" : "opacity-0")} />
+                        <Check className={cn("size-3.5 shrink-0", value.includes(a.id) ? "opacity-100" : "opacity-0")} />
                         <span className="truncate font-medium">{a.name}</span>
                         <span className="text-muted-foreground shrink-0 font-mono text-xs">#{a.id}</span>
                       </div>
@@ -279,7 +290,9 @@ export function VerifyRunView({
   const channelsQ = useVerifyChannels();
 
   const [inputMode, setInputMode] = useState<"account" | "manual">(presetRun?.mode ?? "account");
-  const [accountId, setAccountId] = useState<number | null>(presetRun?.mode === "account" ? presetRun.accountId : null);
+  const [accountIds, setAccountIds] = useState<number[]>(
+    presetRun?.mode === "account" ? [presetRun.accountId] : [],
+  );
   const [manualUrl, setManualUrl] = useState<string>(presetRun?.mode === "manual" ? presetRun.baseUrl : "");
   const [manualKey, setManualKey] = useState<string>("");
   const [manualName, setManualName] = useState<string>(presetRun?.mode === "manual" ? presetRun.targetName : "");
@@ -298,7 +311,7 @@ export function VerifyRunView({
   const [manualModels, setManualModels] = useState<VerifyModelOption[]>([]);
 
   const [starting, setStarting] = useState(false);
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [activeRunIds, setActiveRunIds] = useState<string[]>([]);
   const initedAccountRef = useRef<number | null>(
     presetRun?.mode === "account" && presetRun.model ? presetRun.accountId : null,
   );
@@ -314,7 +327,7 @@ export function VerifyRunView({
     setFetchErrorText("");
     if (presetRun.mode === "account") {
       initedAccountRef.current = presetRun.model ? presetRun.accountId : null;
-      setAccountId(presetRun.accountId);
+      setAccountIds([presetRun.accountId]);
       setAccountModelsOverride(null);
     } else {
       initedAccountRef.current = null;
@@ -325,8 +338,9 @@ export function VerifyRunView({
     }
   }, [presetRun]);
 
-  const inspectQ = useVerifyAccountInspect(inputMode === "account" ? accountId : null);
-  const runQ = useVerifyRun(activeRunId);
+  const primaryAccountId = accountIds[0] ?? null;
+  const inspectQ = useVerifyAccountInspect(inputMode === "account" ? primaryAccountId : null);
+  const batchQ = useVerifyAccountsInspect(inputMode === "account" ? accountIds : []);
 
   const channels = useMemo(() => channelsQ.data ?? [], [channelsQ.data]);
   const selectedChannel: VerifyChannel | undefined = useMemo(
@@ -335,28 +349,33 @@ export function VerifyRunView({
   );
 
   // 切换账号时同步重置模型与覆盖模型列表
-  const handleSelectAccount = (id: number) => {
-    initedAccountRef.current = null;
-    setAccountId(id);
-    setModel("");
-    setRequestedModel("");
-    setCustomSk("");
-    setCustomSkOpen(false);
-    setAccountModelsOverride(null);
-    setFetchStatusText("");
-    setFetchErrorText("");
+  const handleSelectAccounts = (ids: number[]) => {
+    const primaryChanged = ids[0] !== accountIds[0];
+    setAccountIds(ids);
+    if (primaryChanged) {
+      initedAccountRef.current = null;
+      setModel("");
+      setRequestedModel("");
+      setAccountModelsOverride(null);
+      setFetchStatusText("");
+      setFetchErrorText("");
+    }
+    if (ids.length !== 1) {
+      setCustomSk("");
+      setCustomSkOpen(false);
+    }
   };
 
   // 拉取标准上游模型列表
   const fetchModelsFromUpstream = useCallback(
     async ({ silent }: { silent: boolean }) => {
       if (inputMode === "account") {
-        if (!accountId) return;
+        if (!primaryAccountId) return;
         setFetchingModels(true);
         setFetchErrorText("");
         try {
           const r = await post<VerifyFetchModelsResp>("/verify/fetch-models", {
-            account_id: accountId,
+            account_id: primaryAccountId,
             api_key_override: customSk.trim() || undefined,
           });
           setAccountModelsOverride(r.models);
@@ -401,7 +420,7 @@ export function VerifyRunView({
         setFetchingModels(false);
       }
     },
-    [inputMode, accountId, customSk, manualUrl, manualKey, model, selectedChannel?.platform_hint],
+    [inputMode, primaryAccountId, customSk, manualUrl, manualKey, model, selectedChannel?.platform_hint],
   );
 
   // 手动模式：输入完整 URL + Key 后自动防抖 600ms 拉取一次标准模型列表
@@ -436,12 +455,12 @@ export function VerifyRunView({
   }, [inputMode, inspectQ.data, selectedChannel?.platform_hint]);
 
   const accounts = accountsQ.data ?? [];
-  const selectedAccount = accounts.find((a) => a.id === accountId) ?? null;
+  const inspected = batchQ.data ?? [];
 
   const saveStandaloneKey = async () => {
-    if (!accountId) return;
+    if (!primaryAccountId) return;
     try {
-      await put(`/verify/accounts/${accountId}/key`, { api_key: customSk.trim() });
+      await put(`/verify/accounts/${primaryAccountId}/key`, { api_key: customSk.trim() });
       toast.success(customSk.trim() ? "已保存该账号测试 SK" : "已清除本地覆盖 SK");
       setCustomSk("");
       setCustomSkOpen(false);
@@ -475,7 +494,7 @@ export function VerifyRunView({
           channel_code: selectedChannel.code,
           model: trimmedModel,
         });
-        setActiveRunId(r.id);
+        setActiveRunIds([r.id]);
         invalidate("verify-runs");
       } catch (e) {
         toast.error(readErr(e));
@@ -485,23 +504,41 @@ export function VerifyRunView({
       return;
     }
 
-    if (!accountId) return toast.error("请先搜索并选择要鉴定的账号");
+    if (!accountIds.length) return toast.error("请先搜索并选择要鉴定的账号");
     const override = customSk.trim();
-    if (!inspectQ.data?.has_sk && !override) return toast.error("未能自动读取该账号的 SK，请先填写测试 SK");
+    const missing = accountIds.filter((id) => {
+      const row = inspected.find((r) => r.account.id === id);
+      return !row?.has_sk && !(accountIds.length === 1 && override);
+    });
+    if (missing.length) {
+      return toast.error(
+        missing.length === accountIds.length
+          ? "有账号没读到 SK，请只选中该账号后填写测试 SK"
+          : `这 ${missing.length} 个账号没读到 SK，请单独选中后再填测试 SK`,
+      );
+    }
+    const blocked = accountIds.filter((id) => !inspected.find((r) => r.account.id === id)?.supported);
+    if (blocked.length) return toast.error("有账号没有上游地址，已跳过不了，请先取消这些账号");
 
     setStarting(true);
     try {
-      const r = await post<{ id: string }>("/verify/runs", {
-        mode: "account",
-        account_id: accountId,
-        channel_code: selectedChannel.code,
-        model: trimmedModel,
-        requested_model: requestedModel || undefined,
-        api_key_override: override || undefined,
-        save_key: Boolean(override && saveSk),
-      });
-      setActiveRunId(r.id);
-      if (override && saveSk) {
+      const settled = await Promise.all(
+        accountIds.map(async (id) => {
+          const useOverride = accountIds.length === 1 ? override : "";
+          const r = await post<{ id: string }>("/verify/runs", {
+            mode: "account",
+            account_id: id,
+            channel_code: selectedChannel.code,
+            model: trimmedModel,
+            requested_model: requestedModel || undefined,
+            api_key_override: useOverride || undefined,
+            save_key: Boolean(useOverride && saveSk),
+          });
+          return r.id;
+        }),
+      );
+      setActiveRunIds(settled);
+      if (override && saveSk && accountIds.length === 1) {
         setCustomSk("");
         setCustomSkOpen(false);
         invalidate("verify-inspect");
@@ -516,11 +553,15 @@ export function VerifyRunView({
 
   const inspect = inspectQ.data;
   const availableModels = inputMode === "manual" ? manualModels : (accountModelsOverride ?? inspect?.models ?? []);
-  const isRunning = runQ.data?.status === "running";
   const targetReady =
     inputMode === "manual"
       ? URL_RE.test(manualUrl.trim()) && Boolean(manualKey.trim())
-      : Boolean(accountId && inspect?.supported);
+      : accountIds.length > 0 &&
+        !batchQ.isLoading &&
+        accountIds.every((id) => {
+          const row = inspected.find((r) => r.account.id === id);
+          return Boolean(row?.supported && (row.has_sk || (accountIds.length === 1 && customSk.trim())));
+        });
 
   return (
     <div className="flex flex-col gap-6">
@@ -578,54 +619,64 @@ export function VerifyRunView({
                 </div>
                 <AccountSearchPicker
                   accounts={accounts}
-                  value={accountId}
-                  onChange={handleSelectAccount}
+                  value={accountIds}
+                  onChange={handleSelectAccounts}
                   loading={accountsQ.isLoading}
                 />
 
-                {accountId ? (
-                  inspectQ.isLoading ? (
+                {accountIds.length ? (
+                  batchQ.isLoading ? (
                     <Skeleton className="h-20 w-full" />
-                  ) : inspectQ.isError ? (
+                  ) : batchQ.isError ? (
                     <div className="border-danger/30 bg-danger/5 text-danger rounded-lg border px-3 py-2 text-xs">
-                      读取账号配置失败：{readErr(inspectQ.error)}
+                      读取账号配置失败：{readErr(batchQ.error)}
                     </div>
-                  ) : inspect ? (
+                  ) : (
                     <div className="bg-muted/30 space-y-3 rounded-lg border p-3.5 text-xs">
                       <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="font-medium">{inspect.account.name}</span>
-                          <span className="text-muted-foreground font-mono">#{inspect.account.id}</span>
-                          {selectedAccount ? <AccountStatus a={selectedAccount} /> : null}
-                        </div>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 px-2 text-xs"
-                          onClick={() => setCustomSkOpen((v) => !v)}
-                        >
-                          <KeyRound className="size-3.5" />
-                          {customSkOpen ? "收起 SK 设置" : "更换 / 覆盖测试 SK"}
-                        </Button>
+                        <span className="text-muted-foreground">
+                          已选 {accountIds.length} 个，将并行鉴定。一次最多 {MAX_VERIFY_ACCOUNTS} 个。
+                        </span>
+                        {accountIds.length === 1 ? (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 px-2 text-xs"
+                            onClick={() => setCustomSkOpen((v) => !v)}
+                          >
+                            <KeyRound className="size-3.5" />
+                            {customSkOpen ? "收起 SK 设置" : "更换 / 覆盖测试 SK"}
+                          </Button>
+                        ) : null}
                       </div>
-                      <div className="grid gap-2 sm:grid-cols-2">
-                        <div>
-                          <span className="text-muted-foreground">上游站点地址：</span>
-                          {inspect.supported ? (
-                            <span className="font-mono break-all">{inspect.base_url}</span>
-                          ) : (
-                            <span className="text-danger">{inspect.unsupported_reason}</span>
-                          )}
-                        </div>
-                        <div>
-                          <span className="text-muted-foreground">检测 SK：</span>
-                          {inspect.has_sk ? (
-                            <span className="text-success font-mono">{inspect.sk_masked}（已就绪）</span>
-                          ) : (
-                            <span className="text-warning">未自动读取到明文 SK，请在下方填入测试 SK</span>
-                          )}
-                        </div>
+                      <div className="space-y-2">
+                        {accountIds.map((id) => {
+                          const row = inspected.find((r) => r.account.id === id);
+                          const acc = accounts.find((a) => a.id === id);
+                          return (
+                            <div key={id} className="grid gap-1 border-t pt-2 sm:grid-cols-2">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="font-medium">{row?.account.name || acc?.name || `#${id}`}</span>
+                                <span className="text-muted-foreground font-mono">#{id}</span>
+                                {id === primaryAccountId && acc ? <AccountStatus a={acc} /> : null}
+                              </div>
+                              <div className="text-muted-foreground sm:text-right">
+                                {row?.supported ? (
+                                  <span className="text-foreground font-mono break-all">{row.base_url}</span>
+                                ) : (
+                                  <span className="text-danger">{row?.unsupported_reason || "读取中"}</span>
+                                )}
+                                <span className="mx-1">·</span>
+                                {row?.has_sk ? (
+                                  <span className="text-success font-mono">{row.sk_masked}</span>
+                                ) : (
+                                  <span className="text-warning">无 SK</span>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                       {customSkOpen ? (
                         <div className="bg-background space-y-2 rounded-md border p-3">
@@ -638,7 +689,7 @@ export function VerifyRunView({
                               type="password"
                               autoComplete="off"
                               className="h-8 flex-1 font-mono text-xs"
-                              placeholder={inspect.has_sk ? "留空则继续使用自动读取的 SK" : "输入 sk-… 或上游 API Key"}
+                              placeholder={inspect?.has_sk ? "留空则继续使用自动读取的 SK" : "输入 sk-… 或上游 API Key"}
                               value={customSk}
                               onChange={(e) => setCustomSk(e.target.value)}
                             />
@@ -652,7 +703,7 @@ export function VerifyRunView({
                               >
                                 仅保存 SK
                               </Button>
-                            ) : inspect.sk_source === "saved_key" ? (
+                            ) : inspect?.sk_source === "saved_key" ? (
                               <Button
                                 type="button"
                                 size="sm"
@@ -671,7 +722,7 @@ export function VerifyRunView({
                         </div>
                       ) : null}
                     </div>
-                  ) : null
+                  )
                 ) : null}
               </div>
             ) : (
@@ -826,7 +877,7 @@ export function VerifyRunView({
               models={availableModels}
               platformHint={selectedChannel?.platform_hint}
               value={model}
-              disabled={inputMode === "account" ? !accountId || inspectQ.isLoading : false}
+              disabled={inputMode === "account" ? !primaryAccountId || inspectQ.isLoading : false}
               onChange={(mId, reqId) => {
                 setModel(mId);
                 setRequestedModel(reqId);
@@ -857,21 +908,29 @@ export function VerifyRunView({
             <Button
               type="button"
               size="lg"
-              disabled={starting || isRunning || !targetReady || !selectedChannel?.ready || !model.trim()}
+              disabled={starting || !targetReady || !selectedChannel?.ready || !model.trim()}
               onClick={startVerify}
             >
               <Play className="size-4" />
-              {starting || isRunning ? "正在检测中…" : "开始渠道鉴定"}
+              {starting
+                ? "正在启动…"
+                : accountIds.length > 1 && inputMode === "account"
+                  ? `开始鉴定（${accountIds.length} 个账号）`
+                  : "开始渠道鉴定"}
             </Button>
           </div>
         </CardContent>
       </Card>
 
-      {runQ.data ? (
-        <VerifyReportCard run={runQ.data} onRerun={startVerify} rerunning={starting} />
-      ) : activeRunId && runQ.isLoading ? (
-        <Skeleton className="h-64 w-full" />
-      ) : null}
+      {activeRunIds.map((id) => (
+        <VerifyLiveRun key={id} runId={id} />
+      ))}
     </div>
   );
+}
+
+function VerifyLiveRun({ runId }: { runId: string }) {
+  const q = useVerifyRun(runId);
+  if (!q.data) return <Skeleton className="h-64 w-full" />;
+  return <VerifyReportCard run={q.data} />;
 }
