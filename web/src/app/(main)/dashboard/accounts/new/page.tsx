@@ -3,7 +3,7 @@
 import { Suspense } from "react";
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import { ArrowLeft } from "lucide-react";
 
@@ -13,6 +13,7 @@ import { PageHeader } from "@/modules/ops/components/shared";
 import { useOps } from "@/modules/ops/provider";
 
 function NewAccount() {
+  const router = useRouter();
   const group = Number(useSearchParams().get("group")) || null;
   const { groups } = useOps();
   const pg = groups.find((g) => g.id === group);
@@ -31,7 +32,11 @@ function NewAccount() {
         }
         title={<>新建供应商账号 {pg ? <Tag tone="info">加入分组：{pg.name}</Tag> : null}</>}
       />
-      <AccountForm account={null} presetGroup={group} />
+      <AccountForm
+        account={null}
+        presetGroup={group}
+        onManageTemplates={() => router.push("/dashboard/verify?tab=templates")}
+      />
     </div>
   );
 }

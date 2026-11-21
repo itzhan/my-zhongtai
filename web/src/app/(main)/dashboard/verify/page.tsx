@@ -5,6 +5,7 @@ import { Suspense, useState } from "react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Embedded, PageHeader, useTabParam } from "@/modules/ops/components/shared";
 import type { VerifyPreset } from "@/modules/ops/types";
+import { AccountTemplatesView } from "@/modules/ops/views/account-templates-view";
 import { VerifyHistoryView } from "@/modules/ops/views/verify-history-view";
 import { VerifyMethodsView } from "@/modules/ops/views/verify-methods-view";
 import { VerifyRunView } from "@/modules/ops/views/verify-run-view";
@@ -12,6 +13,7 @@ import { VerifyRunView } from "@/modules/ops/views/verify-run-view";
 const TABS = [
   ["run", "开始鉴定"],
   ["history", "鉴定记录"],
+  ["templates", "录入模板"],
   ["methods", "方法论配置"],
 ] as const;
 
@@ -25,7 +27,7 @@ function VerifyInner() {
 
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader title="渠道鉴定" description="渠道真伪检测 · 实时探针诊断 · 可更新方法论与报告存档" />
+      <PageHeader title="渠道鉴定" description="渠道真伪检测 · URL 预检一键录入 · 录入模板与方法论配置" />
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           {TABS.map(([k, l]) => (
@@ -43,6 +45,7 @@ function VerifyInner() {
               if (code) setMethodCode(code);
               setTab("methods");
             }}
+            onOpenTemplates={() => setTab("templates")}
           />
         ) : tab === "history" ? (
           <VerifyHistoryView
@@ -50,7 +53,10 @@ function VerifyInner() {
               setPresetRun({ ...preset });
               setTab("run");
             }}
+            onOpenTemplates={() => setTab("templates")}
           />
+        ) : tab === "templates" ? (
+          <AccountTemplatesView />
         ) : (
           <VerifyMethodsView initialCode={methodCode} />
         )}

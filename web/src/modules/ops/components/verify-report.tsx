@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 
+import Link from "next/link";
+
 import {
   Check,
   CheckCircle2,
@@ -9,8 +11,10 @@ import {
   ChevronRight,
   Clock,
   Copy,
+  ExternalLink,
   Loader2,
   MinusCircle,
+  PlusCircle,
   RotateCw,
   ShieldAlert,
   ShieldCheck,
@@ -55,6 +59,8 @@ function getSkSourceLabel(src: string): string {
   switch (src) {
     case "manual":
       return "本次手动输入";
+    case "saved_manual":
+      return "复用上次测试 Key";
     case "saved_key":
       return "鉴定专用 Key";
     case "db":
@@ -302,10 +308,14 @@ export function VerifyReportCard({
   run,
   onRerun,
   rerunning = false,
+  onQuickAdd,
+  addedAccount,
 }: {
   run: VerifyRun;
   onRerun?: () => void;
   rerunning?: boolean;
+  onQuickAdd?: () => void;
+  addedAccount?: { id: number; name: string } | null;
 }) {
   const [copied, setCopied] = useState(false);
   const running = run.status === "running";
@@ -352,6 +362,27 @@ export function VerifyReportCard({
           {run.finished_at ? ` · 总耗时 ${ms(run.duration_ms)}` : ""}
         </CardDescription>
         <CardAction className="flex flex-wrap items-center gap-2">
+          {run.account_id === 0 && !running && onQuickAdd ? (
+            <>
+              {addedAccount ? (
+                <Button size="sm" variant="outline" asChild>
+                  <Link prefetch={false} href={`/dashboard/accounts/${addedAccount.id}`}>
+                    <Check className="text-success size-3.5" />
+                    已录入 #{addedAccount.id}
+                    <ExternalLink className="size-3 opacity-60" />
+                  </Link>
+                </Button>
+              ) : null}
+              <Button
+                size="sm"
+                variant={!addedAccount && run.verdict === "authentic" ? "default" : "outline"}
+                onClick={onQuickAdd}
+              >
+                <PlusCircle className="size-3.5" />
+                {addedAccount ? "再次录入" : "一键添加供应商"}
+              </Button>
+            </>
+          ) : null}
           <Button size="sm" variant="outline" onClick={copyReport}>
             {copied ? <Check className="text-success" /> : <Copy />}
             {copied ? "已复制" : "复制报告"}
@@ -425,9 +456,33 @@ export function VerifyReportCard({
           </div>
         </div>
 
-        <div className={cn("rounded-lg border px-4 py-3 text-sm leading-relaxed", summaryToneClass)}>
-          <span className="font-semibold">综合研判：</span>
-          {run.summary}
+        <div
+          className={cn(
+            "flex flex-col gap-3 rounded-lg border px-4 py-3 text-sm leading-relaxed sm:flex-row sm:items-center sm:justify-between",
+            summaryToneClass,
+          )}
+        >
+          <div>
+            <span className="font-semibold">综合研判：</span>
+            {run.summary}
+          </div>
+          {run.account_id === 0 && !running && onQuickAdd ? (
+            <div className="flex shrink-0 items-center gap-2">
+              {addedAccount ? (
+                <Button size="sm" variant="outline" asChild>
+                  <Link prefetch={false} href={`/dashboard/accounts/${addedAccount.id}`}>
+                    查看账号 #{addedAccount.id}
+                    <ExternalLink className="size-3" />
+                  </Link>
+                </Button>
+              ) : (
+                <Button size="sm" variant={run.verdict === "authentic" ? "default" : "outline"} onClick={onQuickAdd}>
+                  <PlusCircle className="size-3.5" />
+                  一键添加到系统
+                </Button>
+              )}
+            </div>
+          ) : null}
         </div>
 
         <div className="space-y-2">
@@ -470,11 +525,15 @@ export function VerifyReportDialog({
   open,
   onOpenChange,
   onRerun,
+  onQuickAdd,
+  addedAccount,
 }: {
   runId: string | null;
   open: boolean;
   onOpenChange: (o: boolean) => void;
   onRerun?: (run: VerifyRun) => void;
+  onQuickAdd?: (run: VerifyRun) => void;
+  addedAccount?: { id: number; name: string } | null;
 }) {
   const { data, isLoading } = useVerifyRun(open ? runId : null);
   return (
@@ -490,7 +549,12 @@ export function VerifyReportDialog({
           <Skeleton className="h-64" />
         </div>
       ) : (
-        <VerifyReportCard run={data} onRerun={onRerun ? () => onRerun(data) : undefined} />
+        <VerifyReportCard
+          run={data}
+          onRerun={onRerun ? () => onRerun(data) : undefined}
+          onQuickAdd={onQuickAdd && data.account_id === 0 ? () => onQuickAdd(data) : undefined}
+          addedAccount={addedAccount}
+        />
       )}
     </ResponsiveDialog>
   );

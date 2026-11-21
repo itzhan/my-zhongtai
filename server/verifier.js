@@ -302,7 +302,7 @@ export const BUILTIN_CHANNELS = [
     platform_hint: "gemini",
     protocol: "gemini_native",
     sort_order: 3,
-    builtin_version: 2,
+    builtin_version: 3,
     pass_ratio: 0.5,
     summary: "通过原生 Gemini 接口探测 error.details.metadata.service、candidateCount 限制及反查 Vertex 范围文案，确认是否为纯 AI Studio 资源。",
     methodology_md: AS_GEMINI_METHODOLOGY_MD,
@@ -407,7 +407,7 @@ export const BUILTIN_CHANNELS = [
         kind: "fingerprint",
         enabled: true,
         request_desc: "先发 responseLogprobs: true（若模型支持返回 200，则自动补发 responseLogprobs: true + logprobs: 99 触发原生 400）",
-        expect_desc: "400 错误包含 Logprobs is not enabled for models/ 或 service: generativelanguage.googleapis.com，且绝不含 Vertex 文档链接",
+        expect_desc: "400 错误包含 Logprobs is not enabled for models/ 或 for this model 或 service: generativelanguage.googleapis.com，且绝不含 Vertex 文档链接",
         request_body: {
           contents: [{ role: "user", parts: [{ text: "hi" }] }],
           generationConfig: { responseLogprobs: true },
@@ -419,11 +419,11 @@ export const BUILTIN_CHANNELS = [
         expect_status: [400],
         match_mode: "any",
         must_match: [
-          "Logprobs is not enabled for models/",
+          "Logprobs is not enabled for (?:models/|this model)",
           "generativelanguage\\.googleapis\\.com",
         ],
         strong_match: [
-          "Logprobs is not enabled for models/",
+          "Logprobs is not enabled for (?:models/|this model)",
           "generativelanguage\\.googleapis\\.com",
         ],
         counter_match: AS_VERTEX_COUNTER_PATTERNS,
@@ -437,7 +437,7 @@ export const BUILTIN_CHANNELS = [
     platform_hint: "gemini",
     protocol: "gemini_native",
     sort_order: 4,
-    builtin_version: 1,
+    builtin_version: 2,
     pass_ratio: 0.8,
     summary: "通过基准连通 + 6 项 Vertex AI 原生参数边界与跨端权限探针，鉴别是否为真实 Google Cloud Vertex Gemini。",
     methodology_md: VERTEX_METHODOLOGY_MD,
@@ -484,7 +484,7 @@ export const BUILTIN_CHANNELS = [
         ],
         strong_match: ["cloud\\.google\\.com/vertex-ai"],
         counter_match: [
-          "Logprobs is not enabled for models/",
+          "Logprobs is not enabled for (?:models/|this model)",
           "generativelanguage\\.googleapis\\.com",
         ],
         pass_200_hint: "两轮 logprobs 探测均返回 HTTP 200，说明中转层丢弃了 generationConfig 中的 logprobs 相关参数（非纯透传）",
@@ -529,7 +529,7 @@ export const BUILTIN_CHANNELS = [
           "topP value of 2 but the supported range is from 0 \\(inclusive\\) to 1 \\(inclusive\\)",
         ],
         strong_match: [],
-        counter_match: ["must be in \\[0\\.0,\\s*1\\.0\\]"],
+        counter_match: ["\\[0\\.0,\\s*1\\.0\\]", "must be in (?:the range )?\\[0\\.0,\\s*1\\.0\\]"],
         pass_200_hint: "返回 HTTP 200，说明中转层过滤/重置了超界 topP: 2 参数，未原样透传",
       },
       {
@@ -1812,6 +1812,11 @@ export function openVerifyDb(dataDir) {
       api_key TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS verify_manual_keys (
+      run_id TEXT PRIMARY KEY,
+      api_key TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS verify_runs (
       id TEXT PRIMARY KEY,
       account_id INTEGER NOT NULL,
@@ -1917,7 +1922,7 @@ function channelView(row) {
   };
 }
 
-function runView(row, includeSteps = true) {
+function runView(row, includeSteps = true, hasSavedKey = false) {
   const steps = parseJsonSafe(row.steps_json, []);
   const out = {
     id: row.id,
@@ -1927,6 +1932,7 @@ function runView(row, includeSteps = true) {
     base_url: row.base_url,
     sk_masked: row.sk_masked,
     sk_source: row.sk_source,
+    has_saved_key: Boolean(hasSavedKey),
     channel_code: row.channel_code,
     channel_name: row.channel_name,
     methodology_version: row.methodology_version,
@@ -1958,8 +1964,28 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     allChannels: db.prepare("SELECT * FROM verify_channels ORDER BY sort_order ASC, created_at ASC"),
     channel: db.prepare("SELECT * FROM verify_channels WHERE code = ?"),
     savedKey: db.prepare("SELECT api_key FROM verify_account_keys WHERE account_id = ?"),
+    manualKey: db.prepare("SELECT api_key FROM verify_manual_keys WHERE run_id = ?"),
+    allManualKeyIds: db.prepare("SELECT run_id FROM verify_manual_keys"),
+    saveManualKey: db.prepare(
+      "INSERT INTO verify_manual_keys (run_id, api_key, updated_at) VALUES (?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET api_key = excluded.api_key, updated_at = excluded.updated_at",
+    ),
+    delManualKey: db.prepare("DELETE FROM verify_manual_keys WHERE run_id = ?"),
     run: db.prepare("SELECT * FROM verify_runs WHERE id = ?"),
   };
+
+  function resolveManualRunKey(sourceRunId, expectedBaseUrl = "") {
+    const rid = str(sourceRunId, 40);
+    if (!rid) return "";
+    const keyRow = q.manualKey.get(rid);
+    if (!keyRow?.api_key) return "";
+    if (expectedBaseUrl) {
+      const runRow = q.run.get(rid);
+      if (runRow && normalizeUpstreamBase(runRow.base_url) !== normalizeUpstreamBase(expectedBaseUrl)) {
+        return "";
+      }
+    }
+    return String(keyRow.api_key).trim();
+  }
   const mustChannel = (code) => {
     const row = q.channel.get(str(code, 50));
     if (!row) throw httpError(404, "渠道类型不存在");
@@ -3293,9 +3319,11 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         }
         return { models: merged, endpoint: fetched.endpoint, count: merged.length };
       }
+      const manualKey =
+        str(b.api_key || b.api_key_override, 1000) || resolveManualRunKey(b.source_run_id, b.base_url);
       return fetchUpstreamModels({
         baseUrl: b.base_url,
-        apiKey: b.api_key || b.api_key_override,
+        apiKey: manualKey,
         fetchImpl,
         httpError,
       });
@@ -3387,7 +3415,12 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         if (!/^https?:\/\/[^/\s]+/i.test(cleanBaseUrl)) {
           throw httpError(400, "请输入合法的上游站点 URL（需以 http:// 或 https:// 开头）");
         }
-        const manualKey = str(b.api_key || b.api_key_override, 1000);
+        let manualKey = str(b.api_key || b.api_key_override, 1000);
+        let skSource = "manual";
+        if (!manualKey && b.source_run_id) {
+          manualKey = resolveManualRunKey(b.source_run_id, cleanBaseUrl);
+          if (manualKey) skSource = "saved_manual";
+        }
         if (!manualKey) throw httpError(400, "请输入测试 API Key (SK)");
         let host = cleanBaseUrl;
         try {
@@ -3403,7 +3436,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
           base_url: cleanBaseUrl,
           api_key: manualKey,
           sk_masked: maskSecret(manualKey),
-          sk_source: "manual",
+          sk_source: skSource,
           model_mapping: {},
         };
       } else {
@@ -3447,13 +3480,17 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         enabledFp.length,
         startedAt,
       );
+      if (isManual && ctx.api_key) {
+        q.saveManualKey.run(runId, ctx.api_key, startedAt);
+      }
       db.prepare(
         `DELETE FROM verify_runs WHERE id NOT IN (SELECT id FROM verify_runs ORDER BY started_at DESC LIMIT ${MAX_RUNS})`,
       ).run();
+      db.prepare("DELETE FROM verify_manual_keys WHERE run_id NOT IN (SELECT id FROM verify_runs)").run();
 
       // 异步执行各探针，立即返回 runId 给前端轮询实时进度
       void executeVerifyRun({ runId, ctx, channel, model: upstreamModel });
-      return runView(q.run.get(runId), true);
+      return runView(q.run.get(runId), true, isManual && Boolean(ctx.api_key));
     }),
   );
 
@@ -3480,8 +3517,9 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         params.push(kw, kw, kw, kw);
       }
       const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100));
+      const savedSet = new Set(q.allManualKeyIds.all().map((x) => x.run_id));
       const sql = `SELECT * FROM verify_runs ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY started_at DESC LIMIT ${limit}`;
-      return db.prepare(sql).all(...params).map((r) => runView(r, false));
+      return db.prepare(sql).all(...params).map((r) => runView(r, false, savedSet.has(r.id)));
     }),
   );
 
@@ -3490,15 +3528,21 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     wrap(async (req) => {
       const row = q.run.get(str(req.params.id, 40));
       if (!row) throw httpError(404, "检测报告不存在");
-      return runView(row, true);
+      return runView(row, true, Boolean(q.manualKey.get(row.id)));
     }),
   );
 
   app.delete(
     "/api/verify/runs/:id",
     wrap(async (req) => {
-      db.prepare("DELETE FROM verify_runs WHERE id = ?").run(str(req.params.id, 40));
+      const rid = str(req.params.id, 40);
+      db.prepare("DELETE FROM verify_runs WHERE id = ?").run(rid);
+      q.delManualKey.run(rid);
       return { ok: true };
     }),
   );
+
+  return {
+    getManualRunKey: resolveManualRunKey,
+  };
 }

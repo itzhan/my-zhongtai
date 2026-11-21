@@ -1,13 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
-import { useQuery } from "@tanstack/react-query";
+import { Eye, EyeOff, FileCode2, Search, Settings2, Sparkles, X } from "lucide-react";
 import { toast } from "sonner";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -17,14 +18,17 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
 
-import { get, post, put } from "../api";
-import { CLAUDE_MODELS, OPENAI_MODELS, readErr } from "../format";
+import { post, put } from "../api";
+import { CLAUDE_MODELS, GEMINI_MODELS, OPENAI_MODELS, readErr } from "../format";
+import { useAccountTemplates, useInvalidate, useProxies } from "../hooks";
 import { useOps } from "../provider";
+import type { AccountPlatform, AccountTemplate, AccountTemplateConfig, Group } from "../types";
 
+import { PlatformBadge, Tag } from "./badges";
 import { ResponsiveDialog, useConfirm } from "./shared";
 
-type Proxy = { id: number; name: string; protocol: string; host: string; port: number };
 export type AccountFull = {
   id: number;
   name: string;
@@ -50,8 +54,59 @@ export type AccountFull = {
   extra?: Record<string, unknown>;
 };
 
-const KNOWN = ["base_url", "model_mapping", "pool_mode", "pool_mode_retry_count", "pool_mode_retry_status_codes"];
-const passKey = (p: string) => (p === "openai" ? "openai_passthrough" : "anthropic_passthrough");
+export type AccountFormInitialValues = {
+  name?: string;
+  base_url?: string;
+  api_key?: string;
+  source_verify_run_id?: string;
+  saved_key_masked?: string;
+  platform?: string;
+  notes?: string;
+};
+
+const KNOWN_CRED_KEYS = [
+  "base_url",
+  "model_mapping",
+  "pool_mode",
+  "pool_mode_retry_count",
+  "pool_mode_retry_status_codes",
+  "api_key",
+  "access_token",
+  "refresh_token",
+  "session_key",
+  "cookie",
+];
+
+const KNOWN_EXTRA_KEYS = ["anthropic_passthrough", "openai_passthrough", "upstream_billing_probe_enabled"];
+
+export const EMPTY_TEMPLATE_CONFIG: AccountTemplateConfig = {
+  platform: "anthropic",
+  notes: "",
+  schedulable: true,
+  use_as_detect_key: true,
+  pool_mode: false,
+  pool_mode_retry_count: 3,
+  pool_mode_retry_status_codes: "",
+  passthrough: false,
+  upstream_billing_probe_enabled: false,
+  model_mapping: {},
+  priority: 1,
+  concurrency: 1000,
+  load_factor: "",
+  rate_multiplier: 1,
+  proxy_id: 0,
+  auto_pause_on_expired: true,
+  group_ids: [],
+  credentials_other: {},
+  extra_other: {},
+};
+
+const passKey = (p: string): "anthropic_passthrough" | "openai_passthrough" | null =>
+  p === "openai" ? "openai_passthrough" : p === "anthropic" ? "anthropic_passthrough" : null;
+
+const normalizePlatform = (p?: string): AccountPlatform =>
+  p === "openai" || p === "gemini" || p === "anthropic" ? p : "anthropic";
+
 const dtLocal = (t?: string | null) => {
   if (!t) return "";
   const d = new Date(t);
@@ -59,28 +114,339 @@ const dtLocal = (t?: string | null) => {
   return d.toISOString().slice(0, 16);
 };
 
+function stripKeys(obj: Record<string, unknown> | undefined, keys: string[]): Record<string, unknown> {
+  if (!obj || typeof obj !== "object") return {};
+  return Object.fromEntries(Object.entries(obj).filter(([k]) => !keys.includes(k)));
+}
+
+export function accountFullToTemplateConfig(a: AccountFull): AccountTemplateConfig {
+  const c = a.credentials || {};
+  const plat = normalizePlatform(a.platform);
+  const pk = passKey(plat);
+  return {
+    platform: plat,
+    notes: a.notes ?? "",
+    schedulable: a.schedulable !== false,
+    use_as_detect_key: true,
+    pool_mode: !!c.pool_mode,
+    pool_mode_retry_count: c.pool_mode_retry_count ?? 3,
+    pool_mode_retry_status_codes: (c.pool_mode_retry_status_codes || []).join(","),
+    passthrough: pk ? !!a.extra?.[pk] : false,
+    upstream_billing_probe_enabled: !!a.extra?.upstream_billing_probe_enabled,
+    model_mapping: { ...(c.model_mapping || {}) },
+    priority: a.priority ?? 1,
+    concurrency: a.concurrency ?? 1000,
+    load_factor: a.load_factor ? String(a.load_factor) : "",
+    rate_multiplier: a.rate_multiplier ?? 1,
+    proxy_id: a.proxy_id ?? 0,
+    auto_pause_on_expired: a.auto_pause_on_expired !== false,
+    group_ids: [...(a.group_ids || [])],
+    credentials_other: stripKeys(c, KNOWN_CRED_KEYS),
+    extra_other: stripKeys(a.extra, KNOWN_EXTRA_KEYS),
+  };
+}
+
+// ---------- 共享子组件：模型映射编辑器 ----------
+export function ModelMappingEditor({
+  mapping,
+  onChange,
+  availableModels,
+  title = "模型映射",
+  description = "左边是客户请求的模型，右边是发给上游的模型；相同则只是允许该模型",
+}: {
+  mapping: [string, string][];
+  onChange: (next: [string, string][]) => void;
+  availableModels?: string[];
+  title?: string;
+  description?: string;
+}) {
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkText, setBulkText] = useState("");
+
+  const addModels = (list: string[]) => {
+    const have = new Set(mapping.map(([k]) => k));
+    const added = list
+      .filter((x) => x.trim() && !have.has(x.trim()))
+      .map((x) => [x.trim(), x.trim()] as [string, string]);
+    if (!added.length) return;
+    onChange([...mapping, ...added]);
+  };
+
+  return (
+    <>
+      <Card>
+        <CardHeader>
+          <CardTitle>{title}</CardTitle>
+          <CardDescription>{description}</CardDescription>
+          <CardAction className="flex flex-wrap gap-1">
+            {availableModels && availableModels.length > 0 ? (
+              <Button type="button" size="sm" variant="outline" onClick={() => addModels(availableModels)}>
+                ＋ 本次拉取模型 ({availableModels.length})
+              </Button>
+            ) : null}
+            <Button type="button" size="sm" variant="outline" onClick={() => addModels(CLAUDE_MODELS)}>
+              ＋ Claude 常用
+            </Button>
+            <Button type="button" size="sm" variant="outline" onClick={() => addModels(OPENAI_MODELS)}>
+              ＋ GPT 常用
+            </Button>
+            <Button type="button" size="sm" variant="outline" onClick={() => addModels(GEMINI_MODELS)}>
+              ＋ Gemini 常用
+            </Button>
+            <Button type="button" size="sm" variant="outline" onClick={() => onChange([...mapping, ["", ""]])}>
+              ＋ 一行
+            </Button>
+            <Button type="button" size="sm" variant="outline" onClick={() => setBulkOpen(true)}>
+              批量粘贴
+            </Button>
+            <Button type="button" size="sm" variant="outline" className="text-destructive" onClick={() => onChange([])}>
+              清空
+            </Button>
+          </CardAction>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {mapping.length ? (
+            mapping.map(([k, x], i) => (
+              <div key={i} className="flex items-center gap-2">
+                <Input
+                  value={k}
+                  placeholder="请求模型"
+                  className="font-mono text-xs"
+                  onChange={(e) => onChange(mapping.map((r, j) => (j === i ? [e.target.value, r[1]] : r)))}
+                />
+                <span className="text-muted-foreground">→</span>
+                <Input
+                  value={x}
+                  placeholder="上游模型（留空 = 同左）"
+                  className="font-mono text-xs"
+                  onChange={(e) => onChange(mapping.map((r, j) => (j === i ? [r[0], e.target.value] : r)))}
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => onChange(mapping.filter((_, j) => j !== i))}
+                >
+                  删除
+                </Button>
+              </div>
+            ))
+          ) : (
+            <p className="text-muted-foreground text-sm">未设置模型映射（留空表示不限制，由 sub2api 默认匹配）</p>
+          )}
+        </CardContent>
+      </Card>
+
+      <ResponsiveDialog
+        open={bulkOpen}
+        onOpenChange={setBulkOpen}
+        title="批量粘贴模型映射"
+        description="每行一个：模型 或 请求模型=上游模型，会追加到现有列表。"
+      >
+        <div className="space-y-3">
+          <Textarea
+            className="min-h-48 font-mono text-xs"
+            placeholder={"claude-opus-5\nclaude-sonnet-5=claude-sonnet-5"}
+            value={bulkText}
+            onChange={(e) => setBulkText(e.target.value)}
+          />
+          <Button
+            type="button"
+            className="w-full"
+            onClick={() => {
+              const have = new Set(mapping.map(([k]) => k));
+              const add: [string, string][] = [];
+              for (const l of bulkText
+                .split("\n")
+                .map((x) => x.trim())
+                .filter(Boolean)) {
+                const [k, x] = l.split(/\s*(?:=>|=|→)\s*/);
+                if (k && !have.has(k)) {
+                  add.push([k, x || k]);
+                  have.add(k);
+                }
+              }
+              onChange([...mapping, ...add]);
+              setBulkText("");
+              setBulkOpen(false);
+            }}
+          >
+            添加
+          </Button>
+        </div>
+      </ResponsiveDialog>
+    </>
+  );
+}
+
+// ---------- 共享子组件：所属分组多选器（支持搜索与按平台过滤） ----------
+export function GroupMultiPicker({
+  groups,
+  value,
+  onChange,
+  platform,
+  label = "所属分组",
+}: {
+  groups: Group[];
+  value: Set<number>;
+  onChange: (next: Set<number>) => void;
+  platform?: string;
+  label?: string;
+}) {
+  const [kw, setKw] = useState("");
+  const [onlySamePlatform, setOnlySamePlatform] = useState(false);
+
+  const selectedGroups = useMemo(() => {
+    const map = new Map(groups.map((g) => [g.id, g]));
+    return [...value].map((id) => ({ id, group: map.get(id) }));
+  }, [groups, value]);
+
+  const filtered = useMemo(() => {
+    const q = kw.trim().toLowerCase();
+    return groups.filter((g) => {
+      if (onlySamePlatform && platform && g.platform !== platform) return false;
+      if (q && !`${g.name} ${g.platform} ${g.id}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [groups, kw, onlySamePlatform, platform]);
+
+  const toggle = (id: number, checked: boolean) => {
+    const n = new Set(value);
+    if (checked) n.add(id);
+    else n.delete(id);
+    onChange(n);
+  };
+
+  return (
+    <div className="space-y-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <Label>
+          {label}
+          {value.size > 0 ? (
+            <span className="text-muted-foreground ml-1.5 font-normal">（已选 {value.size} 个）</span>
+          ) : null}
+        </Label>
+        <div className="flex flex-wrap items-center gap-2">
+          {platform ? (
+            <label className="text-muted-foreground flex items-center gap-1.5 text-xs">
+              <Checkbox checked={onlySamePlatform} onCheckedChange={(x) => setOnlySamePlatform(!!x)} />
+              仅看 {platform} 分组
+            </label>
+          ) : null}
+          {value.size > 0 ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="text-muted-foreground h-6 px-2 text-xs"
+              onClick={() => onChange(new Set())}
+            >
+              清空已选
+            </Button>
+          ) : null}
+        </div>
+      </div>
+
+      {selectedGroups.length > 0 ? (
+        <div className="flex flex-wrap gap-1.5">
+          {selectedGroups.map(({ id, group }) => (
+            <Badge key={id} variant="secondary" className="gap-1 pr-1 font-normal">
+              <span>{group ? group.name : `分组 #${id}（已不存在）`}</span>
+              {group ? <span className="text-muted-foreground text-[10px]">{group.platform}</span> : null}
+              <button
+                type="button"
+                className="hover:bg-muted-foreground/20 rounded-full p-0.5"
+                onClick={() => toggle(id, false)}
+                title="移除"
+              >
+                <X className="size-3" />
+              </button>
+            </Badge>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="relative">
+        <Search className="text-muted-foreground absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2" />
+        <Input
+          placeholder="搜索分组名称或平台…"
+          value={kw}
+          onChange={(e) => setKw(e.target.value)}
+          className="h-8 pl-8 text-xs"
+        />
+      </div>
+
+      <div className="grid max-h-56 gap-2 overflow-y-auto rounded-md border p-3 sm:grid-cols-2 lg:grid-cols-3">
+        {filtered.length ? (
+          filtered.map((g) => (
+            <label
+              key={g.id}
+              className="hover:bg-accent/40 flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm"
+            >
+              <Checkbox checked={value.has(g.id)} onCheckedChange={(x) => toggle(g.id, !!x)} />
+              <span className="truncate">{g.name}</span>
+              <span className="text-muted-foreground shrink-0 text-xs">{g.platform}</span>
+            </label>
+          ))
+        ) : (
+          <p className="text-muted-foreground col-span-full py-4 text-center text-xs">没有匹配的分组</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // 新建 / 编辑上游账号（直接写 sub2api；只读模式下后端会拦截）
-export function AccountForm({ account: a, presetGroup }: { account: AccountFull | null; presetGroup?: number | null }) {
+export function AccountForm({
+  account: a,
+  presetGroup,
+  initialValues,
+  defaultChannelCode,
+  availableModels,
+  submitLabel,
+  onSuccess,
+  onCancel,
+  onManageTemplates,
+}: {
+  account: AccountFull | null;
+  presetGroup?: number | null;
+  initialValues?: AccountFormInitialValues;
+  defaultChannelCode?: string;
+  availableModels?: string[];
+  submitLabel?: string;
+  onSuccess?: (created: { id: number; name: string }) => void;
+  onCancel?: () => void;
+  onManageTemplates?: () => void;
+}) {
   const router = useRouter();
+  const invalidate = useInvalidate();
   const { groups } = useOps();
   const creating = !a;
   const pg = presetGroup ? groups.find((g) => g.id === presetGroup) : undefined;
-  const proxies = useQuery({ queryKey: ["ops", "proxies"], queryFn: () => get<Proxy[]>("/proxies"), retry: false });
+  const proxies = useProxies();
+  const templatesQ = useAccountTemplates();
+  const templates = useMemo(() => templatesQ.data ?? [], [templatesQ.data]);
   const [confirm, confirmEl] = useConfirm();
   const c = a?.credentials || {};
 
+  const initPlatform = normalizePlatform(
+    a?.platform ||
+      initialValues?.platform ||
+      (pg && ["anthropic", "openai", "gemini"].includes(pg.platform) ? pg.platform : "anthropic"),
+  );
+  const initPassKey = passKey(initPlatform);
+
   const [v, setV] = useState({
-    name: a?.name ?? "",
-    notes: a?.notes ?? "",
-    platform:
-      a?.platform || (pg && ["anthropic", "openai", "gemini"].includes(pg.platform) ? pg.platform : "anthropic"),
-    base_url: c.base_url ?? "",
-    api_key: "",
+    name: a?.name ?? initialValues?.name ?? "",
+    notes: a?.notes ?? initialValues?.notes ?? "",
+    platform: initPlatform as string,
+    base_url: c.base_url ?? initialValues?.base_url ?? "",
+    api_key: initialValues?.api_key ?? "",
     use_as_detect_key: true,
     pool_mode: !!c.pool_mode,
     pool_mode_retry_count: String(c.pool_mode_retry_count ?? 3),
     pool_mode_retry_status_codes: (c.pool_mode_retry_status_codes || []).join(","),
-    passthrough: !!a?.extra?.[passKey(a?.platform ?? "anthropic")],
+    passthrough: initPassKey ? !!a?.extra?.[initPassKey] : false,
     upstream_billing_probe_enabled: !!a?.extra?.upstream_billing_probe_enabled,
     priority: String(a?.priority ?? 1),
     concurrency: String(a?.concurrency ?? 1000),
@@ -92,29 +458,117 @@ export function AccountForm({ account: a, presetGroup }: { account: AccountFull 
     schedulable: a ? a.schedulable : true,
     status_on: a ? a.status !== "inactive" : true,
     enroll: true,
-    other: JSON.stringify(Object.fromEntries(Object.entries(c).filter(([k]) => !KNOWN.includes(k))), null, 2),
+    other: JSON.stringify(stripKeys(c, KNOWN_CRED_KEYS), null, 2),
+    extraOther: JSON.stringify(stripKeys(a?.extra, KNOWN_EXTRA_KEYS), null, 2),
   });
   const [groupIds, setGroupIds] = useState<Set<number>>(new Set(a?.group_ids ?? (presetGroup ? [presetGroup] : [])));
   const [mapping, setMapping] = useState<[string, string][]>(Object.entries(c.model_mapping || {}));
-  const [bulkOpen, setBulkOpen] = useState(false);
-  const [bulkText, setBulkText] = useState("");
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>("none");
+  const [showKey, setShowKey] = useState(false);
   const [busy, setBusy] = useState(false);
+  const autoAppliedRef = useRef(false);
+
   const set = (p: Partial<typeof v>) => setV((x) => ({ ...x, ...p }));
 
-  const addModels = (list: string[]) =>
-    setMapping((m) => {
-      const have = new Set(m.map(([k]) => k));
-      return [...m, ...list.filter((x) => !have.has(x)).map((x) => [x, x] as [string, string])];
-    });
+  const validGroupIdSet = useMemo(() => new Set(groups.map((g) => g.id)), [groups]);
+
+  const applyTemplate = (tpl: AccountTemplate | null) => {
+    if (!tpl) {
+      setSelectedTemplateId("none");
+      setV((prev) => ({
+        ...prev,
+        notes: initialValues?.notes ?? "",
+        platform: initPlatform,
+        use_as_detect_key: true,
+        pool_mode: false,
+        pool_mode_retry_count: "3",
+        pool_mode_retry_status_codes: "",
+        passthrough: false,
+        upstream_billing_probe_enabled: false,
+        priority: "1",
+        concurrency: "1000",
+        load_factor: "",
+        rate_multiplier: "1",
+        proxy_id: "0",
+        auto_pause_on_expired: true,
+        schedulable: true,
+        other: "{}",
+        extraOther: "{}",
+      }));
+      setMapping([]);
+      setGroupIds(new Set(presetGroup ? [presetGroup] : []));
+      return;
+    }
+    const cfg = tpl.config;
+    setSelectedTemplateId(String(tpl.id));
+    setV((prev) => ({
+      ...prev,
+      // 保留账号名称、URL、API Key 不变，其余按模板套用
+      platform: cfg.platform,
+      notes: cfg.notes,
+      schedulable: cfg.schedulable,
+      use_as_detect_key: cfg.use_as_detect_key,
+      pool_mode: cfg.pool_mode,
+      pool_mode_retry_count: String(cfg.pool_mode_retry_count ?? 3),
+      pool_mode_retry_status_codes: cfg.pool_mode_retry_status_codes ?? "",
+      passthrough: cfg.platform === "gemini" ? false : !!cfg.passthrough,
+      upstream_billing_probe_enabled: !!cfg.upstream_billing_probe_enabled,
+      priority: String(cfg.priority ?? 1),
+      concurrency: String(cfg.concurrency ?? 1000),
+      load_factor: cfg.load_factor ?? "",
+      rate_multiplier: String(cfg.rate_multiplier ?? 1),
+      proxy_id: String(cfg.proxy_id ?? 0),
+      auto_pause_on_expired: cfg.auto_pause_on_expired !== false,
+      other: JSON.stringify(cfg.credentials_other || {}, null, 2),
+      extraOther: JSON.stringify(cfg.extra_other || {}, null, 2),
+    }));
+    setMapping(Object.entries(cfg.model_mapping || {}));
+    const nextGroups = new Set<number>(
+      (cfg.group_ids || []).filter((id) => validGroupIdSet.size === 0 || validGroupIdSet.has(id)),
+    );
+    if (presetGroup) nextGroups.add(presetGroup);
+    setGroupIds(nextGroups);
+  };
+
+  // 若指定了 defaultChannelCode（如来自 URL 鉴定的 aws_bedrock），加载模板后自动套用对应模板一次
+  useEffect(() => {
+    if (!creating || !defaultChannelCode || autoAppliedRef.current || !templates.length) return;
+    const hit = templates.find((t) => t.channel_code === defaultChannelCode);
+    if (hit) {
+      autoAppliedRef.current = true;
+      applyTemplate(hit);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [creating, defaultChannelCode, templates]);
+
+  const activeTemplate = useMemo(
+    () => (selectedTemplateId === "none" ? null : (templates.find((t) => String(t.id) === selectedTemplateId) ?? null)),
+    [selectedTemplateId, templates],
+  );
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     let other: Record<string, unknown>;
     try {
-      other = JSON.parse(v.other || "{}");
+      const parsed = JSON.parse(v.other || "{}");
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return toast.error("高级凭证字段必须是 JSON 对象");
+      }
+      other = parsed as Record<string, unknown>;
     } catch {
       return toast.error("高级凭证字段不是合法 JSON");
     }
+    let extraOther: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(v.extraOther || "{}");
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return toast.error("扩展字段 extra 必须是 JSON 对象");
+      }
+      extraOther = parsed as Record<string, unknown>;
+    } catch {
+      return toast.error("扩展字段 extra 不是合法 JSON");
+    }
+
     const plat = creating ? v.platform : a.platform;
     const body: Record<string, unknown> = {
       name: v.name,
@@ -122,6 +576,9 @@ export function AccountForm({ account: a, presetGroup }: { account: AccountFull 
       platform: plat,
       base_url: v.base_url,
       api_key: v.api_key,
+      ...(creating && !v.api_key.trim() && initialValues?.source_verify_run_id
+        ? { source_verify_run_id: initialValues.source_verify_run_id }
+        : {}),
       use_as_detect_key: v.use_as_detect_key,
       credentials: other,
       model_mapping: Object.fromEntries(mapping.filter(([k]) => k.trim()).map(([k, x]) => [k.trim(), (x || k).trim()])),
@@ -140,24 +597,55 @@ export function AccountForm({ account: a, presetGroup }: { account: AccountFull 
       schedulable: v.schedulable,
     };
     if (!creating) body.status = v.status_on ? "active" : "inactive";
-    // 透传开关变了才提交 extra（sub2api 的 extra 是整份覆盖）
+    // 透传开关或扩展字段有内容时提交 extra（sub2api 的 extra 是整份覆盖）
     const pk = passKey(plat);
-    if (creating ? v.passthrough : !!a.extra?.[pk] !== v.passthrough)
-      body.extra = { ...(a?.extra || {}), [pk]: v.passthrough };
+    const mergedExtra: Record<string, unknown> = { ...extraOther };
+    if (pk) {
+      if (creating ? v.passthrough : !!a.extra?.[pk] !== v.passthrough || Object.keys(extraOther).length > 0) {
+        mergedExtra[pk] = v.passthrough;
+      }
+    }
+    if (creating) {
+      if (Object.keys(mergedExtra).length > 0) body.extra = mergedExtra;
+    } else {
+      const origExtraOther = stripKeys(a.extra, KNOWN_EXTRA_KEYS);
+      const extraChanged =
+        (pk ? !!a.extra?.[pk] !== v.passthrough : false) ||
+        JSON.stringify(origExtraOther) !== JSON.stringify(extraOther);
+      if (extraChanged) {
+        body.extra = {
+          ...(a.extra?.upstream_billing_probe_enabled !== undefined
+            ? { upstream_billing_probe_enabled: a.extra.upstream_billing_probe_enabled }
+            : {}),
+          ...mergedExtra,
+        };
+      }
+    }
+
     setBusy(true);
     const send = async (mixed: boolean): Promise<void> => {
       try {
         const r = creating
-          ? await post<{ id: number }>("/accounts", { ...body, confirm_mixed_channel_risk: mixed })
+          ? await post<{ id: number; name?: string }>("/accounts", { ...body, confirm_mixed_channel_risk: mixed })
           : await put<{ ok: boolean }>(`/accounts/${a.id}`, { ...body, confirm_mixed_channel_risk: mixed });
-        toast.success(creating ? "账号已创建" : "已保存");
+        invalidate("accounts", "meta");
         const newId = creating ? (r as { id: number }).id : a.id;
+        const createdName = creating ? (r as { name?: string }).name || v.name.trim() : v.name.trim();
+        toast.success(creating ? `账号「${createdName}」已录入 (#${newId})` : "已保存");
         if (creating && pg) {
           if (v.enroll && groupIds.has(pg.id))
             await post(`/sched/groups/${pg.id}/enroll`, { account_ids: [newId], enrolled: true }).catch((err) =>
               toast.error(`关联智能调度失败：${readErr(err)}`),
             );
+          if (onSuccess) {
+            onSuccess({ id: newId, name: createdName });
+            return;
+          }
           router.push(`/dashboard/groups/${pg.id}`);
+          return;
+        }
+        if (onSuccess) {
+          onSuccess({ id: newId, name: createdName });
           return;
         }
         router.push(`/dashboard/accounts/${newId}`);
@@ -173,7 +661,7 @@ export function AccountForm({ account: a, presetGroup }: { account: AccountFull 
         setBusy(false);
       }
     };
-    send(false);
+    void send(false);
   };
 
   const sw = (label: string, key: keyof typeof v) => (
@@ -182,8 +670,91 @@ export function AccountForm({ account: a, presetGroup }: { account: AccountFull 
     </label>
   );
 
+  const showPassthrough = v.platform === "anthropic" || v.platform === "openai";
+
   return (
     <form onSubmit={submit} className="space-y-4">
+      {creating ? (
+        <Card className="border-primary/25 bg-primary/[0.02]">
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <FileCode2 className="text-primary size-4" />
+              套用录入模板
+            </CardTitle>
+            <CardDescription>
+              选择模板可一键填充平台、号池、透传、并发、模型映射与默认分组，保留当前名称、URL 与
+              Key；套用后可自由微调任意字段。
+            </CardDescription>
+            {onManageTemplates ? (
+              <CardAction>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
+                  onClick={onManageTemplates}
+                >
+                  <Settings2 className="size-3.5" />
+                  管理模板
+                </Button>
+              </CardAction>
+            ) : null}
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <Select
+                value={selectedTemplateId}
+                onValueChange={(val) => {
+                  if (val === "none") applyTemplate(null);
+                  else applyTemplate(templates.find((t) => String(t.id) === val) ?? null);
+                }}
+              >
+                <SelectTrigger className="w-full sm:w-72">
+                  <SelectValue placeholder="选择录入模板（可选）" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">不使用模板（手动填写）</SelectItem>
+                  {templates.map((t) => (
+                    <SelectItem key={t.id} value={String(t.id)}>
+                      {t.name}（{t.config.platform} · {t.config.group_ids.length} 分组）
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {templates.length > 0 ? (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {templates.slice(0, 6).map((t) => {
+                    const active = String(t.id) === selectedTemplateId;
+                    return (
+                      <Button
+                        key={t.id}
+                        type="button"
+                        size="sm"
+                        variant={active ? "default" : "outline"}
+                        className="h-7 gap-1 px-2.5 text-xs"
+                        onClick={() => applyTemplate(t)}
+                      >
+                        <Sparkles className="size-3" />
+                        {t.name}
+                      </Button>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
+            {activeTemplate ? (
+              <div className="bg-background/80 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs">
+                <Tag tone="ok">已套用模板：{activeTemplate.name}</Tag>
+                <PlatformBadge platform={activeTemplate.config.platform} />
+                <span className="text-muted-foreground">
+                  {activeTemplate.description || "下方任意配置（如分组、倍率、模型映射）均可直接微调，不会修改原模板。"}
+                </span>
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
+      ) : null}
+
       <Card>
         <CardHeader>
           <CardTitle>基本信息</CardTitle>
@@ -201,7 +772,11 @@ export function AccountForm({ account: a, presetGroup }: { account: AccountFull 
             </div>
             <div className="space-y-2">
               <Label>平台{creating ? " *" : "（创建后不可改）"}</Label>
-              <Select value={v.platform} onValueChange={(x) => set({ platform: x })} disabled={!creating}>
+              <Select
+                value={v.platform}
+                onValueChange={(x) => set({ platform: x, passthrough: x === "gemini" ? false : v.passthrough })}
+                disabled={!creating}
+              >
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
@@ -235,20 +810,54 @@ export function AccountForm({ account: a, presetGroup }: { account: AccountFull 
             <Label>上游地址（base_url）*</Label>
             <Input
               required
+              className="font-mono text-xs"
               value={v.base_url}
               placeholder="https://api.example.com"
               onChange={(e) => set({ base_url: e.target.value })}
             />
           </div>
           <div className="space-y-2">
-            <Label>API Key {creating ? "*" : "（留空 = 保持原 Key 不变）"}</Label>
-            <Input
-              type="password"
-              autoComplete="new-password"
-              placeholder={creating ? "sk-…" : "不修改请留空"}
-              value={v.api_key}
-              onChange={(e) => set({ api_key: e.target.value })}
-            />
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Label>
+                API Key{" "}
+                {creating
+                  ? initialValues?.source_verify_run_id && !v.api_key.trim()
+                    ? "（留空 = 自动复用测试 Key）"
+                    : "*"
+                  : "（留空 = 保持原 Key 不变）"}
+              </Label>
+              {creating && initialValues?.source_verify_run_id && !v.api_key.trim() ? (
+                <Tag tone="ok" className="font-mono text-[10px]">
+                  已复用测试 Key：{initialValues.saved_key_masked || "后端已保存"}
+                </Tag>
+              ) : null}
+            </div>
+            <div className="flex gap-2">
+              <Input
+                type={showKey ? "text" : "password"}
+                required={creating && !initialValues?.source_verify_run_id}
+                autoComplete="new-password"
+                className="flex-1 font-mono text-xs"
+                placeholder={
+                  creating
+                    ? initialValues?.source_verify_run_id
+                      ? `留空将自动复用测试时的 Key（${initialValues.saved_key_masked || "已保存"}），也可输入新 Key 覆盖`
+                      : "sk-…"
+                    : "不修改请留空"
+                }
+                value={v.api_key}
+                onChange={(e) => set({ api_key: e.target.value })}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                onClick={() => setShowKey((s) => !s)}
+                title={showKey ? "隐藏 Key" : "显示 Key"}
+              >
+                {showKey ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+              </Button>
+            </div>
           </div>
           <label className="flex items-center gap-2 text-sm">
             <Checkbox checked={v.use_as_detect_key} onCheckedChange={(x) => set({ use_as_detect_key: !!x })} />{" "}
@@ -256,88 +865,33 @@ export function AccountForm({ account: a, presetGroup }: { account: AccountFull 
           </label>
           <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
             {sw("号池模式", "pool_mode")}
-            <label className="flex items-center gap-2 text-sm">
+            <label className={cn("flex items-center gap-2 text-sm", !v.pool_mode && "opacity-50")}>
               重试次数{" "}
               <Input
                 type="number"
                 className="h-8 w-16"
+                disabled={!v.pool_mode}
                 value={v.pool_mode_retry_count}
                 onChange={(e) => set({ pool_mode_retry_count: e.target.value })}
               />
             </label>
-            <label className="flex items-center gap-2 text-sm">
+            <label className={cn("flex items-center gap-2 text-sm", !v.pool_mode && "opacity-50")}>
               重试状态码{" "}
               <Input
-                className="h-8 w-44"
+                className="h-8 w-44 font-mono text-xs"
+                disabled={!v.pool_mode}
                 placeholder="如 401,403,429,503"
                 value={v.pool_mode_retry_status_codes}
                 onChange={(e) => set({ pool_mode_retry_status_codes: e.target.value })}
               />
             </label>
-            {sw("透传", "passthrough")}
+            {showPassthrough ? sw("透传", "passthrough") : null}
             {sw("上游计费探测", "upstream_billing_probe_enabled")}
           </div>
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>模型映射</CardTitle>
-          <CardDescription>左边是客户请求的模型，右边是发给上游的模型；相同则只是允许该模型</CardDescription>
-          <CardAction className="flex flex-wrap gap-1">
-            <Button type="button" size="sm" variant="outline" onClick={() => addModels(CLAUDE_MODELS)}>
-              ＋ Claude 常用
-            </Button>
-            <Button type="button" size="sm" variant="outline" onClick={() => addModels(OPENAI_MODELS)}>
-              ＋ GPT 常用
-            </Button>
-            <Button type="button" size="sm" variant="outline" onClick={() => setMapping((m) => [...m, ["", ""]])}>
-              ＋ 一行
-            </Button>
-            <Button type="button" size="sm" variant="outline" onClick={() => setBulkOpen(true)}>
-              批量粘贴
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="text-destructive"
-              onClick={() => setMapping([])}
-            >
-              清空
-            </Button>
-          </CardAction>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          {mapping.length ? (
-            mapping.map(([k, x], i) => (
-              <div key={i} className="flex items-center gap-2">
-                <Input
-                  value={k}
-                  placeholder="请求模型"
-                  onChange={(e) => setMapping((m) => m.map((r, j) => (j === i ? [e.target.value, r[1]] : r)))}
-                />
-                <span className="text-muted-foreground">→</span>
-                <Input
-                  value={x}
-                  placeholder="上游模型（留空 = 同左）"
-                  onChange={(e) => setMapping((m) => m.map((r, j) => (j === i ? [r[0], e.target.value] : r)))}
-                />
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => setMapping((m) => m.filter((_, j) => j !== i))}
-                >
-                  删除
-                </Button>
-              </div>
-            ))
-          ) : (
-            <p className="text-muted-foreground text-sm">未设置模型映射</p>
-          )}
-        </CardContent>
-      </Card>
+      <ModelMappingEditor mapping={mapping} onChange={setMapping} availableModels={availableModels} />
 
       <Card>
         <CardHeader>
@@ -389,103 +943,60 @@ export function AccountForm({ account: a, presetGroup }: { account: AccountFull 
             <Checkbox checked={v.auto_pause_on_expired} onCheckedChange={(x) => set({ auto_pause_on_expired: !!x })} />{" "}
             到期自动暂停
           </label>
-          <div className="space-y-2">
-            <Label>所属分组</Label>
-            <div className="grid max-h-56 gap-2 overflow-y-auto sm:grid-cols-3">
-              {groups.map((g) => (
-                <label key={g.id} className="flex items-center gap-2 text-sm">
-                  <Checkbox
-                    checked={groupIds.has(g.id)}
-                    onCheckedChange={(x) =>
-                      setGroupIds((s) => {
-                        const n = new Set(s);
-                        if (x) n.add(g.id);
-                        else n.delete(g.id);
-                        return n;
-                      })
-                    }
-                  />
-                  {g.name} <span className="text-muted-foreground text-xs">{g.platform}</span>
-                </label>
-              ))}
-            </div>
-          </div>
+          <GroupMultiPicker groups={groups} value={groupIds} onChange={setGroupIds} platform={v.platform} />
         </CardContent>
       </Card>
 
       <Collapsible className="rounded-xl border">
         <CollapsibleTrigger className="w-full px-6 py-4 text-left text-sm font-medium">
-          高级：其他凭证字段（JSON，不含 Key；一般不用改）▾
+          高级：其他凭证与扩展字段（JSON，不含 Key；一般不用改）▾
         </CollapsibleTrigger>
-        <CollapsibleContent className="px-6 pb-4">
-          <Textarea
-            className="min-h-32 font-mono text-xs"
-            value={v.other}
-            onChange={(e) => set({ other: e.target.value })}
-          />
+        <CollapsibleContent className="space-y-4 px-6 pb-4">
+          <div className="space-y-1.5">
+            <Label className="text-xs">其他凭证字段（credentials）</Label>
+            <Textarea
+              className="min-h-24 font-mono text-xs"
+              value={v.other}
+              onChange={(e) => set({ other: e.target.value })}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">扩展字段（extra，不含透传与计费探测开关）</Label>
+            <Textarea
+              className="min-h-24 font-mono text-xs"
+              value={v.extraOther}
+              onChange={(e) => set({ extraOther: e.target.value })}
+            />
+          </div>
         </CollapsibleContent>
       </Collapsible>
 
       <div className="flex gap-2">
         <Button type="submit" disabled={busy}>
-          {creating ? "创建账号" : "保存修改"}
+          {busy ? "提交中…" : (submitLabel ?? (creating ? "创建账号" : "保存修改"))}
         </Button>
-        <Button variant="outline" asChild>
-          <Link
-            prefetch={false}
-            href={
-              creating
-                ? pg
-                  ? `/dashboard/groups/${pg.id}`
-                  : "/dashboard/channels?tab=accounts"
-                : `/dashboard/accounts/${a.id}`
-            }
-          >
+        {onCancel ? (
+          <Button type="button" variant="outline" onClick={onCancel}>
             取消
-          </Link>
-        </Button>
+          </Button>
+        ) : (
+          <Button variant="outline" asChild>
+            <Link
+              prefetch={false}
+              href={
+                creating
+                  ? pg
+                    ? `/dashboard/groups/${pg.id}`
+                    : "/dashboard/channels?tab=accounts"
+                  : `/dashboard/accounts/${a.id}`
+              }
+            >
+              取消
+            </Link>
+          </Button>
+        )}
       </div>
 
-      <ResponsiveDialog
-        open={bulkOpen}
-        onOpenChange={setBulkOpen}
-        title="批量粘贴模型映射"
-        description="每行一个：模型 或 请求模型=上游模型，会追加到现有列表。"
-      >
-        <div className="space-y-3">
-          <Textarea
-            className="min-h-48 font-mono text-xs"
-            placeholder={"claude-opus-5\nclaude-sonnet-5=claude-sonnet-5"}
-            value={bulkText}
-            onChange={(e) => setBulkText(e.target.value)}
-          />
-          <Button
-            type="button"
-            className="w-full"
-            onClick={() => {
-              setMapping((m) => {
-                const have = new Set(m.map(([k]) => k));
-                const add: [string, string][] = [];
-                for (const l of bulkText
-                  .split("\n")
-                  .map((x) => x.trim())
-                  .filter(Boolean)) {
-                  const [k, x] = l.split(/\s*(?:=>|=|→)\s*/);
-                  if (k && !have.has(k)) {
-                    add.push([k, x || k]);
-                    have.add(k);
-                  }
-                }
-                return [...m, ...add];
-              });
-              setBulkText("");
-              setBulkOpen(false);
-            }}
-          >
-            添加
-          </Button>
-        </div>
-      </ResponsiveDialog>
       {confirmEl}
     </form>
   );

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-import { Eye, RefreshCw, RotateCw, Search, Trash2 } from "lucide-react";
+import { Eye, PlusCircle, RefreshCw, RotateCw, Search, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -14,11 +14,12 @@ import { cn } from "@/lib/utils";
 
 import { del } from "../api";
 import { Tag } from "../components/badges";
+import { QuickAddAccountDialog } from "../components/quick-add-account-dialog";
 import { Pager, StatCards, useConfirm, usePaged } from "../components/shared";
 import { VerifyReportDialog, VerifyVerdictBadge } from "../components/verify-report";
 import { ago, ms, readErr, time } from "../format";
 import { useInvalidate, useVerifyChannels, useVerifyRuns } from "../hooks";
-import type { VerifyPreset, VerifyRun } from "../types";
+import type { ManualVerifyQuickAddContext, VerifyPreset, VerifyRun } from "../types";
 
 const ALL = "all";
 
@@ -26,22 +27,50 @@ function toPreset(r: VerifyRun): VerifyPreset {
   if (r.account_id > 0) {
     return { mode: "account", accountId: r.account_id, channelCode: r.channel_code, model: r.model };
   }
+  const isDefaultAutoName = /^手动检测\s*\(/.test(r.account_name || "");
   return {
     mode: "manual",
     baseUrl: r.base_url,
-    targetName: r.account_name,
+    targetName: isDefaultAutoName ? "" : r.account_name,
     channelCode: r.channel_code,
     model: r.model,
+    sourceRunId: r.id,
+    skMasked: r.sk_masked,
+    hasSavedKey: r.has_saved_key,
   };
 }
 
-export function VerifyHistoryView({ onRerunPreset }: { onRerunPreset: (preset: VerifyPreset) => void }) {
+function toQuickAddCtx(r: VerifyRun): ManualVerifyQuickAddContext {
+  const isDefaultAutoName = /^手动检测\s*\(/.test(r.account_name || "");
+  return {
+    runId: r.id,
+    baseUrl: r.base_url,
+    skMasked: r.sk_masked,
+    hasSavedKey: r.has_saved_key,
+    targetName: isDefaultAutoName ? "" : r.account_name,
+    channelCode: r.channel_code,
+    channelName: r.channel_name,
+    platformHint: r.platform || undefined,
+    model: r.model,
+    verdict: r.verdict,
+  };
+}
+
+export function VerifyHistoryView({
+  onRerunPreset,
+  onOpenTemplates,
+}: {
+  onRerunPreset: (preset: VerifyPreset) => void;
+  onOpenTemplates?: () => void;
+}) {
   const invalidate = useInvalidate();
   const [confirm, confirmEl] = useConfirm();
   const [kw, setKw] = useState("");
   const [channelFilter, setChannelFilter] = useState(ALL);
   const [verdictFilter, setVerdictFilter] = useState(ALL);
   const [viewRunId, setViewRunId] = useState<string | null>(null);
+  const [quickAddCtx, setQuickAddCtx] = useState<ManualVerifyQuickAddContext | null>(null);
+  const [addedByRunId, setAddedByRunId] = useState<Record<string, { id: number; name: string }>>({});
 
   const channelsQ = useVerifyChannels();
   const runsQ = useVerifyRuns({});
@@ -193,6 +222,17 @@ export function VerifyHistoryView({ onRerunPreset }: { onRerunPreset: (preset: V
                       <TableCell className="font-mono text-xs whitespace-nowrap">{ms(r.duration_ms)}</TableCell>
                       <TableCell className="text-right whitespace-nowrap">
                         <div className="inline-flex items-center gap-1">
+                          {r.account_id === 0 && r.status !== "running" ? (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="text-primary h-7 px-2"
+                              onClick={() => setQuickAddCtx(toQuickAddCtx(r))}
+                            >
+                              <PlusCircle className="size-3.5" />
+                              录入
+                            </Button>
+                          ) : null}
                           <Button size="sm" variant="ghost" className="h-7 px-2" onClick={() => setViewRunId(r.id)}>
                             <Eye className="size-3.5" />
                             报告
@@ -239,6 +279,20 @@ export function VerifyHistoryView({ onRerunPreset }: { onRerunPreset: (preset: V
         onRerun={(r) => {
           setViewRunId(null);
           onRerunPreset(toPreset(r));
+        }}
+        addedAccount={viewRunId ? (addedByRunId[viewRunId] ?? null) : null}
+        onQuickAdd={(r) => {
+          setViewRunId(null);
+          setQuickAddCtx(toQuickAddCtx(r));
+        }}
+      />
+      <QuickAddAccountDialog
+        ctx={quickAddCtx}
+        open={Boolean(quickAddCtx)}
+        onOpenChange={(o) => !o && setQuickAddCtx(null)}
+        onManageTemplates={onOpenTemplates}
+        onCreated={({ id, name, runId }) => {
+          setAddedByRunId((prev) => ({ ...prev, [runId]: { id, name } }));
         }}
       />
       {confirmEl}

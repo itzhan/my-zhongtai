@@ -31,6 +31,7 @@ import { cn } from "@/lib/utils";
 
 import { post, put } from "../api";
 import { AccountStatus, PlatformBadge, Tag } from "../components/badges";
+import { QuickAddAccountDialog } from "../components/quick-add-account-dialog";
 import { VerifyReportCard } from "../components/verify-report";
 import { readErr } from "../format";
 import {
@@ -42,7 +43,15 @@ import {
   useVerifyRun,
 } from "../hooks";
 import { useOps } from "../provider";
-import type { Account, VerifyChannel, VerifyFetchModelsResp, VerifyModelOption, VerifyPreset } from "../types";
+import type {
+  Account,
+  ManualVerifyQuickAddContext,
+  VerifyChannel,
+  VerifyFetchModelsResp,
+  VerifyModelOption,
+  VerifyPreset,
+  VerifyRun,
+} from "../types";
 
 const MAX_ACCOUNT_DROPDOWN = 40;
 const MAX_VERIFY_ACCOUNTS = 10;
@@ -146,14 +155,17 @@ function AccountSearchPicker({
                     value={String(a.id)}
                     onSelect={() => {
                       if (value.includes(a.id)) onChange(value.filter((id) => id !== a.id));
-                      else if (value.length >= MAX_VERIFY_ACCOUNTS) toast.error(`一次最多选 ${MAX_VERIFY_ACCOUNTS} 个账号`);
+                      else if (value.length >= MAX_VERIFY_ACCOUNTS)
+                        toast.error(`一次最多选 ${MAX_VERIFY_ACCOUNTS} 个账号`);
                       else onChange([...value, a.id]);
                     }}
                     className="flex items-center justify-between gap-2 py-2"
                   >
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-1.5">
-                        <Check className={cn("size-3.5 shrink-0", value.includes(a.id) ? "opacity-100" : "opacity-0")} />
+                        <Check
+                          className={cn("size-3.5 shrink-0", value.includes(a.id) ? "opacity-100" : "opacity-0")}
+                        />
                         <span className="truncate font-medium">{a.name}</span>
                         <span className="text-muted-foreground shrink-0 font-mono text-xs">#{a.id}</span>
                       </div>
@@ -280,9 +292,11 @@ function ModelPicker({
 
 export function VerifyRunView({
   onOpenMethods,
+  onOpenTemplates,
   presetRun,
 }: {
   onOpenMethods: (channelCode?: string) => void;
+  onOpenTemplates?: () => void;
   presetRun?: VerifyPreset | null;
 }) {
   const invalidate = useInvalidate();
@@ -290,11 +304,18 @@ export function VerifyRunView({
   const channelsQ = useVerifyChannels();
 
   const [inputMode, setInputMode] = useState<"account" | "manual">(presetRun?.mode ?? "account");
-  const [accountIds, setAccountIds] = useState<number[]>(
-    presetRun?.mode === "account" ? [presetRun.accountId] : [],
-  );
+  const [accountIds, setAccountIds] = useState<number[]>(presetRun?.mode === "account" ? [presetRun.accountId] : []);
   const [manualUrl, setManualUrl] = useState<string>(presetRun?.mode === "manual" ? presetRun.baseUrl : "");
   const [manualKey, setManualKey] = useState<string>("");
+  const [manualSourceRunId, setManualSourceRunId] = useState<string>(
+    presetRun?.mode === "manual" && presetRun.hasSavedKey && presetRun.sourceRunId ? presetRun.sourceRunId : "",
+  );
+  const [manualSavedSkMasked, setManualSavedSkMasked] = useState<string>(
+    presetRun?.mode === "manual" && presetRun.hasSavedKey ? (presetRun.skMasked ?? "") : "",
+  );
+  const [manualSourceUrl, setManualSourceUrl] = useState<string>(
+    presetRun?.mode === "manual" && presetRun.hasSavedKey ? presetRun.baseUrl : "",
+  );
   const [manualName, setManualName] = useState<string>(presetRun?.mode === "manual" ? presetRun.targetName : "");
 
   const [channelCode, setChannelCode] = useState<string>(presetRun?.channelCode ?? "vertex_gemini");
@@ -312,6 +333,24 @@ export function VerifyRunView({
 
   const [starting, setStarting] = useState(false);
   const [activeRunIds, setActiveRunIds] = useState<string[]>([]);
+  const [manualRunMap, setManualRunMap] = useState<
+    Record<
+      string,
+      {
+        baseUrl: string;
+        apiKey: string;
+        skMasked?: string;
+        hasSavedKey?: boolean;
+        targetName: string;
+        channelCode: string;
+        channelName: string;
+        platformHint?: string;
+        availableModels: string[];
+      }
+    >
+  >({});
+  const [quickAddCtx, setQuickAddCtx] = useState<ManualVerifyQuickAddContext | null>(null);
+  const [addedByRunId, setAddedByRunId] = useState<Record<string, { id: number; name: string }>>({});
   const initedAccountRef = useRef<number | null>(
     presetRun?.mode === "account" && presetRun.model ? presetRun.accountId : null,
   );
@@ -333,6 +372,16 @@ export function VerifyRunView({
       initedAccountRef.current = null;
       setManualUrl(presetRun.baseUrl);
       setManualName(presetRun.targetName);
+      setManualKey("");
+      if (presetRun.hasSavedKey && presetRun.sourceRunId) {
+        setManualSourceRunId(presetRun.sourceRunId);
+        setManualSavedSkMasked(presetRun.skMasked ?? "");
+        setManualSourceUrl(presetRun.baseUrl);
+      } else {
+        setManualSourceRunId("");
+        setManualSavedSkMasked("");
+        setManualSourceUrl("");
+      }
       setManualModels([]);
       lastManualAutoFetchRef.current = "";
     }
@@ -393,7 +442,8 @@ export function VerifyRunView({
 
       const url = manualUrl.trim();
       const key = manualKey.trim();
-      if (!URL_RE.test(url) || !key) {
+      const canReuse = Boolean(!key && manualSourceRunId);
+      if (!URL_RE.test(url) || (!key && !canReuse)) {
         if (!silent) toast.error("请先填写合法的上游站点 URL 与 API Key");
         return;
       }
@@ -402,7 +452,8 @@ export function VerifyRunView({
       try {
         const r = await post<VerifyFetchModelsResp>("/verify/fetch-models", {
           base_url: url,
-          api_key: key,
+          api_key: key || undefined,
+          source_run_id: canReuse ? manualSourceRunId : undefined,
         });
         setManualModels(r.models);
         setFetchStatusText(`已从上游 ${r.endpoint} 获取 ${r.count} 个可用模型`);
@@ -420,23 +471,33 @@ export function VerifyRunView({
         setFetchingModels(false);
       }
     },
-    [inputMode, primaryAccountId, customSk, manualUrl, manualKey, model, selectedChannel?.platform_hint],
+    [
+      inputMode,
+      primaryAccountId,
+      customSk,
+      manualUrl,
+      manualKey,
+      manualSourceRunId,
+      model,
+      selectedChannel?.platform_hint,
+    ],
   );
 
-  // 手动模式：输入完整 URL + Key 后自动防抖 600ms 拉取一次标准模型列表
+  // 手动模式：输入完整 URL + Key（或复测复用上次 Key）后自动防抖 600ms 拉取一次标准模型列表
   useEffect(() => {
     if (inputMode !== "manual") return;
     const url = manualUrl.trim();
     const key = manualKey.trim();
-    if (!URL_RE.test(url) || key.length < 6) return;
-    const sig = `${url}|${key}`;
+    const reuseId = !key ? manualSourceRunId : "";
+    if (!URL_RE.test(url) || (key.length < 6 && !reuseId)) return;
+    const sig = `${url}|${key || `reuse:${reuseId}`}`;
     if (lastManualAutoFetchRef.current === sig) return;
     const timer = setTimeout(() => {
       lastManualAutoFetchRef.current = sig;
       void fetchModelsFromUpstream({ silent: true });
     }, 600);
     return () => clearTimeout(timer);
-  }, [inputMode, manualUrl, manualKey, fetchModelsFromUpstream]);
+  }, [inputMode, manualUrl, manualKey, manualSourceRunId, fetchModelsFromUpstream]);
 
   useEffect(() => {
     if (inputMode !== "account" || !inspectQ.data) return;
@@ -482,18 +543,35 @@ export function VerifyRunView({
     if (inputMode === "manual") {
       const url = manualUrl.trim();
       const key = manualKey.trim();
+      const canReuse = Boolean(!key && manualSourceRunId);
       if (!URL_RE.test(url)) return toast.error("请输入合法的上游站点 URL（以 http:// 或 https:// 开头）");
-      if (!key) return toast.error("请输入测试 API Key (SK)");
+      if (!key && !canReuse) return toast.error("请输入测试 API Key (SK)");
       setStarting(true);
       try {
-        const r = await post<{ id: string }>("/verify/runs", {
+        const r = await post<{ id: string; sk_masked?: string; has_saved_key?: boolean }>("/verify/runs", {
           mode: "manual",
           base_url: url,
-          api_key: key,
+          api_key: key || undefined,
+          source_run_id: canReuse ? manualSourceRunId : undefined,
           target_name: manualName.trim() || undefined,
           channel_code: selectedChannel.code,
           model: trimmedModel,
         });
+        const modelsList = manualModels.map((m) => m.id).filter(Boolean);
+        setManualRunMap((prev) => ({
+          ...prev,
+          [r.id]: {
+            baseUrl: url,
+            apiKey: key,
+            skMasked: r.sk_masked || manualSavedSkMasked || undefined,
+            hasSavedKey: r.has_saved_key ?? true,
+            targetName: manualName.trim(),
+            channelCode: selectedChannel.code,
+            channelName: selectedChannel.name,
+            platformHint: selectedChannel.platform_hint || undefined,
+            availableModels: modelsList,
+          },
+        }));
         setActiveRunIds([r.id]);
         invalidate("verify-runs");
       } catch (e) {
@@ -555,7 +633,7 @@ export function VerifyRunView({
   const availableModels = inputMode === "manual" ? manualModels : (accountModelsOverride ?? inspect?.models ?? []);
   const targetReady =
     inputMode === "manual"
-      ? URL_RE.test(manualUrl.trim()) && Boolean(manualKey.trim())
+      ? URL_RE.test(manualUrl.trim()) && Boolean(manualKey.trim() || manualSourceRunId)
       : accountIds.length > 0 &&
         !batchQ.isLoading &&
         accountIds.every((id) => {
@@ -737,7 +815,19 @@ export function VerifyRunView({
                       placeholder="https://api.example.com（可带或不带 /v1）"
                       className="font-mono text-xs"
                       value={manualUrl}
-                      onChange={(e) => setManualUrl(e.target.value)}
+                      onChange={(e) => {
+                        const nextUrl = e.target.value;
+                        setManualUrl(nextUrl);
+                        if (
+                          manualSourceRunId &&
+                          manualSourceUrl &&
+                          nextUrl.trim().replace(/\/+$/, "") !== manualSourceUrl.trim().replace(/\/+$/, "")
+                        ) {
+                          setManualSourceRunId("");
+                          setManualSavedSkMasked("");
+                          setManualSourceUrl("");
+                        }
+                      }}
                     />
                   </div>
                   <div className="space-y-1.5">
@@ -754,15 +844,41 @@ export function VerifyRunView({
                   </div>
                 </div>
                 <div className="space-y-1.5">
-                  <Label htmlFor="manual-key" className="text-xs">
-                    测试 API Key (SK) *
-                  </Label>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Label htmlFor="manual-key" className="text-xs">
+                      测试 API Key (SK) {manualSourceRunId && !manualKey.trim() ? "（已复用上次）" : "*"}
+                    </Label>
+                    {manualSourceRunId && !manualKey.trim() ? (
+                      <div className="flex items-center gap-1.5 text-xs">
+                        <Tag tone="ok" className="font-mono text-[10px]">
+                          已自动带入上次 Key：{manualSavedSkMasked || "已保存"}
+                        </Tag>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          className="text-muted-foreground h-5 px-1.5 text-[11px]"
+                          onClick={() => {
+                            setManualSourceRunId("");
+                            setManualSavedSkMasked("");
+                            setManualSourceUrl("");
+                          }}
+                        >
+                          清除
+                        </Button>
+                      </div>
+                    ) : null}
+                  </div>
                   <div className="flex flex-col gap-2 sm:flex-row">
                     <Input
                       id="manual-key"
                       type="password"
                       autoComplete="off"
-                      placeholder="sk-… 或供应商 API Key（仅用于本次测试与拉取模型，报告中会自动脱敏）"
+                      placeholder={
+                        manualSourceRunId
+                          ? `已自动复用上次测试 Key（${manualSavedSkMasked || "后端安全保管"}），留空直接复测，或输入新 Key 覆盖`
+                          : "sk-… 或供应商 API Key（仅用于本次测试与拉取模型，报告中会自动脱敏）"
+                      }
                       className="flex-1 font-mono text-xs"
                       value={manualKey}
                       onChange={(e) => setManualKey(e.target.value)}
@@ -770,7 +886,9 @@ export function VerifyRunView({
                     <Button
                       type="button"
                       variant="outline"
-                      disabled={fetchingModels || !URL_RE.test(manualUrl.trim()) || !manualKey.trim()}
+                      disabled={
+                        fetchingModels || !URL_RE.test(manualUrl.trim()) || (!manualKey.trim() && !manualSourceRunId)
+                      }
                       onClick={() => fetchModelsFromUpstream({ silent: false })}
                     >
                       <Download className={cn("size-4", fetchingModels && "animate-pulse")} />
@@ -922,15 +1040,66 @@ export function VerifyRunView({
         </CardContent>
       </Card>
 
-      {activeRunIds.map((id) => (
-        <VerifyLiveRun key={id} runId={id} />
-      ))}
+      {activeRunIds.map((id) => {
+        const snap = manualRunMap[id];
+        return (
+          <VerifyLiveRun
+            key={id}
+            runId={id}
+            addedAccount={addedByRunId[id] ?? null}
+            onQuickAdd={
+              snap
+                ? (run: VerifyRun) =>
+                    setQuickAddCtx({
+                      runId: run.id,
+                      baseUrl: run.base_url || snap.baseUrl,
+                      apiKey: snap.apiKey,
+                      skMasked: run.sk_masked || snap.skMasked,
+                      hasSavedKey: run.has_saved_key ?? snap.hasSavedKey,
+                      targetName: snap.targetName,
+                      channelCode: run.channel_code || snap.channelCode,
+                      channelName: run.channel_name || snap.channelName,
+                      platformHint: snap.platformHint || run.platform || undefined,
+                      model: run.model,
+                      verdict: run.verdict,
+                      availableModels: snap.availableModels,
+                    })
+                : undefined
+            }
+          />
+        );
+      })}
+
+      <QuickAddAccountDialog
+        ctx={quickAddCtx}
+        open={Boolean(quickAddCtx)}
+        onOpenChange={(o) => !o && setQuickAddCtx(null)}
+        onManageTemplates={onOpenTemplates}
+        onCreated={({ id, name, runId }) => {
+          setAddedByRunId((prev) => ({ ...prev, [runId]: { id, name } }));
+        }}
+      />
     </div>
   );
 }
 
-function VerifyLiveRun({ runId }: { runId: string }) {
+function VerifyLiveRun({
+  runId,
+  onQuickAdd,
+  addedAccount,
+}: {
+  runId: string;
+  onQuickAdd?: (run: VerifyRun) => void;
+  addedAccount?: { id: number; name: string } | null;
+}) {
   const q = useVerifyRun(runId);
   if (!q.data) return <Skeleton className="h-64 w-full" />;
-  return <VerifyReportCard run={q.data} />;
+  const run = q.data;
+  return (
+    <VerifyReportCard
+      run={run}
+      onQuickAdd={onQuickAdd && run.account_id === 0 ? () => onQuickAdd(run) : undefined}
+      addedAccount={addedAccount}
+    />
+  );
 }

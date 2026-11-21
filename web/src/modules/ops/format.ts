@@ -78,6 +78,14 @@ export const OPENAI_MODELS = [
   "codex-auto-review",
   "gpt-image-2",
 ];
+export const GEMINI_MODELS = [
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+  "gemini-3-pro-preview",
+  "gemini-3-flash-preview",
+  "gemini-3.1-pro-preview",
+  "gemini-3.1-flash-lite-preview",
+];
 
 // 北京日期 YYYY-MM-DD
 export const ymd = (d: Date) => new Date(d.getTime() + 8 * 3600e3).toISOString().slice(0, 10);

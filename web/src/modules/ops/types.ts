@@ -297,6 +297,7 @@ export type VerifyRun = {
   base_url: string;
   sk_masked: string;
   sk_source: string;
+  has_saved_key?: boolean;
   channel_code: string;
   channel_name: string;
   methodology_version: number;
@@ -322,4 +323,73 @@ export type VerifyFetchModelsResp = {
 
 export type VerifyPreset =
   | { mode: "account"; accountId: number; channelCode: string; model: string }
-  | { mode: "manual"; baseUrl: string; targetName: string; channelCode: string; model: string };
+  | {
+      mode: "manual";
+      baseUrl: string;
+      targetName: string;
+      channelCode: string;
+      model: string;
+      sourceRunId?: string;
+      skMasked?: string;
+      hasSavedKey?: boolean;
+    };
+
+// 账号录入模板（保存常用渠道的默认 sub2api 账号配置）
+export type AccountPlatform = "anthropic" | "openai" | "gemini";
+
+export type AccountTemplateConfig = {
+  platform: AccountPlatform;
+  notes: string;
+  schedulable: boolean;
+  use_as_detect_key: boolean;
+  pool_mode: boolean;
+  pool_mode_retry_count: number;
+  pool_mode_retry_status_codes: string;
+  passthrough: boolean;
+  upstream_billing_probe_enabled: boolean;
+  model_mapping: Record<string, string>;
+  priority: number;
+  concurrency: number;
+  load_factor: string;
+  rate_multiplier: number;
+  proxy_id: number;
+  auto_pause_on_expired: boolean;
+  group_ids: number[];
+  credentials_other: Record<string, unknown>;
+  extra_other: Record<string, unknown>;
+};
+
+export type AccountTemplate = {
+  id: number;
+  code: string;
+  name: string;
+  description: string;
+  channel_code: string;
+  sort_order: number;
+  config: AccountTemplateConfig;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ProxyItem = {
+  id: number;
+  name: string;
+  protocol: string;
+  host: string;
+  port: number;
+};
+
+export type ManualVerifyQuickAddContext = {
+  runId: string;
+  baseUrl: string;
+  apiKey?: string;
+  skMasked?: string;
+  hasSavedKey?: boolean;
+  targetName: string;
+  channelCode: string;
+  channelName: string;
+  platformHint?: string;
+  model: string;
+  verdict: VerifyVerdict;
+  availableModels?: string[];
+};

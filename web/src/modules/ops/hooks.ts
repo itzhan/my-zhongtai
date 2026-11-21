@@ -7,11 +7,13 @@ import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-quer
 import { get, qs } from "./api";
 import type {
   Account,
+  AccountTemplate,
   Alert,
   Customer,
   CustomerOverview,
   Group,
   MonitorResp,
+  ProxyItem,
   Supplier,
   SupplierMonitor,
   SupplierWallet,
@@ -43,6 +45,8 @@ export const qk = {
   verifyInspectBatch: (ids: string) => ["ops", "verify-inspect", "batch", ids] as const,
   verifyRuns: (q: string) => ["ops", "verify-runs", q] as const,
   verifyRun: (id: string) => ["ops", "verify-run", id] as const,
+  accountTemplates: ["ops", "account-templates"] as const,
+  proxies: ["ops", "proxies"] as const,
 };
 
 export const useEnv = () =>
@@ -63,10 +67,11 @@ export const useCustomerOverview = (id: string) =>
     queryFn: () => get<CustomerOverview>(`/customers/${id}/overview`),
     staleTime: 60_000,
   });
+type CustomerChannelsResp = { groups: (Group & { key_count: number })[]; accounts: Account[] };
 export const useCustomerChannels = (id: string, enabled = true) =>
   useQuery({
     queryKey: qk.channels(id),
-    queryFn: () => get<{ groups:(Group & { key_count: number })[]; accounts: Account[] }>(`/customers/${id}/channels`),
+    queryFn: () => get<CustomerChannelsResp>(`/customers/${id}/channels`),
     enabled,
   });
 
@@ -164,6 +169,20 @@ export function useVerifyRun(runId: string | null) {
   }, [status, qc]);
   return q;
 }
+
+// 账号录入模板与代理列表
+export const useAccountTemplates = () =>
+  useQuery({
+    queryKey: qk.accountTemplates,
+    queryFn: () => get<AccountTemplate[]>("/account-templates"),
+  });
+
+export const useProxies = () =>
+  useQuery({
+    queryKey: qk.proxies,
+    queryFn: () => get<ProxyItem[]>("/proxies"),
+    retry: false,
+  });
 
 // 写操作后刷新某一类数据（前缀匹配）
 export function useInvalidate() {
