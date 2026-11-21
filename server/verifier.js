@@ -87,7 +87,7 @@ const AS_GEMINI_METHODOLOGY_MD = `### 鉴定原理（AI Studio 真货确认方�
 #### 判定规则与模型差异说明
 
 - 出现 \`service: generativelanguage.googleapis.com\` **且** 无任何 Vertex 特征文案 → 判定为 **真（AI Studio 原生资源）**。
-- 出现 \`Multiple candidates is not enabled for this model\` → 进一步确认为 AI Studio 体系。
+- 出现 \`Multiple candidates is not enabled for this model\` 或 \`Logprobs is not enabled for ...\` 等多项 AI Studio 原生校验文案、所有有效探针均通过且无 Vertex 特征（仅网关裁剪了 \`error.details\`）→ 判定为 **真（AI Studio 上游资源，注明非完整透传 error.details）**。
 - 只要出现任意 Vertex 特征文案或文档链接 → 直接判定为 **假（Vertex AI 或 Vertex 掺水）**。
 - **Gemini 3.6+ / 4 注意事项**：新一代 Gemini 3.6+/4 模型本身会忽略超界 \`temperature\` / \`topP\` 并返回 \`HTTP 200\`，因此本渠道判定**不会**因这两项返回 \`200\` 而误判为假，只要其它探针（如 \`candidateCount\` / \`logprobs\`）触发 \`service: generativelanguage.googleapis.com\` 且无 Vertex 特征，仍判定为真。`;
 
@@ -302,7 +302,7 @@ export const BUILTIN_CHANNELS = [
     platform_hint: "gemini",
     protocol: "gemini_native",
     sort_order: 3,
-    builtin_version: 3,
+    builtin_version: 4,
     pass_ratio: 0.5,
     summary: "通过原生 Gemini 接口探测 error.details.metadata.service、candidateCount 限制及反查 Vertex 范围文案，确认是否为纯 AI Studio 资源。",
     methodology_md: AS_GEMINI_METHODOLOGY_MD,
@@ -369,6 +369,7 @@ export const BUILTIN_CHANNELS = [
         match_mode: "any",
         must_match: [
           "Multiple candidates is not enabled for this model",
+          "candidate_count must be in the range \\[1,\\s*8\\]",
           "generativelanguage\\.googleapis\\.com",
         ],
         strong_match: [
@@ -1474,13 +1475,38 @@ export function computeAsGeminiVerdict({ steps, channelName = "as gemini" }) {
   }
 
   const score = Math.round((matched / total) * 100);
+  const strongHits = fpSteps.filter((s) => s.status === "pass" && s.strong_hit);
+  const nonSamplingStripped = fpSteps.filter(
+    (s) => s.param_stripped && s.id !== "as_temperature" && s.id !== "as_top_p",
+  );
+  const effectiveTotal = Math.max(1, total - ignoredSampling200.length);
+
+  // 中转网关（如 new-api）常会裁剪 Google 原生 error.details，但保留原生 error.message：
+  // 当无 Vertex 反例、核心探针未被吞参数，且命中多项 AI Studio 专属强特征或全部有效探针通过时，判定为真并注明网关简化了 error.details。
+  if (
+    nonSamplingStripped.length === 0 &&
+    (strongHits.length >= 2 || (hasMultiCand && matched >= Math.max(2, effectiveTotal)) || (matched === total && strongHits.length >= 1))
+  ) {
+    const ignoreNote = ignoredSampling200.length
+      ? `；「${ignoredSampling200.map((s) => s.name).join("、")}」返回 HTTP 200（符合 Gemini 3.6+/4 忽略超界采样参数特征）`
+      : "";
+    const authScore = matched === total ? 100 : Math.min(100, Math.max(90, Math.round((matched / effectiveTotal) * 100)));
+    return {
+      verdict: "authentic",
+      score: authScore,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为真（AI Studio 上游资源）：命中 ${matched}/${total} 项 AI Studio 原生校验特征（含「${strongHits.map((s) => s.name).join("、")}」），全程未见 Vertex 特征文案${ignoreNote}（注：上游中转网关简化了 error.details，未透传 metadata.service）。`,
+    };
+  }
+
   if (hasMultiCand) {
     return {
       verdict: "suspicious",
       score: Math.max(70, score),
       matched_count: matched,
       total_probes: total,
-      summary: `判定为疑似 AI Studio / 报错结构不完整：命中 Gemini 3.x 特有文案「Multiple candidates is not enabled for this model」且未见 Vertex 文案，但响应中缺少 details.metadata.service: generativelanguage.googleapis.com 硬字段（疑似网关裁剪了 error.details）。`,
+      summary: `判定为疑似 AI Studio / 报错结构不完整：命中 Gemini 3.x 特有文案「Multiple candidates is not enabled for this model」且未见 Vertex 文案，但缺少其他 AI Studio 特征与 details.metadata.service 硬字段（仅命中 ${matched}/${total} 项）。`,
     };
   }
 
