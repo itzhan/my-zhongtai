@@ -628,12 +628,21 @@ export function AccountForm({
     const send = async (mixed: boolean): Promise<void> => {
       try {
         const r = creating
-          ? await post<{ id: number; name?: string }>("/accounts", { ...body, confirm_mixed_channel_risk: mixed })
-          : await put<{ ok: boolean }>(`/accounts/${a.id}`, { ...body, confirm_mixed_channel_risk: mixed });
+          ? await post<{ id: number; name?: string; warnings?: string[] }>("/accounts", {
+              ...body,
+              confirm_mixed_channel_risk: mixed,
+            })
+          : await put<{ ok: boolean; warnings?: string[] }>(`/accounts/${a.id}`, {
+              ...body,
+              confirm_mixed_channel_risk: mixed,
+            });
         invalidate("accounts", "meta");
         const newId = creating ? (r as { id: number }).id : a.id;
         const createdName = creating ? (r as { name?: string }).name || v.name.trim() : v.name.trim();
         toast.success(creating ? `账号「${createdName}」已录入 (#${newId})` : "已保存");
+        if (Array.isArray(r.warnings) && r.warnings.length > 0) {
+          toast.warning(r.warnings.join("；"), { duration: 9000 });
+        }
         if (creating && pg) {
           if (v.enroll && groupIds.has(pg.id))
             await post(`/sched/groups/${pg.id}/enroll`, { account_ids: [newId], enrolled: true }).catch((err) =>

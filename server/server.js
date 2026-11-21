@@ -24,6 +24,7 @@ const APP_PASSWORD = env("APP_PASSWORD");
 const SESSION_SECRET = env("SESSION_SECRET") || crypto.randomBytes(32).toString("hex");
 const S2_BASE = env("SUB2API_BASE", "http://sub2api-8082:8080/api/v1").replace(/\/$/, "");
 const S2_KEY = env("SUB2API_ADMIN_KEY");
+const IS_SCOPED_KEY = /^adm_sc_/i.test(S2_KEY || "");
 const DATA_DIR = env("DATA_DIR", path.join(__dirname, "data"));
 const TZ = "Asia/Shanghai";
 
@@ -310,7 +311,7 @@ app.get("/api/monitor/user-rpm", wrap(async () =>
     return { at: new Date().toISOString(), users: list };
   }),
 ));
-app.get("/api/env", (req, res) => res.json({ readonly: READONLY, jobs: READONLY ? "observe" : "full" }));
+app.get("/api/env", (req, res) => res.json({ readonly: READONLY, jobs: READONLY ? "observe" : "full", scoped_key: IS_SCOPED_KEY }));
 
 function s2UserView(u) {
   return { id: u.id, email: u.email, username: u.username, balance: u.balance, status: u.status, allowed_groups: u.allowed_groups || [], last_active_at: u.last_active_at };
@@ -929,27 +930,49 @@ app.get("/api/accounts/:id/full", wrap(async (req) => {
 }));
 
 // 表单 → sub2api 请求体。credentials 由前端带上完整的非敏感配置；api_key 只有填了才提交（sub2api 不传敏感键 = 保留原值）
+// 注意：sub2api 对受限管理密钥（adm_sc_）启用了严格字段白名单，会拒绝 pool_mode / extra / upstream_billing_probe_enabled / confirm_mixed_channel_risk。
 function accountPayload(b, creating) {
-  const credentials = { ...(b.credentials && typeof b.credentials === "object" ? b.credentials : {}) };
-  for (const k of ["api_key", "access_token", "refresh_token", "session_key", "cookie"]) delete credentials[k];
-  credentials.base_url = String(b.base_url || "").trim().replace(/\/+$/, "");
-  if (!credentials.base_url) throw httpError(400, "base_url 必填");
-  credentials.model_mapping = b.model_mapping && typeof b.model_mapping === "object" ? b.model_mapping : {};
-  credentials.pool_mode = !!b.pool_mode;
-  if (b.pool_mode) {
-    credentials.pool_mode_retry_count = parseInt(b.pool_mode_retry_count) || 0;
-    const codes = String(b.pool_mode_retry_status_codes ?? "").split(/[,\s，]+/).map(Number).filter(Boolean);
-    if (codes.length) credentials.pool_mode_retry_status_codes = codes;
-    else delete credentials.pool_mode_retry_status_codes;
-  } else {
-    delete credentials.pool_mode_retry_count;
-    delete credentials.pool_mode_retry_status_codes;
-  }
+  const skipped = [];
+  const rawExtraCreds = b.credentials && typeof b.credentials === "object" ? { ...b.credentials } : {};
+  for (const k of ["api_key", "access_token", "refresh_token", "session_key", "cookie"]) delete rawExtraCreds[k];
+
+  const baseUrl = String(b.base_url || "").trim().replace(/\/+$/, "");
+  if (!baseUrl) throw httpError(400, "base_url 必填");
+  const modelMapping = b.model_mapping && typeof b.model_mapping === "object" ? b.model_mapping : {};
   const key = String(b.api_key || "").trim();
-  if (key) credentials.api_key = key;
   if (creating && !key) throw httpError(400, "新建账号必须填写 API Key");
   const name = String(b.name || "").trim();
   if (!name) throw httpError(400, "账号名称必填");
+
+  const credentials = IS_SCOPED_KEY ? {} : { ...rawExtraCreds };
+  credentials.base_url = baseUrl;
+  credentials.model_mapping = modelMapping;
+  if (key) credentials.api_key = key;
+
+  if (IS_SCOPED_KEY) {
+    if (b.pool_mode) skipped.push("号池模式");
+    const extraCredKeys = Object.keys(rawExtraCreds).filter(
+      (k) => !["base_url", "model_mapping", "pool_mode", "pool_mode_retry_count", "pool_mode_retry_status_codes"].includes(k),
+    );
+    if (extraCredKeys.length) skipped.push(`高级凭证字段(${extraCredKeys.join(",")})`);
+  } else {
+    if (b.pool_mode) {
+      credentials.pool_mode = true;
+      credentials.pool_mode_retry_count = parseInt(b.pool_mode_retry_count) || 0;
+      const codes = String(b.pool_mode_retry_status_codes ?? "").split(/[,\s，]+/).map(Number).filter(Boolean);
+      if (codes.length) credentials.pool_mode_retry_status_codes = codes;
+      else delete credentials.pool_mode_retry_status_codes;
+    } else if (!creating) {
+      credentials.pool_mode = false;
+      delete credentials.pool_mode_retry_count;
+      delete credentials.pool_mode_retry_status_codes;
+    } else {
+      delete credentials.pool_mode;
+      delete credentials.pool_mode_retry_count;
+      delete credentials.pool_mode_retry_status_codes;
+    }
+  }
+
   const num = (v, d) => (v === "" || v === undefined || v === null ? d : Number(v));
   const body = {
     name,
@@ -963,10 +986,23 @@ function accountPayload(b, creating) {
     group_ids: (b.group_ids || []).map(Number),
     expires_at: b.expires_at ? Math.floor(new Date(b.expires_at).getTime() / 1000) : 0,
     auto_pause_on_expired: !!b.auto_pause_on_expired,
-    upstream_billing_probe_enabled: !!b.upstream_billing_probe_enabled,
-    confirm_mixed_channel_risk: !!b.confirm_mixed_channel_risk,
   };
-  if (b.extra && typeof b.extra === "object") body.extra = b.extra;
+
+  if (IS_SCOPED_KEY) {
+    if (b.upstream_billing_probe_enabled) skipped.push("上游计费探测");
+    if (b.extra && typeof b.extra === "object") {
+      if (b.extra.anthropic_passthrough || b.extra.openai_passthrough) skipped.push("透传");
+      const otherExtra = Object.keys(b.extra).filter(
+        (k) => !["anthropic_passthrough", "openai_passthrough", "upstream_billing_probe_enabled"].includes(k),
+      );
+      if (otherExtra.length) skipped.push(`扩展字段(${otherExtra.join(",")})`);
+    }
+  } else {
+    if (b.upstream_billing_probe_enabled) body.upstream_billing_probe_enabled = true;
+    if (b.confirm_mixed_channel_risk) body.confirm_mixed_channel_risk = true;
+    if (b.extra && typeof b.extra === "object" && Object.keys(b.extra).length > 0) body.extra = b.extra;
+  }
+
   if (creating) {
     body.platform = b.platform || "anthropic";
     body.type = "apikey";
@@ -974,7 +1010,11 @@ function accountPayload(b, creating) {
     if (!body.load_factor) delete body.load_factor;
     if (!body.expires_at) delete body.expires_at;
   } else if (["active", "inactive"].includes(b.status)) body.status = b.status;
-  return body;
+
+  const warnings = skipped.length
+    ? [`当前中台使用受限管理密钥（adm_sc_），sub2api 拒绝写入：${skipped.join("、")}；其余配置已保存，如需开启请在 sub2api 后台补勾或切换完整管理员 Key`]
+    : [];
+  return { body, warnings };
 }
 
 let verifierApi = null;
@@ -985,23 +1025,25 @@ app.post("/api/accounts", wrap(async (req) => {
     const saved = verifierApi.getManualRunKey(b.source_verify_run_id, b.base_url);
     if (saved) b.api_key = saved;
   }
-  const a = await s2("POST", "/admin/accounts", accountPayload(b, true));
+  const { body, warnings } = accountPayload(b, true);
+  const a = await s2("POST", "/admin/accounts", body);
   if (b.schedulable === false) await s2("POST", "/admin/accounts/bulk-update", { account_ids: [a.id], schedulable: false });
   if (b.use_as_detect_key && b.api_key) detector.setKey(a.id, b.api_key);
   bust("accounts");
   bust("groups");
-  return { id: a.id, name: a.name ?? b.name };
+  return { id: a.id, name: a.name ?? b.name, warnings };
 }));
 
 app.put("/api/accounts/:id", wrap(async (req) => {
   const id = parseInt(req.params.id);
   const b = req.body || {};
-  await s2("PUT", `/admin/accounts/${id}`, accountPayload(b, false));
+  const { body, warnings } = accountPayload(b, false);
+  await s2("PUT", `/admin/accounts/${id}`, body);
   if (typeof b.schedulable === "boolean") await s2("POST", "/admin/accounts/bulk-update", { account_ids: [id], schedulable: b.schedulable });
   if (b.use_as_detect_key && b.api_key) detector.setKey(id, b.api_key);
   bust("accounts");
   bust("groups");
-  return { ok: true };
+  return { ok: true, warnings };
 }));
 
 app.delete("/api/accounts/:id", wrap(async (req) => {
