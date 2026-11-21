@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
-import { Eye, EyeOff, FileCode2, Search, Settings2, Sparkles, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, EyeOff, FileCode2, Search, Settings2, Sparkles, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -420,7 +420,7 @@ export function AccountForm({
 }) {
   const router = useRouter();
   const invalidate = useInvalidate();
-  const { groups } = useOps();
+  const { groups, groupName } = useOps();
   const creating = !a;
   const pg = presetGroup ? groups.find((g) => g.id === presetGroup) : undefined;
   const proxies = useProxies();
@@ -464,6 +464,7 @@ export function AccountForm({
   const [groupIds, setGroupIds] = useState<Set<number>>(new Set(a?.group_ids ?? (presetGroup ? [presetGroup] : [])));
   const [mapping, setMapping] = useState<[string, string][]>(Object.entries(c.model_mapping || {}));
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>("none");
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [showKey, setShowKey] = useState(false);
   const [busy, setBusy] = useState(false);
   const autoAppliedRef = useRef(false);
@@ -501,6 +502,7 @@ export function AccountForm({
     }
     const cfg = tpl.config;
     setSelectedTemplateId(String(tpl.id));
+    setDetailsOpen(false);
     setV((prev) => ({
       ...prev,
       // 保留账号名称、URL、API Key 不变，其余按模板套用
@@ -671,6 +673,217 @@ export function AccountForm({
   );
 
   const showPassthrough = v.platform === "anthropic" || v.platform === "openai";
+  const compactTemplateMode = creating && Boolean(activeTemplate);
+  const selectedGroupNames = [...groupIds].map((id) => groupName(id));
+
+  const nameField = (
+    <div className="space-y-2">
+      <Label>账号名称 *</Label>
+      <Input
+        required
+        value={v.name}
+        placeholder="例如：小欧--awsb--3.3"
+        onChange={(e) => set({ name: e.target.value })}
+      />
+    </div>
+  );
+
+  const baseUrlField = (
+    <div className="space-y-2">
+      <Label>上游地址（base_url）*</Label>
+      <Input
+        required
+        className="font-mono text-xs"
+        value={v.base_url}
+        placeholder="https://api.example.com"
+        onChange={(e) => set({ base_url: e.target.value })}
+      />
+    </div>
+  );
+
+  const apiKeyField = (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <Label>
+          API Key{" "}
+          {creating
+            ? initialValues?.source_verify_run_id && !v.api_key.trim()
+              ? "（留空 = 自动复用测试 Key）"
+              : "*"
+            : "（留空 = 保持原 Key 不变）"}
+        </Label>
+        {creating && initialValues?.source_verify_run_id && !v.api_key.trim() ? (
+          <Tag tone="ok" className="font-mono text-[10px]">
+            已复用测试 Key：{initialValues.saved_key_masked || "后端已保存"}
+          </Tag>
+        ) : null}
+      </div>
+      <div className="flex gap-2">
+        <Input
+          type={showKey ? "text" : "password"}
+          required={creating && !initialValues?.source_verify_run_id}
+          autoComplete="new-password"
+          className="flex-1 font-mono text-xs"
+          placeholder={
+            creating
+              ? initialValues?.source_verify_run_id
+                ? `留空将自动复用测试时的 Key（${initialValues.saved_key_masked || "已保存"}），也可输入新 Key 覆盖`
+                : "sk-…"
+              : "不修改请留空"
+          }
+          value={v.api_key}
+          onChange={(e) => set({ api_key: e.target.value })}
+        />
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          onClick={() => setShowKey((s) => !s)}
+          title={showKey ? "隐藏 Key" : "显示 Key"}
+        >
+          {showKey ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+        </Button>
+      </div>
+    </div>
+  );
+
+  const platformField = (
+    <div className="space-y-2">
+      <Label>平台{creating ? " *" : "（创建后不可改）"}</Label>
+      <Select
+        value={v.platform}
+        onValueChange={(x) => set({ platform: x, passthrough: x === "gemini" ? false : v.passthrough })}
+        disabled={!creating}
+      >
+        <SelectTrigger className="w-full">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {["anthropic", "openai", "gemini"].map((p) => (
+            <SelectItem key={p} value={p}>
+              {p}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+
+  const connectionSwitches = (
+    <>
+      <label className="flex items-center gap-2 text-sm">
+        <Checkbox checked={v.use_as_detect_key} onCheckedChange={(x) => set({ use_as_detect_key: !!x })} />{" "}
+        同时作为这个账号的深度检测 Key
+      </label>
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+        {sw("号池模式", "pool_mode")}
+        <label className={cn("flex items-center gap-2 text-sm", !v.pool_mode && "opacity-50")}>
+          重试次数{" "}
+          <Input
+            type="number"
+            className="h-8 w-16"
+            disabled={!v.pool_mode}
+            value={v.pool_mode_retry_count}
+            onChange={(e) => set({ pool_mode_retry_count: e.target.value })}
+          />
+        </label>
+        <label className={cn("flex items-center gap-2 text-sm", !v.pool_mode && "opacity-50")}>
+          重试状态码{" "}
+          <Input
+            className="h-8 w-44 font-mono text-xs"
+            disabled={!v.pool_mode}
+            placeholder="如 401,403,429,503"
+            value={v.pool_mode_retry_status_codes}
+            onChange={(e) => set({ pool_mode_retry_status_codes: e.target.value })}
+          />
+        </label>
+        {showPassthrough ? sw("透传", "passthrough") : null}
+        {sw("上游计费探测", "upstream_billing_probe_enabled")}
+      </div>
+    </>
+  );
+
+  const scheduleCard = (
+    <Card>
+      <CardHeader>
+        <CardTitle>调度设置</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {(
+            [
+              ["priority", "优先级（1–10，越小越优先）"],
+              ["concurrency", "并发上限"],
+              ["load_factor", "负载系数（留空 = 按并发）"],
+              ["rate_multiplier", "账号倍率"],
+            ] as const
+          ).map(([k, l]) => (
+            <div key={k} className="space-y-2">
+              <Label>{l}</Label>
+              <Input type="number" step="any" value={v[k]} onChange={(e) => set({ [k]: e.target.value })} />
+            </div>
+          ))}
+          <div className="space-y-2">
+            <Label>代理</Label>
+            <Select value={v.proxy_id} onValueChange={(x) => set({ proxy_id: x })}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="0">不使用代理</SelectItem>
+                {(proxies.data ?? []).map((p) => (
+                  <SelectItem key={p.id} value={String(p.id)}>
+                    {p.name} · {p.protocol}://{p.host}:{p.port}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label>过期时间（留空 = 不过期）</Label>
+            <Input type="datetime-local" value={v.expires_at} onChange={(e) => set({ expires_at: e.target.value })} />
+          </div>
+        </div>
+        {pg ? (
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox checked={v.enroll} onCheckedChange={(x) => set({ enroll: !!x })} /> 创建后关联到「{pg.name}
+            」的智能调度
+          </label>
+        ) : null}
+        <label className="flex items-center gap-2 text-sm">
+          <Checkbox checked={v.auto_pause_on_expired} onCheckedChange={(x) => set({ auto_pause_on_expired: !!x })} />{" "}
+          到期自动暂停
+        </label>
+        <GroupMultiPicker groups={groups} value={groupIds} onChange={setGroupIds} platform={v.platform} />
+      </CardContent>
+    </Card>
+  );
+
+  const advancedCard = (
+    <Collapsible className="rounded-xl border">
+      <CollapsibleTrigger className="w-full px-6 py-4 text-left text-sm font-medium">
+        高级：其他凭证与扩展字段（JSON，不含 Key；一般不用改）▾
+      </CollapsibleTrigger>
+      <CollapsibleContent className="space-y-4 px-6 pb-4">
+        <div className="space-y-1.5">
+          <Label className="text-xs">其他凭证字段（credentials）</Label>
+          <Textarea
+            className="min-h-24 font-mono text-xs"
+            value={v.other}
+            onChange={(e) => set({ other: e.target.value })}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label className="text-xs">扩展字段（extra，不含透传与计费探测开关）</Label>
+          <Textarea
+            className="min-h-24 font-mono text-xs"
+            value={v.extraOther}
+            onChange={(e) => set({ extraOther: e.target.value })}
+          />
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
 
   return (
     <form onSubmit={submit} className="space-y-4">
@@ -682,8 +895,7 @@ export function AccountForm({
               套用录入模板
             </CardTitle>
             <CardDescription>
-              选择模板可一键填充平台、号池、透传、并发、模型映射与默认分组，保留当前名称、URL 与
-              Key；套用后可自由微调任意字段。
+              选择模板后仅需填写名称、URL 与 Key 即可直接录入；其他详细配置默认收起，随时可展开微调（不会修改原模板）。
             </CardDescription>
             {onManageTemplates ? (
               <CardAction>
@@ -713,7 +925,7 @@ export function AccountForm({
                   <SelectValue placeholder="选择录入模板（可选）" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="none">不使用模板（手动填写）</SelectItem>
+                  <SelectItem value="none">不使用模板（展开全部手动填写）</SelectItem>
                   {templates.map((t) => (
                     <SelectItem key={t.id} value={String(t.id)}>
                       {t.name}（{t.config.platform} · {t.config.group_ids.length} 分组）
@@ -745,9 +957,10 @@ export function AccountForm({
             {activeTemplate ? (
               <div className="bg-background/80 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs">
                 <Tag tone="ok">已套用模板：{activeTemplate.name}</Tag>
-                <PlatformBadge platform={activeTemplate.config.platform} />
+                <PlatformBadge platform={v.platform} />
                 <span className="text-muted-foreground">
-                  {activeTemplate.description || "下方任意配置（如分组、倍率、模型映射）均可直接微调，不会修改原模板。"}
+                  {activeTemplate.description ||
+                    "下方详细配置已按模板自动填充并默认收起，如需修改分组或参数可点击展开。"}
                 </span>
               </div>
             ) : null}
@@ -755,221 +968,127 @@ export function AccountForm({
         </Card>
       ) : null}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>基本信息</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-2">
-              <Label>账号名称 *</Label>
-              <Input
-                required
-                value={v.name}
-                placeholder="例如：小欧--awsb--3.3"
-                onChange={(e) => set({ name: e.target.value })}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>平台{creating ? " *" : "（创建后不可改）"}</Label>
-              <Select
-                value={v.platform}
-                onValueChange={(x) => set({ platform: x, passthrough: x === "gemini" ? false : v.passthrough })}
-                disabled={!creating}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {["anthropic", "openai", "gemini"].map((p) => (
-                    <SelectItem key={p} value={p}>
-                      {p}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-          <div className="space-y-2">
-            <Label>备注</Label>
-            <Input value={v.notes} onChange={(e) => set({ notes: e.target.value })} />
-          </div>
-          <div className="flex flex-wrap gap-6">
-            {!creating ? sw("启用", "status_on") : null}
-            {sw(creating ? "创建后立即参与调度" : "参与调度", "schedulable")}
-          </div>
-        </CardContent>
-      </Card>
+      {compactTemplateMode ? (
+        <>
+          <Card>
+            <CardHeader>
+              <CardTitle>必填信息</CardTitle>
+              <CardDescription>已按模板填充其余配置，核对账号名称、URL 与 Key 后即可直接录入</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {nameField}
+              {baseUrlField}
+              {apiKeyField}
+            </CardContent>
+          </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>上游连接</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="space-y-2">
-            <Label>上游地址（base_url）*</Label>
-            <Input
-              required
-              className="font-mono text-xs"
-              value={v.base_url}
-              placeholder="https://api.example.com"
-              onChange={(e) => set({ base_url: e.target.value })}
-            />
-          </div>
-          <div className="space-y-2">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <Label>
-                API Key{" "}
-                {creating
-                  ? initialValues?.source_verify_run_id && !v.api_key.trim()
-                    ? "（留空 = 自动复用测试 Key）"
-                    : "*"
-                  : "（留空 = 保持原 Key 不变）"}
-              </Label>
-              {creating && initialValues?.source_verify_run_id && !v.api_key.trim() ? (
-                <Tag tone="ok" className="font-mono text-[10px]">
-                  已复用测试 Key：{initialValues.saved_key_masked || "后端已保存"}
-                </Tag>
-              ) : null}
-            </div>
-            <div className="flex gap-2">
-              <Input
-                type={showKey ? "text" : "password"}
-                required={creating && !initialValues?.source_verify_run_id}
-                autoComplete="new-password"
-                className="flex-1 font-mono text-xs"
-                placeholder={
-                  creating
-                    ? initialValues?.source_verify_run_id
-                      ? `留空将自动复用测试时的 Key（${initialValues.saved_key_masked || "已保存"}），也可输入新 Key 覆盖`
-                      : "sk-…"
-                    : "不修改请留空"
-                }
-                value={v.api_key}
-                onChange={(e) => set({ api_key: e.target.value })}
-              />
-              <Button
+          <Collapsible open={detailsOpen} onOpenChange={setDetailsOpen} className="rounded-xl border">
+            <CollapsibleTrigger asChild>
+              <button
                 type="button"
-                variant="outline"
-                size="icon"
-                onClick={() => setShowKey((s) => !s)}
-                title={showKey ? "隐藏 Key" : "显示 Key"}
+                className="hover:bg-accent/40 flex w-full flex-col gap-2 rounded-xl px-5 py-3.5 text-left transition-colors"
               >
-                {showKey ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
-              </Button>
-            </div>
-          </div>
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={v.use_as_detect_key} onCheckedChange={(x) => set({ use_as_detect_key: !!x })} />{" "}
-            同时作为这个账号的深度检测 Key
-          </label>
-          <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
-            {sw("号池模式", "pool_mode")}
-            <label className={cn("flex items-center gap-2 text-sm", !v.pool_mode && "opacity-50")}>
-              重试次数{" "}
-              <Input
-                type="number"
-                className="h-8 w-16"
-                disabled={!v.pool_mode}
-                value={v.pool_mode_retry_count}
-                onChange={(e) => set({ pool_mode_retry_count: e.target.value })}
-              />
-            </label>
-            <label className={cn("flex items-center gap-2 text-sm", !v.pool_mode && "opacity-50")}>
-              重试状态码{" "}
-              <Input
-                className="h-8 w-44 font-mono text-xs"
-                disabled={!v.pool_mode}
-                placeholder="如 401,403,429,503"
-                value={v.pool_mode_retry_status_codes}
-                onChange={(e) => set({ pool_mode_retry_status_codes: e.target.value })}
-              />
-            </label>
-            {showPassthrough ? sw("透传", "passthrough") : null}
-            {sw("上游计费探测", "upstream_billing_probe_enabled")}
-          </div>
-        </CardContent>
-      </Card>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="flex items-center gap-2 text-sm font-medium">
+                    {detailsOpen ? (
+                      <ChevronDown className="text-muted-foreground size-4" />
+                    ) : (
+                      <ChevronRight className="text-muted-foreground size-4" />
+                    )}
+                    模板详细配置（平台 / 分组 / 模型映射 / 调度 / 号池等）
+                  </span>
+                  <span className="text-primary text-xs font-medium">{detailsOpen ? "收起详情" : "展开微调"}</span>
+                </div>
+                <div className="text-muted-foreground flex flex-wrap items-center gap-1.5 pl-6 text-xs">
+                  <PlatformBadge platform={v.platform} />
+                  <Badge variant="secondary" className="font-normal">
+                    {selectedGroupNames.length > 0
+                      ? `分组：${selectedGroupNames.slice(0, 3).join("、")}${selectedGroupNames.length > 3 ? ` +${selectedGroupNames.length - 3}` : ""}`
+                      : "未选分组"}
+                  </Badge>
+                  <Badge variant="outline" className="font-normal">
+                    并发 {v.concurrency || "1000"} · 优先级 {v.priority || "1"} · 倍率 {v.rate_multiplier || "1"}
+                  </Badge>
+                  {v.pool_mode ? (
+                    <Badge variant="outline" className="font-normal">
+                      号池（重试 {v.pool_mode_retry_count || "0"} 次）
+                    </Badge>
+                  ) : null}
+                  {showPassthrough && v.passthrough ? (
+                    <Badge variant="outline" className="font-normal">
+                      透传
+                    </Badge>
+                  ) : null}
+                  {mapping.length > 0 ? (
+                    <Badge variant="outline" className="font-normal">
+                      模型映射 {mapping.length} 条
+                    </Badge>
+                  ) : null}
+                </div>
+              </button>
+            </CollapsibleTrigger>
+            <CollapsibleContent className="space-y-4 border-t p-4">
+              <Card>
+                <CardHeader>
+                  <CardTitle>平台、备注与连接特性</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    {platformField}
+                    <div className="space-y-2">
+                      <Label>备注</Label>
+                      <Input value={v.notes} onChange={(e) => set({ notes: e.target.value })} />
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-6">{sw("创建后立即参与调度", "schedulable")}</div>
+                  {connectionSwitches}
+                </CardContent>
+              </Card>
 
-      <ModelMappingEditor mapping={mapping} onChange={setMapping} availableModels={availableModels} />
-
-      <Card>
-        <CardHeader>
-          <CardTitle>调度设置</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {(
-              [
-                ["priority", "优先级（1–10，越小越优先）"],
-                ["concurrency", "并发上限"],
-                ["load_factor", "负载系数（留空 = 按并发）"],
-                ["rate_multiplier", "账号倍率"],
-              ] as const
-            ).map(([k, l]) => (
-              <div key={k} className="space-y-2">
-                <Label>{l}</Label>
-                <Input type="number" step="any" value={v[k]} onChange={(e) => set({ [k]: e.target.value })} />
+              <ModelMappingEditor mapping={mapping} onChange={setMapping} availableModels={availableModels} />
+              {scheduleCard}
+              {advancedCard}
+            </CollapsibleContent>
+          </Collapsible>
+        </>
+      ) : (
+        <>
+          <Card>
+            <CardHeader>
+              <CardTitle>基本信息</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                {nameField}
+                {platformField}
               </div>
-            ))}
-            <div className="space-y-2">
-              <Label>代理</Label>
-              <Select value={v.proxy_id} onValueChange={(x) => set({ proxy_id: x })}>
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="0">不使用代理</SelectItem>
-                  {(proxies.data ?? []).map((p) => (
-                    <SelectItem key={p.id} value={String(p.id)}>
-                      {p.name} · {p.protocol}://{p.host}:{p.port}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label>过期时间（留空 = 不过期）</Label>
-              <Input type="datetime-local" value={v.expires_at} onChange={(e) => set({ expires_at: e.target.value })} />
-            </div>
-          </div>
-          {pg ? (
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox checked={v.enroll} onCheckedChange={(x) => set({ enroll: !!x })} /> 创建后关联到「{pg.name}
-              」的智能调度
-            </label>
-          ) : null}
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={v.auto_pause_on_expired} onCheckedChange={(x) => set({ auto_pause_on_expired: !!x })} />{" "}
-            到期自动暂停
-          </label>
-          <GroupMultiPicker groups={groups} value={groupIds} onChange={setGroupIds} platform={v.platform} />
-        </CardContent>
-      </Card>
+              <div className="space-y-2">
+                <Label>备注</Label>
+                <Input value={v.notes} onChange={(e) => set({ notes: e.target.value })} />
+              </div>
+              <div className="flex flex-wrap gap-6">
+                {!creating ? sw("启用", "status_on") : null}
+                {sw(creating ? "创建后立即参与调度" : "参与调度", "schedulable")}
+              </div>
+            </CardContent>
+          </Card>
 
-      <Collapsible className="rounded-xl border">
-        <CollapsibleTrigger className="w-full px-6 py-4 text-left text-sm font-medium">
-          高级：其他凭证与扩展字段（JSON，不含 Key；一般不用改）▾
-        </CollapsibleTrigger>
-        <CollapsibleContent className="space-y-4 px-6 pb-4">
-          <div className="space-y-1.5">
-            <Label className="text-xs">其他凭证字段（credentials）</Label>
-            <Textarea
-              className="min-h-24 font-mono text-xs"
-              value={v.other}
-              onChange={(e) => set({ other: e.target.value })}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">扩展字段（extra，不含透传与计费探测开关）</Label>
-            <Textarea
-              className="min-h-24 font-mono text-xs"
-              value={v.extraOther}
-              onChange={(e) => set({ extraOther: e.target.value })}
-            />
-          </div>
-        </CollapsibleContent>
-      </Collapsible>
+          <Card>
+            <CardHeader>
+              <CardTitle>上游连接</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {baseUrlField}
+              {apiKeyField}
+              {connectionSwitches}
+            </CardContent>
+          </Card>
+
+          <ModelMappingEditor mapping={mapping} onChange={setMapping} availableModels={availableModels} />
+          {scheduleCard}
+          {advancedCard}
+        </>
+      )}
 
       <div className="flex gap-2">
         <Button type="submit" disabled={busy}>
