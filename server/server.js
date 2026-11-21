@@ -24,7 +24,6 @@ const APP_PASSWORD = env("APP_PASSWORD");
 const SESSION_SECRET = env("SESSION_SECRET") || crypto.randomBytes(32).toString("hex");
 const S2_BASE = env("SUB2API_BASE", "http://sub2api-8082:8080/api/v1").replace(/\/$/, "");
 const S2_KEY = env("SUB2API_ADMIN_KEY");
-const IS_SCOPED_KEY = /^adm_sc_/i.test(S2_KEY || "");
 const DATA_DIR = env("DATA_DIR", path.join(__dirname, "data"));
 const TZ = "Asia/Shanghai";
 
@@ -311,7 +310,7 @@ app.get("/api/monitor/user-rpm", wrap(async () =>
     return { at: new Date().toISOString(), users: list };
   }),
 ));
-app.get("/api/env", (req, res) => res.json({ readonly: READONLY, jobs: READONLY ? "observe" : "full", scoped_key: IS_SCOPED_KEY }));
+app.get("/api/env", (req, res) => res.json({ readonly: READONLY, jobs: READONLY ? "observe" : "full" }));
 
 function s2UserView(u) {
   return { id: u.id, email: u.email, username: u.username, balance: u.balance, status: u.status, allowed_groups: u.allowed_groups || [], last_active_at: u.last_active_at };
@@ -930,8 +929,9 @@ app.get("/api/accounts/:id/full", wrap(async (req) => {
 }));
 
 // 表单 → sub2api 请求体。credentials 由前端带上完整的非敏感配置；api_key 只有填了才提交（sub2api 不传敏感键 = 保留原值）
-// 注意：sub2api 对受限管理密钥（adm_sc_）启用了严格字段白名单，会拒绝 pool_mode / extra / upstream_billing_probe_enabled / confirm_mixed_channel_risk。
-function accountPayload(b, creating) {
+// strictScoped=false 提交完整字段（全权限密钥 / 完整 admin key）；
+// strictScoped=true 仅保留受限密钥（restricted adm_sc_）白名单字段，避免被 400「请求参数无效」拦截。
+function accountPayload(b, creating, strictScoped = false) {
   const skipped = [];
   const rawExtraCreds = b.credentials && typeof b.credentials === "object" ? { ...b.credentials } : {};
   for (const k of ["api_key", "access_token", "refresh_token", "session_key", "cookie"]) delete rawExtraCreds[k];
@@ -944,12 +944,12 @@ function accountPayload(b, creating) {
   const name = String(b.name || "").trim();
   if (!name) throw httpError(400, "账号名称必填");
 
-  const credentials = IS_SCOPED_KEY ? {} : { ...rawExtraCreds };
+  const credentials = strictScoped ? {} : { ...rawExtraCreds };
   credentials.base_url = baseUrl;
   credentials.model_mapping = modelMapping;
   if (key) credentials.api_key = key;
 
-  if (IS_SCOPED_KEY) {
+  if (strictScoped) {
     if (b.pool_mode) skipped.push("号池模式");
     const extraCredKeys = Object.keys(rawExtraCreds).filter(
       (k) => !["base_url", "model_mapping", "pool_mode", "pool_mode_retry_count", "pool_mode_retry_status_codes"].includes(k),
@@ -988,7 +988,7 @@ function accountPayload(b, creating) {
     auto_pause_on_expired: !!b.auto_pause_on_expired,
   };
 
-  if (IS_SCOPED_KEY) {
+  if (strictScoped) {
     if (b.upstream_billing_probe_enabled) skipped.push("上游计费探测");
     if (b.extra && typeof b.extra === "object") {
       if (b.extra.anthropic_passthrough || b.extra.openai_passthrough) skipped.push("透传");
@@ -1012,9 +1012,24 @@ function accountPayload(b, creating) {
   } else if (["active", "inactive"].includes(b.status)) body.status = b.status;
 
   const warnings = skipped.length
-    ? [`当前中台使用受限管理密钥（adm_sc_），sub2api 拒绝写入：${skipped.join("、")}；其余配置已保存，如需开启请在 sub2api 后台补勾或切换完整管理员 Key`]
+    ? [`当前管理密钥被 sub2api 限制不可写入：${skipped.join("、")}；其余配置已保存，如需开启请在 sub2api 后台补勾或切换全权限密钥`]
     : [];
   return { body, warnings };
+}
+
+async function s2WriteAccount(method, endpoint, b, creating) {
+  const full = accountPayload(b, creating, false);
+  try {
+    const data = await s2(method, endpoint, full.body);
+    return { data, warnings: full.warnings };
+  } catch (e) {
+    if (e.status === 400 && /请求参数无效/.test(e.message || "")) {
+      const scoped = accountPayload(b, creating, true);
+      const data = await s2(method, endpoint, scoped.body);
+      return { data, warnings: scoped.warnings };
+    }
+    throw e;
+  }
 }
 
 let verifierApi = null;
@@ -1025,8 +1040,7 @@ app.post("/api/accounts", wrap(async (req) => {
     const saved = verifierApi.getManualRunKey(b.source_verify_run_id, b.base_url);
     if (saved) b.api_key = saved;
   }
-  const { body, warnings } = accountPayload(b, true);
-  const a = await s2("POST", "/admin/accounts", body);
+  const { data: a, warnings } = await s2WriteAccount("POST", "/admin/accounts", b, true);
   if (b.schedulable === false) await s2("POST", "/admin/accounts/bulk-update", { account_ids: [a.id], schedulable: false });
   if (b.use_as_detect_key && b.api_key) detector.setKey(a.id, b.api_key);
   bust("accounts");
@@ -1037,8 +1051,7 @@ app.post("/api/accounts", wrap(async (req) => {
 app.put("/api/accounts/:id", wrap(async (req) => {
   const id = parseInt(req.params.id);
   const b = req.body || {};
-  const { body, warnings } = accountPayload(b, false);
-  await s2("PUT", `/admin/accounts/${id}`, body);
+  const { warnings } = await s2WriteAccount("PUT", `/admin/accounts/${id}`, b, false);
   if (typeof b.schedulable === "boolean") await s2("POST", "/admin/accounts/bulk-update", { account_ids: [id], schedulable: b.schedulable });
   if (b.use_as_detect_key && b.api_key) detector.setKey(id, b.api_key);
   bust("accounts");
