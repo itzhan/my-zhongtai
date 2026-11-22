@@ -152,7 +152,7 @@ export const BUILTIN_CHANNELS = [
     platform_hint: "openai",
     protocol: "openai_responses",
     sort_order: 2,
-    builtin_version: 3,
+    builtin_version: 4,
     pass_ratio: 1,
     summary: "结合微软 Azure 原生硬指纹（x-ms-* / apim-request-id / 动态 content_filters）与 Responses (/v1/responses) S0–S5 reasoning.encrypted_content 校验，精准区分真 Azure 纯透传、真 Azure 多区清洗中转、OpenAI 官转与假源。",
     methodology_md: AZ_GPT_METHODOLOGY_MD,
@@ -187,7 +187,7 @@ export const BUILTIN_CHANNELS = [
         request_body: {
           store: false,
           input: "请先思考并计算 137 × 29 的结果，同时在内部思考中牢记本轮会话代号 AR-5。思考完成后对外正式回复请只输出 READY，不要提及代号。",
-          reasoning: { summary: "auto" },
+          reasoning: { effort: "medium", summary: "auto" },
           include: ["reasoning.encrypted_content"],
         },
         fallback_on_200: null,
