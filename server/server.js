@@ -22,6 +22,7 @@ const env = (k, d) => process.env[k] ?? d;
 const PORT = Number(env("PORT", 3190));
 const APP_PASSWORD = env("APP_PASSWORD");
 const SESSION_SECRET = env("SESSION_SECRET") || crypto.randomBytes(32).toString("hex");
+const TOTP_SECRET = String(env("TOTP_SECRET", "")).replace(/[\s-]+/g, "").toUpperCase();
 const S2_BASE = env("SUB2API_BASE", "http://sub2api-8082:8080/api/v1").replace(/\/$/, "");
 const S2_KEY = env("SUB2API_ADMIN_KEY");
 const DATA_DIR = env("DATA_DIR", path.join(__dirname, "data"));
@@ -199,6 +200,64 @@ function clientIp(req) {
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// ---------- TOTP (Google Authenticator, RFC 6238) ----------
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function decodeBase32(str) {
+  const clean = String(str || "").toUpperCase().replace(/[^A-Z2-7]/g, "");
+  let bits = 0;
+  let value = 0;
+  const out = [];
+  for (const ch of clean) {
+    const idx = BASE32_ALPHABET.indexOf(ch);
+    if (idx < 0) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(out);
+}
+const TOTP_KEY_BUF = TOTP_SECRET ? decodeBase32(TOTP_SECRET) : null;
+if (TOTP_SECRET && (!TOTP_KEY_BUF || TOTP_KEY_BUF.length < 10)) {
+  console.error("TOTP_SECRET 格式无效（需合法 Base32 密钥）");
+  process.exit(1);
+}
+function totpAt(secretBuf, step) {
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64BE(BigInt(step));
+  const hmac = crypto.createHmac("sha1", secretBuf).update(buf).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const code =
+    (((hmac[offset] & 0x7f) << 24) |
+      ((hmac[offset + 1] & 0xff) << 16) |
+      ((hmac[offset + 2] & 0xff) << 8) |
+      (hmac[offset + 3] & 0xff)) %
+    1_000_000;
+  return String(code).padStart(6, "0");
+}
+const usedTotpCodes = new Map();
+function verifyTotp(rawCode) {
+  if (!TOTP_KEY_BUF) return { ok: true, key: null };
+  const code = String(rawCode || "").replace(/\s+/g, "");
+  if (!/^\d{6}$/.test(code)) return { ok: false, key: null };
+  const nowMs = Date.now();
+  for (const [k, exp] of usedTotpCodes) if (exp <= nowMs) usedTotpCodes.delete(k);
+  const nowStep = Math.floor(nowMs / 30_000);
+  const codeBuf = Buffer.from(code);
+  for (let delta = -1; delta <= 1; delta++) {
+    const step = nowStep + delta;
+    const expected = totpAt(TOTP_KEY_BUF, step);
+    if (crypto.timingSafeEqual(codeBuf, Buffer.from(expected))) {
+      const replayKey = `${step}:${code}`;
+      if (usedTotpCodes.has(replayKey)) return { ok: false, key: null };
+      return { ok: true, key: replayKey };
+    }
+  }
+  return { ok: false, key: null };
+}
+
 const LOGIN_WINDOW_MS = 15 * 60_000;
 const LOGIN_MAX_FAILS = 5;
 const loginAttempts = new Map();
@@ -207,6 +266,9 @@ function pruneLoginAttempts() {
   const cutoff = Date.now() - LOGIN_WINDOW_MS;
   for (const [k, v] of loginAttempts) if (v.t < cutoff) loginAttempts.delete(k);
 }
+app.get("/api/login/config", (_req, res) => {
+  res.json({ totp_required: Boolean(TOTP_KEY_BUF) });
+});
 app.post("/api/login", (req, res) => {
   pruneLoginAttempts();
   const ip = clientIp(req);
@@ -214,15 +276,22 @@ app.post("/api/login", (req, res) => {
   if (Date.now() - a.t > LOGIN_WINDOW_MS) Object.assign(a, { n: 0, t: Date.now() });
   if (a.n >= LOGIN_MAX_FAILS) return res.status(429).json({ error: "尝试次数过多，请 15 分钟后再试" });
   const pw = String(req.body?.password || "");
-  const ok = pw.length === APP_PASSWORD.length && crypto.timingSafeEqual(Buffer.from(pw), Buffer.from(APP_PASSWORD));
-  if (!ok) {
+  const rawTotp = String(req.body?.totp || "").replace(/\s+/g, "");
+  if (TOTP_KEY_BUF && !rawTotp) {
+    return res.status(400).json({ error: "请输入 Google Authenticator 6 位验证码" });
+  }
+  const pwOk = pw.length === APP_PASSWORD.length && crypto.timingSafeEqual(Buffer.from(pw), Buffer.from(APP_PASSWORD));
+  const totpRes = verifyTotp(rawTotp);
+  if (!pwOk || !totpRes.ok) {
     a.n++;
     loginAttempts.set(ip, a);
-    return res.status(401).json({ error: "密码错误" });
+    return res.status(401).json({ error: TOTP_KEY_BUF ? "密码或动态验证码错误" : "密码错误" });
   }
+  if (totpRes.key) usedTotpCodes.set(totpRes.key, Date.now() + 90_000);
   loginAttempts.delete(ip);
   const token = sign({ u: "admin", exp: Date.now() + 12 * 3600_000 });
-  res.setHeader("Set-Cookie", `ops_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${12 * 3600}`);
+  const secureFlag = req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
+  res.setHeader("Set-Cookie", `ops_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${12 * 3600}${secureFlag}`);
   res.json({ ok: true });
 });
 app.post("/api/logout", (req, res) => {
