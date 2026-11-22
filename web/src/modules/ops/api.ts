@@ -25,7 +25,12 @@ export async function api<T = unknown>(method: string, path: string, body?: unkn
     // 非 JSON 响应：出错时按空对象处理；成功状态码却不是 JSON（代理页面、响应被截断等）当失败，免得把 {} 当数据用
     isJson = false;
   }
-  if (res.status === 401 && typeof window !== "undefined" && !window.location.pathname.startsWith("/auth")) {
+  if (
+    res.status === 401 &&
+    (data.code === "SESSION_UNAUTHORIZED" || data.error === "未登录") &&
+    typeof window !== "undefined" &&
+    !window.location.pathname.startsWith("/auth")
+  ) {
     window.location.href = `/auth/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`;
   }
   if (!res.ok) throw new ApiError(String(data.error || `请求失败 (${res.status})`), res.status);

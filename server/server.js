@@ -108,7 +108,13 @@ async function s2(method, p, body) {
     throw httpError(502, `sub2api 返回非 JSON（HTTP ${res.status}）`);
   }
   if (j.error === "mixed_channel_warning") throw httpError(409, `mixed_channel_warning: ${j.message}`);
-  if (!res.ok || j.code !== 0) throw httpError(res.status >= 400 ? res.status : 502, j.message || `sub2api 错误 HTTP ${res.status}`);
+  if (!res.ok || j.code !== 0) {
+    // 上游 sub2api 401/403 不能原样透传 401，否则前端会误判为运维中台登录失效而强制退出
+    const upstreamAuth = res.status === 401 || res.status === 403;
+    const st = upstreamAuth ? 502 : res.status >= 400 ? res.status : 502;
+    const msg = j.message || `sub2api 错误 HTTP ${res.status}`;
+    throw httpError(st, upstreamAuth ? `sub2api 管理密钥无效或无权限（HTTP ${res.status}）：${msg}` : msg);
+  }
   return j.data;
 }
 
@@ -224,7 +230,7 @@ app.post("/api/logout", (req, res) => {
   res.json({ ok: true });
 });
 app.use("/api", (req, res, next) => {
-  if (!verify(readCookie(req, "ops_session"))) return res.status(401).json({ error: "未登录" });
+  if (!verify(readCookie(req, "ops_session"))) return res.status(401).json({ error: "未登录", code: "SESSION_UNAUTHORIZED" });
   next();
 });
 
