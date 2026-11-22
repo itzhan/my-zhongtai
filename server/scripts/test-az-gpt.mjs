@@ -255,7 +255,7 @@ test("AZ GPT Responses encrypted_content S0–S5", async () => {
     assert.equal(channels.length, BUILTIN_CHANNELS.length);
     const az = channels.find((c) => c.code === "az_gpt");
     assert.equal(az.version, 2);
-    assert.equal(az.builtin_version, 4);
+    assert.equal(az.builtin_version, 5);
     assert.equal(az.protocol, "openai_responses");
     assert.equal(az.probe_count, 7);
     assert.equal(az.pass_ratio, 1);

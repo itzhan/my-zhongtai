@@ -168,7 +168,7 @@ export const BUILTIN_CHANNELS = [
     platform_hint: "openai",
     protocol: "openai_responses",
     sort_order: 2,
-    builtin_version: 4,
+    builtin_version: 5,
     pass_ratio: 1,
     summary: "结合微软 Azure 原生硬指纹（x-ms-* / apim-request-id / 动态 content_filters）与 Responses (/v1/responses) S0–S5 reasoning.encrypted_content 校验，精准区分真 Azure 纯透传、真 Azure 多区清洗中转、OpenAI 官转与假源。",
     methodology_md: AZ_GPT_METHODOLOGY_MD,
@@ -202,7 +202,7 @@ export const BUILTIN_CHANNELS = [
         expect_desc: "HTTP 200 且拿到前缀为 gAAAAA、长度 1500+ 字符的 reasoning.encrypted_content（同步记录 Azure 原生指纹）",
         request_body: {
           store: false,
-          input: "请先思考并计算 137 × 29 的结果，同时在内部思考中牢记本轮会话代号 AR-5。思考完成后对外正式回复请只输出 READY，不要提及代号。",
+          input: "若 a+b+c=24，a 比 c 大 3，b 是 c 的 2 倍，请先在内部逐步思考算出 a×b×c 的结果，同时在内部思考中牢记本轮会话代号 AR-5。正式回复请只输出计算结果数字，不要提及代号。",
           reasoning: { effort: "medium", summary: "auto" },
           include: ["reasoning.encrypted_content"],
         },
@@ -312,7 +312,7 @@ export const BUILTIN_CHANNELS = [
     platform_hint: "openai",
     protocol: "openai_responses",
     sort_order: 3,
-    builtin_version: 1,
+    builtin_version: 2,
     pass_ratio: 1,
     summary: "通过 Responses S0–S5 加密思考块校验 + OpenAI 专属 service_tier / previous_response_id 边界探针 + 反查 Azure 原生头/content_filters，精准鉴别真 OpenAI 官转、Azure 冒充与逆向号池。",
     methodology_md: OPENAI_OFFICIAL_METHODOLOGY_MD,
@@ -346,7 +346,7 @@ export const BUILTIN_CHANNELS = [
         expect_desc: "HTTP 200 且拿到前缀为 gAAAAA 的真实 encrypted_content",
         request_body: {
           store: false,
-          input: "请先思考并计算 137 × 29 的结果，同时在内部思考中牢记本轮会话代号 AR-5。思考完成后对外正式回复请只输出 READY，不要提及代号。",
+          input: "若 a+b+c=24，a 比 c 大 3，b 是 c 的 2 倍，请先在内部逐步思考算出 a×b×c 的结果，同时在内部思考中牢记本轮会话代号 AR-5。正式回复请只输出计算结果数字，不要提及代号。",
           reasoning: { effort: "medium", summary: "auto" },
           include: ["reasoning.encrypted_content"],
         },
@@ -3478,7 +3478,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         const retryBody = {
           ...(probe.request_body || {}),
           store: false,
-          input: "请先在内部逐步推导：若 a+b+c=24，a 比 c 大 3，b 是 c 的 2 倍，求 a×b×c，并把本轮会话代号 AR-5 一并记在内部思考中。推导完成后对外正式回复请只输出 READY，不要输出推导过程或代号。",
+          input: "一个三位数，各位数字之和是 18，百位比个位大 2，十位是个位的 2 倍，请先在内部逐步推导算出这个三位数与 17 的乘积，同时在内部思考中牢记本轮会话代号 AR-5。正式回复请只输出最终乘积数字，不要输出代号。",
           reasoning: { effort: "high", summary: "auto" },
           include: ["reasoning.encrypted_content"],
         };
