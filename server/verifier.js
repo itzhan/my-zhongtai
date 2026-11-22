@@ -111,6 +111,22 @@ const AZ_GPT_METHODOLOGY_MD = `### 鉴定原理（Azure OpenAI 原生硬指纹 +
 - **假 / 未校验**：既无 Azure 原生硬指纹，又拿不到 \`gAAAAA\` 或 S2–S5 被静默吞掉返回 200 / S1 答不出 \`AR-5\`。
 - **无法判定**：限流、超时、5xx、余额不足、账号鉴权失败或模型不支持 Responses reasoning。`;
 
+const OPENAI_OFFICIAL_METHODOLOGY_MD = `### 鉴定原理（OpenAI 官转纯透传鉴别：区分真 \`api.openai.com\` vs Azure 冒充 vs 逆向号池/套壳）
+
+本方法论直接向 \`POST /v1/responses\` 发起探测，围绕 **4 项硬性维度** 综合鉴别是否为真正的 **OpenAI 官方 API 纯透传**：
+
+1. **反查 Azure 冒充（一票否决）**
+   - 任何一步响应头或响应体只要出现微软 Azure 特征（\`x-ms-region\`、\`apim-request-id\`、\`x-ms-served-model\`、\`x-ms-aoai-configured-data-retention-days\` 或 \`content_filters\`），直接判定为 **假（实为 Azure OpenAI 冒充 OpenAI 官转）**。
+2. **\`reasoning.encrypted_content\` S0–S5 加密验签矩阵（核心防逆向/防套壳）**
+   - 首轮（\`store: false\` + \`effort: "medium"\`，若跳过思考则自动 \`effort: "high"\` 重试）采集 \`gAAAAA...\` 真实 Fernet 加密思考块，植入代号 \`AR-5\`；
+   - **S1** 原样回传真 blob，明文不含 \`AR-5\` 必须两轮答出 \`AR-5\`（证明上游真正解密续接）；
+   - **S2–S5**（真 blob 改 1 字符、\`"x"\`、\`"AAAA"\`、1500 字符随机串）必须全部返回 \`400 invalid_encrypted_content\`（若返回 \`200\` 说明逆向/套壳吞块或非纯透传清洗网关）。
+3. **OpenAI 官方专属边界探针（防参数裁剪与逆向兼容层）**
+   - **\`service_tier\` 枚举探针**：传非法值 \`"invalid_tier_oai_probe"\`，OpenAI 官方固定返回 \`400\` 并列出官方枚举（\`auto\` / \`default\` / \`flex\` / \`priority\` 等）；逆向号池或非透传网关常忽略该字段返回 \`200\`。
+   - **\`previous_response_id\` 状态探针**：传不存在的 \`resp_oai_probe_nonexistent_9f8e7d6c\`，OpenAI 官方固定返回 \`400 previous_response_not_found\`；逆向/套壳常忽略该字段返回 \`200\`。
+4. **OpenAI 官方响应头佐证（纯透传加分项）**
+   - 自动采集 \`openai-organization\`、\`openai-processing-ms\`、\`openai-version\`、\`x-ratelimit-limit-requests\` 与 \`x-request-id: req_...\`（若中转剥离了响应头，不影响真假判定，但会在报告中标明）。`;
+
 const AWSB_METHODOLOGY_MD = `### 鉴定原理（AWS Bedrock 纯透传黄金口径：S1–S8 Thinking 签名校验）
 
 先以 \`thinking: { type: "adaptive" }\`（旧版 4.5/3.x 模型用 \`enabled + budget_tokens\`，5.x 绝不传 \`budget_tokens\` 或 \`temperature/top_p/top_k\`）采集真实 \`thinking\` 块与 \`signature\`，随后保持会话前缀不变，在第二轮对话里逐一构造以下 **8 项单点变异场景**（每场景默认连跑 **2 轮**）：
@@ -287,6 +303,201 @@ export const BUILTIN_CHANNELS = [
         strong_match: ["invalid_encrypted_content"],
         counter_match: [],
         pass_200_hint: "1500 字符伪造随机串返回 HTTP 200，说明完全未解密校验（假）",
+      },
+    ],
+  },
+  {
+    code: "openai_official",
+    name: "openai 官转",
+    platform_hint: "openai",
+    protocol: "openai_responses",
+    sort_order: 3,
+    builtin_version: 1,
+    pass_ratio: 1,
+    summary: "通过 Responses S0–S5 加密思考块校验 + OpenAI 专属 service_tier / previous_response_id 边界探针 + 反查 Azure 原生头/content_filters，精准鉴别真 OpenAI 官转、Azure 冒充与逆向号池。",
+    methodology_md: OPENAI_OFFICIAL_METHODOLOGY_MD,
+    probes: [
+      {
+        id: "oai_s0",
+        name: "S0 · 不带 reasoning 基础连通",
+        kind: "fingerprint",
+        runner: "resp_enc_s0",
+        rounds: 2,
+        enabled: true,
+        request_desc: "向 POST /v1/responses 发送最小纯字符串请求（连测 2 轮），同步采集 OpenAI 官方头并反查 Azure 特征",
+        expect_desc: "两轮均返回 HTTP 200 且不含 Azure x-ms-* / content_filters",
+        request_body: { input: "请只回复 OK 两个字母。" },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "any",
+        must_match: [],
+        strong_match: [],
+        counter_match: [],
+        pass_200_hint: "",
+      },
+      {
+        id: "oai_seed",
+        name: "采集真实 encrypted_content（植入代号 AR-5）",
+        kind: "baseline",
+        runner: "resp_enc_seed",
+        rounds: 1,
+        enabled: true,
+        request_desc: "store: false + effort=medium（无块时自动 effort=high 重试）+ include: [\"reasoning.encrypted_content\"] 植入代号 AR-5",
+        expect_desc: "HTTP 200 且拿到前缀为 gAAAAA 的真实 encrypted_content",
+        request_body: {
+          store: false,
+          input: "请先思考并计算 137 × 29 的结果，同时在内部思考中牢记本轮会话代号 AR-5。思考完成后对外正式回复请只输出 READY，不要提及代号。",
+          reasoning: { effort: "medium", summary: "auto" },
+          include: ["reasoning.encrypted_content"],
+        },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "any",
+        must_match: [],
+        strong_match: ["gAAAAA"],
+        counter_match: [],
+        pass_200_hint: "",
+      },
+      {
+        id: "oai_s1",
+        name: "S1 · 真 blob 原样回传（核验答出 AR-5）",
+        kind: "fingerprint",
+        runner: "resp_enc_s1",
+        rounds: 2,
+        enabled: true,
+        request_desc: "明文历史不含 AR-5，原样带回真 encrypted_content 追问会话代号（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 200 且正确答出 AR-5",
+        request_body: { _dynamic: "resp_enc_s1" },
+        fallback_on_200: null,
+        expect_status: [200],
+        match_mode: "all",
+        must_match: ["AR-?5"],
+        strong_match: ["AR-?5"],
+        counter_match: [],
+        pass_200_hint: "",
+      },
+      {
+        id: "oai_s2",
+        name: "S2 · 真 blob 改 1 个字符",
+        kind: "fingerprint",
+        runner: "resp_enc_s2",
+        rounds: 2,
+        enabled: true,
+        request_desc: "仅将真 encrypted_content 中点翻转 1 个字符后回传（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 invalid_encrypted_content",
+        request_body: { _dynamic: "resp_enc_s2" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["invalid_encrypted_content", "could not be decrypted or parsed"],
+        strong_match: ["invalid_encrypted_content"],
+        counter_match: [],
+        pass_200_hint: "真 blob 篡改 1 字符仍返回 HTTP 200，说明上游不校验加密块或网关清洗重试（非官转纯透传）",
+      },
+      {
+        id: "oai_s3",
+        name: "S3 · 伪造短串 \"x\"",
+        kind: "fingerprint",
+        runner: "resp_enc_s3",
+        rounds: 2,
+        enabled: true,
+        request_desc: "将 reasoning.encrypted_content 替换为伪造短串 \"x\"（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 invalid_encrypted_content",
+        request_body: { _dynamic: "resp_enc_s3" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["invalid_encrypted_content", "could not be decrypted or parsed"],
+        strong_match: ["invalid_encrypted_content"],
+        counter_match: [],
+        pass_200_hint: "伪造 encrypted_content=\"x\" 返回 HTTP 200，伪造内容被吞掉（非官转纯透传）",
+      },
+      {
+        id: "oai_s4",
+        name: "S4 · 伪造串 \"AAAA\"",
+        kind: "fingerprint",
+        runner: "resp_enc_s4",
+        rounds: 2,
+        enabled: true,
+        request_desc: "将 reasoning.encrypted_content 替换为 \"AAAA\"（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 invalid_encrypted_content",
+        request_body: { _dynamic: "resp_enc_s4" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["invalid_encrypted_content", "could not be decrypted or parsed"],
+        strong_match: ["invalid_encrypted_content"],
+        counter_match: [],
+        pass_200_hint: "伪造 encrypted_content=\"AAAA\" 返回 HTTP 200（非官转纯透传）",
+      },
+      {
+        id: "oai_s5",
+        name: "S5 · 1500 字符随机串",
+        kind: "fingerprint",
+        runner: "resp_enc_s5",
+        rounds: 2,
+        enabled: true,
+        request_desc: "将 reasoning.encrypted_content 替换为 1500 字符随机 base64url 串（连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 invalid_encrypted_content",
+        request_body: { _dynamic: "resp_enc_s5" },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: ["invalid_encrypted_content", "could not be decrypted or parsed"],
+        strong_match: ["invalid_encrypted_content"],
+        counter_match: [],
+        pass_200_hint: "1500 字符伪造随机串返回 HTTP 200，完全未解密校验（非官转）",
+      },
+      {
+        id: "oai_service_tier",
+        name: "service_tier 官方枚举校验",
+        kind: "fingerprint",
+        runner: "resp_enc_probe",
+        rounds: 1,
+        enabled: true,
+        request_desc: "向 POST /v1/responses 传入非法 service_tier: \"invalid_tier_oai_probe\"，验证 OpenAI 官方枚举校验器",
+        expect_desc: "返回 HTTP 400 且包含 Supported values are: 'auto' / 'default' / 'flex' / 'priority' 等 OpenAI 官方枚举文案",
+        request_body: {
+          store: false,
+          input: "hi",
+          service_tier: "invalid_tier_oai_probe",
+        },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: [
+          "Invalid value:.*invalid_tier_oai_probe",
+          "Supported values are:.*(?:flex|priority|default|auto)",
+          "service_tier.*(?:invalid|supported|allowed)",
+        ],
+        strong_match: ["Supported values are:.*(?:flex|priority)"],
+        counter_match: [],
+        pass_200_hint: "非法 service_tier 返回 HTTP 200，说明上游丢弃/裁剪了 service_tier 参数（疑似逆向号池或非纯透传）",
+      },
+      {
+        id: "oai_prev_resp",
+        name: "previous_response_id 原生状态校验",
+        kind: "fingerprint",
+        runner: "resp_enc_probe",
+        rounds: 1,
+        enabled: true,
+        request_desc: "向 POST /v1/responses 传入不存在的 previous_response_id，验证原生 Responses 状态校验",
+        expect_desc: "返回 HTTP 400 且带 previous_response_not_found 或 Previous response with id ... not found",
+        request_body: {
+          input: "hi",
+          previous_response_id: "resp_oai_probe_nonexistent_9f8e7d6c",
+        },
+        fallback_on_200: null,
+        expect_status: [400],
+        match_mode: "any",
+        must_match: [
+          "previous_response_not_found",
+          "Previous response with id .* not found",
+          "Invalid 'previous_response_id'",
+        ],
+        strong_match: ["previous_response_not_found"],
+        counter_match: [],
+        pass_200_hint: "不存在的 previous_response_id 返回 HTTP 200，说明上游丢弃了该参数（疑似逆向号池或非纯透传）",
       },
     ],
   },
@@ -610,7 +821,7 @@ export const BUILTIN_CHANNELS = [
     platform_hint: "anthropic",
     protocol: "anthropic_messages",
     sort_order: 5,
-    builtin_version: 2,
+    builtin_version: 3,
     pass_ratio: 1,
     summary: "依据 S1–S8 Thinking 签名校验矩阵（含 S4=200 黄金口径、msg_bdrk_ 与 Bedrock Runtime 原生堆栈），鉴别是否为纯透传 AWS Bedrock。",
     methodology_md: AWSB_METHODOLOGY_MD,
@@ -721,13 +932,17 @@ export const BUILTIN_CHANNELS = [
         runner: "awsb_s5",
         rounds: 2,
         enabled: true,
-        request_desc: "thinking 正文不变，signature 传空串 \"\"（非流式，连测 2 轮）",
-        expect_desc: "两轮均返回 HTTP 400 Invalid signature in thinking block（若 200 说明网关洗掉了空签名，非纯透传）",
+        request_desc: "thinking 正文非空（原正文为空时自动补占位思考文本），signature 传空串 \"\"（非流式，连测 2 轮）",
+        expect_desc: "两轮均返回 HTTP 400 Invalid signature 或 each thinking block must contain thinking（均带 Bedrock Runtime: InvokeModel）",
         request_body: { _dynamic: "awsb_s5" },
         fallback_on_200: null,
         expect_status: [400],
         match_mode: "any",
-        must_match: ["Invalid\\s+`?signature`?"],
+        must_match: [
+          "Invalid\\s+`?signature`?",
+          "each\\s+thinking\\s+block\\s+must\\s+contain\\s+thinking",
+          "signature.*(?:empty|required|invalid)",
+        ],
         strong_match: ["Bedrock Runtime:\\s*InvokeModel"],
         counter_match: [],
         pass_200_hint: "空签名返回 HTTP 200，说明中转网关将空签名洗掉后重试（非纯透传）",
@@ -1897,9 +2112,235 @@ export function computeRespEncVerdict({ steps, channelName = "az gpt" }) {
   };
 }
 
+const OPENAI_OFFICIAL_HEADER_KEYS = [
+  "openai-organization",
+  "openai-processing-ms",
+  "openai-version",
+  "x-ratelimit-limit-requests",
+  "x-ratelimit-remaining-tokens",
+];
+
+export function extractOpenAiOfficialFingerprint(headers, json) {
+  const hdrs = headers && typeof headers === "object" ? headers : {};
+  const lower = {};
+  for (const [k, v] of Object.entries(hdrs)) {
+    lower[String(k).toLowerCase()] = String(v ?? "").trim();
+  }
+  const oaiHeaders = [];
+  for (const key of OPENAI_OFFICIAL_HEADER_KEYS) {
+    if (lower[key]) oaiHeaders.push(key);
+  }
+  const reqId = lower["x-request-id"] || "";
+  const hasReqPrefix = /^req_[a-z0-9]+/i.test(reqId);
+  if (hasReqPrefix) oaiHeaders.push("x-request-id(req_)");
+  const serviceTier = json && typeof json === "object" && typeof json.service_tier === "string" ? json.service_tier : "";
+  return {
+    oai_headers: oaiHeaders,
+    oai_org: lower["openai-organization"] || "",
+    oai_version: lower["openai-version"] || "",
+    oai_service_tier: serviceTier,
+    oai_req_prefix: hasReqPrefix,
+  };
+}
+
+function summarizeOpenAiOfficialEvidence(steps) {
+  const hdrSet = new Set();
+  const orgs = new Set();
+  const tiers = new Set();
+  for (const s of steps) {
+    if (!s || typeof s !== "object") continue;
+    const fp =
+      s.oai_fp && typeof s.oai_fp === "object"
+        ? s.oai_fp
+        : extractOpenAiOfficialFingerprint(s.response_headers, null);
+    for (const h of fp.oai_headers || []) hdrSet.add(h);
+    if (fp.oai_org) orgs.add(fp.oai_org);
+    if (fp.oai_service_tier) tiers.add(fp.oai_service_tier);
+  }
+  const parts = [];
+  if (orgs.size > 0) parts.push(`openai-organization=${[...orgs][0]}`);
+  if (hdrSet.has("openai-processing-ms")) parts.push("openai-processing-ms");
+  if (hdrSet.has("openai-version")) parts.push("openai-version");
+  if (hdrSet.has("x-request-id(req_)")) parts.push("x-request-id(req_)");
+  if (tiers.size > 0) parts.push(`service_tier=${[...tiers].join("/")}`);
+  return {
+    headerCount: hdrSet.size,
+    hasOfficialHeaders: hdrSet.has("openai-organization") || hdrSet.has("openai-processing-ms") || hdrSet.has("x-request-id(req_)"),
+    summaryText: parts.join(" · "),
+  };
+}
+
+export function computeOpenAiOfficialVerdict({ steps, channelName = "openai 官转" }) {
+  const fpSteps = steps.filter((s) => s.kind !== "baseline");
+  const total = fpSteps.length;
+  const matched = fpSteps.filter((s) => s.status === "pass").length;
+  const score = total ? Math.round((matched / total) * 100) : 0;
+  const byRunner = Object.fromEntries(steps.map((s) => [s.runner || s.id, s]));
+  const s0 = byRunner.resp_enc_s0;
+  const seed = byRunner.resp_enc_seed;
+  const s1 = byRunner.resp_enc_s1;
+  const tamper = ["resp_enc_s2", "resp_enc_s3", "resp_enc_s4", "resp_enc_s5"].map((k) => byRunner[k]).filter(Boolean);
+  const extraProbes = steps.filter((s) => s.runner === "resp_enc_probe");
+  const tierProbe = steps.find((s) => s.id === "oai_service_tier");
+  const prevProbe = steps.find((s) => s.id === "oai_prev_resp");
+
+  const az = summarizeAzureEvidence(steps);
+  const oai = summarizeOpenAiOfficialEvidence(steps);
+
+  const envStep = steps.find((s) => s.env_error || s.throttled);
+  if (envStep) {
+    return {
+      verdict: "inconclusive",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `无法判定（限流 / 超时 / 鉴权 / 模型不支持）：${envStep.name || "探测"} — ${envStep.reason || "环境错误"}`,
+    };
+  }
+
+  // 一票否决：检出微软 Azure 原生硬特征 -> 拿 Azure 冒充 OpenAI 官转
+  if (az.strongHeaders || az.cfSteps > 0) {
+    return {
+      verdict: "fake",
+      score: 0,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（实为 Azure OpenAI 冒充 OpenAI 官转）：检出微软 Azure 专属特征（${az.summaryText}），并非 OpenAI 官方 API（api.openai.com）。`,
+    };
+  }
+
+  if (seed?.no_blob_200 || (seed?.status === "fail" && seed.http_status === 200 && !seed.blob_len)) {
+    const forgeSteps = ["resp_enc_s3", "resp_enc_s4", "resp_enc_s5"].map((k) => byRunner[k]).filter(Boolean);
+    const allForge400Code =
+      forgeSteps.length === 3 &&
+      forgeSteps.every(
+        (s) => (s.round_statuses || []).length > 0 && (s.round_statuses || []).every((c) => c === 400) && s.has_invalid_enc_code,
+      );
+    const extraOk = extraProbes.filter((s) => s.status === "pass").length;
+    if (allForge400Code && (tierProbe?.status === "pass" || oai.hasOfficialHeaders)) {
+      return {
+        verdict: "authentic",
+        score: 90,
+        matched_count: matched,
+        total_probes: total,
+        summary: `判定为真（OpenAI 官转纯透传，仅 Seed 未吐出思考块）：无任何 Azure 特征，S3–S5 全部返回 400 invalid_encrypted_content，官方探针命中 ${extraOk}/${extraProbes.length}${oai.summaryText ? `（${oai.summaryText}）` : ""}。`,
+      };
+    }
+    return {
+      verdict: "fake",
+      score: 0,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（非 OpenAI 官转）：Seed 未返回 reasoning.encrypted_content 且未通过伪造块严格验签（疑似逆向号池或非透传套壳）。`,
+    };
+  }
+  if (seed && seed.status !== "pass") {
+    return {
+      verdict: "inconclusive",
+      score: 0,
+      matched_count: 0,
+      total_probes: total,
+      summary: `无法判定：真 blob 采集失败（${seed.reason || "seed 未通过"}），不能据此认定 ${channelName} 为假。`,
+    };
+  }
+
+  const swallowed = tamper.filter((s) => s.any_200 || (s.round_statuses || []).some((c) => c === 200));
+  if (swallowed.length > 0) {
+    return {
+      verdict: "fake",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（非 OpenAI 官转纯透传）：「${swallowed.map((s) => s.name).join("、")}」返回 HTTP 200，伪造/篡改 encrypted_content 被吞掉或清洗（疑似逆向号池/套壳/非透传网关）。`,
+    };
+  }
+
+  if (s1?.s1_wrong_answer || (s1?.status === "fail" && (s1.round_statuses || []).every((c) => c === 200) && !s1.s1_ar5_ok)) {
+    return {
+      verdict: "fake",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为假（真 blob 回传后未答出 AR-5）：上游未真正解密续接 reasoning.encrypted_content，不符合 OpenAI 官转口径。`,
+    };
+  }
+
+  const unstable = [s0, s1, ...tamper].filter((s) => s?.round_conflict);
+  if (unstable.length > 0) {
+    return {
+      verdict: "inconclusive",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `无法判定：「${unstable.map((s) => s.name).join("、")}」两轮状态不一致（${unstable.map((s) => (s.round_statuses || []).join("/")).join("；")}），疑似抖动或混池，请重试。`,
+    };
+  }
+
+  if (s1 && s1.status !== "pass" && s1.status !== "skip" && !(s1.round_statuses || []).includes(200)) {
+    return {
+      verdict: "inconclusive",
+      score,
+      matched_count: matched,
+      total_probes: total,
+      summary: `无法判定：S1 真 blob 回传未得到 HTTP 200（${(s1.round_statuses || []).join(" / ") || "无状态"}）。`,
+    };
+  }
+
+  const s0ok = !s0 || s0.status === "pass";
+  const s1ok = Boolean(s1 && s1.status === "pass" && s1.s1_ar5_ok);
+  const allTamper400 =
+    tamper.length === 4 && tamper.every((s) => (s.round_statuses || []).length > 0 && (s.round_statuses || []).every((c) => c === 400));
+  const allHaveCode = tamper.every((s) => s.has_invalid_enc_code);
+  const prefixOk = Boolean(seed?.blob_prefix_ok);
+  const extraPassed = extraProbes.filter((s) => s.status === "pass").length;
+  const extraStripped = extraProbes.filter((s) => s.param_stripped);
+
+  if (s0ok && s1ok && allTamper400 && allHaveCode && prefixOk) {
+    const oaiNote = oai.summaryText ? ` · 官方特征：${oai.summaryText}` : "（网关未透传 openai-* 响应头）";
+    if (extraProbes.length > 0 && extraStripped.length === extraProbes.length) {
+      return {
+        verdict: "suspicious",
+        score: 78,
+        matched_count: matched,
+        total_probes: total,
+        summary: `判定为疑似（S0–S5 加密验签通过且无 Azure 特征，但网关裁剪了 service_tier 与 previous_response_id 参数返 200）：非完整纯透传${oaiNote}。`,
+      };
+    }
+    const finalScore = extraProbes.length > 0 && extraPassed === extraProbes.length ? 100 : 92;
+    return {
+      verdict: "authentic",
+      score: finalScore,
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为真（OpenAI 官转纯透传）：无任何 Azure 特征，S0=200、S1=200 答出 AR-5、S2–S5 全部 400 invalid_encrypted_content，真 blob 前缀 gAAAAA（${seed.blob_len} 字符），官方边界探针通过 ${extraPassed}/${extraProbes.length}${oaiNote}。`,
+    };
+  }
+
+  if (s0ok && s1ok && allTamper400 && !allHaveCode) {
+    return {
+      verdict: "suspicious",
+      score: Math.max(score, 70),
+      matched_count: matched,
+      total_probes: total,
+      summary: `判定为疑似（上游像 OpenAI 官转，但网关清洗了错误体）：无 Azure 特征，S0/S1(AR-5) 通过且 S2–S5 全部 400，但未透传 invalid_encrypted_content 原文。`,
+    };
+  }
+
+  return {
+    verdict: matched >= 3 ? "suspicious" : "fake",
+    score,
+    matched_count: matched,
+    total_probes: total,
+    summary: `判定为${matched >= 3 ? "疑似" : "假"}（OpenAI 官转口径未凑齐）：通过 ${matched}/${total}，官方边界探针 ${extraPassed}/${extraProbes.length}。`,
+  };
+}
+
 export function computeRunVerdict({ steps, passRatio = 0.8, channelName, channelCode }) {
   if (steps.some((s) => String(s.runner || "").startsWith("awsb_"))) {
     return computeAwsbVerdict({ steps, channelName });
+  }
+  if (channelCode === "openai_official" || steps.some((s) => s.id === "oai_service_tier" || s.id === "oai_prev_resp")) {
+    return computeOpenAiOfficialVerdict({ steps, channelName });
   }
   if (steps.some((s) => String(s.runner || "").startsWith("resp_enc_"))) {
     return computeRespEncVerdict({ steps, channelName });
@@ -2522,7 +2963,13 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         thinkingBlock = { type: "thinking", thinking: AWSB_UNRELATED_THINKING, signature: awsb.origSig };
         break;
       case "awsb_s5":
-        thinkingBlock = { type: "thinking", thinking: awsb.origThinking, signature: "" };
+        // Claude 5.x 自适应思考返回的 origThinking 常为空串 ""；若同时传 thinking:"" 与 signature:""，
+        // Bedrock 会先报 "each thinking block must contain thinking"，故正文为空时补占位文本以精准测空签名
+        thinkingBlock = {
+          type: "thinking",
+          thinking: awsb.origThinking || "Let me solve this problem step by step.",
+          signature: "",
+        };
         break;
       case "awsb_s6":
         thinkingBlock = { type: "thinking", thinking: awsb.origThinking };
@@ -2941,6 +3388,58 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         body,
       });
 
+    if (runner === "resp_enc_probe") {
+      const r = await sendBody(probe.request_body);
+      if (isRespEncEnvError(r)) {
+        return {
+          stepPatch: {
+            status: "fail",
+            env_error: true,
+            throttled: r.http_status === 429,
+            http_status: r.http_status,
+            round_statuses: [r.http_status],
+            latency_ms: r.latency_ms,
+            reason: `环境错误（HTTP ${r.http_status}）：${extractResponseMessage(r.json, r.raw_text).slice(0, 140)}`,
+            request_url: r.url,
+            request_body: r.request_body,
+            response_headers: r.headers,
+            response_snippet: r.snippet,
+          },
+          abort: false,
+        };
+      }
+      const ev = evaluateProbeResponse({
+        probe,
+        protocol: channel.protocol,
+        httpStatus: r.http_status,
+        json: r.json,
+        rawText: r.raw_text,
+      });
+      const azFp = extractAzureFingerprint(r.headers, r.json, r.raw_text);
+      const oaiFp = extractOpenAiOfficialFingerprint(r.headers, r.json);
+      return {
+        stepPatch: {
+          status: ev.status,
+          http_status: r.http_status,
+          round_statuses: [r.http_status],
+          latency_ms: r.latency_ms,
+          strong_hit: ev.strong_hit,
+          counter_hit: ev.counter_hit,
+          param_stripped: ev.param_stripped,
+          status_rewritten: ev.status_rewritten,
+          matched_patterns: ev.matched_patterns,
+          az_fp: azFp,
+          oai_fp: oaiFp,
+          reason: ev.reason,
+          request_url: r.url,
+          request_body: r.request_body,
+          response_headers: r.headers,
+          response_snippet: r.snippet,
+        },
+        abort: false,
+      };
+    }
+
     if (runner === "resp_enc_seed") {
       let res = await sendBody(probe.request_body);
       if (isRespEncEnvError(res)) {
@@ -2992,6 +3491,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         }
       }
       const seedAzFp = extractAzureFingerprint(res.headers, res.json, res.raw_text);
+      const seedOaiFp = extractOpenAiOfficialFingerprint(res.headers, res.json);
       if (res.http_status !== 200 || !extracted.blob) {
         const noBlob = res.http_status === 200;
         return {
@@ -3002,6 +3502,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
             round_statuses: seedStatuses,
             latency_ms: totalSeedMs,
             az_fp: seedAzFp,
+            oai_fp: seedOaiFp,
             fallback_used: usedHighRetry,
             reason: noBlob
               ? `HTTP 200 但响应没有 reasoning.encrypted_content（已自动高强度重试；S1/S2 跳过，继续执行 S3–S5 伪造块校验）${seedAzFp.az_region ? ` · Azure(${seedAzFp.az_region})` : seedAzFp.az_has_content_filters ? " · Azure(content_filters)" : ""}`
@@ -3037,6 +3538,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
           blob_prefix_ok: prefixOk,
           strong_hit: prefixOk,
           az_fp: seedAzFp,
+          oai_fp: seedOaiFp,
           fallback_used: usedHighRetry,
           reason: `已采集 encrypted_content（${extracted.blob.length} 字符${prefixOk ? "，前缀 gAAAAA" : "，前缀不是 gAAAAA"}${usedHighRetry ? "，高强度重试成功" : ""}）${extracted.reasoningId ? ` · ${extracted.reasoningId}` : ""}${azHint}`,
           request_url: res.url,
@@ -3101,6 +3603,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     const statuses = roundResults.map((r) => r.http_status);
     const last = roundResults[roundResults.length - 1];
     const lastAzFp = extractAzureFingerprint(last.headers, last.json, last.raw_text);
+    const lastOaiFp = extractOpenAiOfficialFingerprint(last.headers, last.json);
     const totalMs = roundResults.reduce((sum, r) => sum + (r.latency_ms || 0), 0);
     const roundConflict = new Set(statuses).size > 1;
     const basePatch = {
@@ -3109,6 +3612,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       round_conflict: roundConflict,
       latency_ms: totalMs,
       az_fp: lastAzFp,
+      oai_fp: lastOaiFp,
       request_url: last.url,
       request_body: last.request_body,
       response_headers: last.headers,
