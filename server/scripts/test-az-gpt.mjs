@@ -292,8 +292,12 @@ test("AZ GPT Responses encrypted_content S0–S5", async () => {
 
     upstream.setMode("azure_no_blob");
     const azNoBlob = await startRun(apiBase, baseUrl, "azure-no-blob");
-    assert.equal(azNoBlob.verdict, "suspicious", azNoBlob.summary);
-    assert.match(azNoBlob.summary, /疑似真 Azure/);
+    assert.equal(azNoBlob.verdict, "authentic", azNoBlob.summary);
+    assert.equal(azNoBlob.score, 92);
+    assert.equal(azNoBlob.steps.find((s) => s.id === "az_s1").status, "skip");
+    assert.equal(azNoBlob.steps.find((s) => s.id === "az_s2").status, "skip");
+    assert.equal(azNoBlob.steps.find((s) => s.id === "az_s3").status, "pass");
+    assert.equal(azNoBlob.steps.find((s) => s.id === "az_s5").status, "pass");
 
     upstream.setMode("swallow");
     const swallowed = await startRun(apiBase, baseUrl, "swallow");

@@ -1714,13 +1714,39 @@ export function computeRespEncVerdict({ steps, channelName = "az gpt" }) {
   }
 
   if (seed?.no_blob_200 || (seed?.status === "fail" && seed.http_status === 200 && !seed.blob_len)) {
+    const forgeSteps = ["resp_enc_s3", "resp_enc_s4", "resp_enc_s5"].map((k) => byRunner[k]).filter(Boolean);
+    const allForge400Code =
+      forgeSteps.length === 3 &&
+      forgeSteps.every(
+        (s) => (s.round_statuses || []).length > 0 && (s.round_statuses || []).every((c) => c === 400) && s.has_invalid_enc_code,
+      );
+    const anyForge200 = forgeSteps.some((s) => s.any_200 || (s.round_statuses || []).some((c) => c === 200));
+
+    if (allForge400Code && (az.strongHeaders || az.dynamicCf)) {
+      return {
+        verdict: "authentic",
+        score: 92,
+        matched_count: matched,
+        total_probes: total,
+        summary: `判定为真（真 Azure 纯透传，仅 Seed 未吐出密文块）：命中微软 Azure 原生指纹（${az.summaryText}），且 S3–S5 伪造块全部返回 400 invalid_encrypted_content（严格校验未清洗）。`,
+      };
+    }
+    if (az.strongHeaders && az.cfSteps >= 2 && anyForge200) {
+      return {
+        verdict: "authentic",
+        score: 82,
+        matched_count: matched,
+        total_probes: total,
+        summary: `判定为真（真 Azure · 多区中转已清洗 reasoning，且 Seed 未吐出密文块）：持续命中微软 Azure 原生指纹（${az.summaryText}），S3–S5 返回 200（网关剥离了入站 encrypted_content）。底层为正版 Azure，非纯透传。`,
+      };
+    }
     if (az.strongHeaders && az.cfSteps >= 1) {
       return {
         verdict: "suspicious",
         score: 65,
         matched_count: matched,
         total_probes: total,
-        summary: `判定为疑似真 Azure（未返回 encrypted_content）：命中微软 Azure 原生指纹（${az.summaryText}），但 Seed 未返回 reasoning.encrypted_content（可能网关未透传 include 参数或模型未开启思考密文），无法完成 S1–S5 透传度校验。`,
+        summary: `判定为疑似真 Azure（未返回 encrypted_content）：命中微软 Azure 原生指纹（${az.summaryText}），但 Seed 未返回 reasoning.encrypted_content，建议人工核对上游渠道。`,
       };
     }
     if (az.dynamicCf) {
@@ -2916,7 +2942,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       });
 
     if (runner === "resp_enc_seed") {
-      const res = await sendBody(probe.request_body);
+      let res = await sendBody(probe.request_body);
       if (isRespEncEnvError(res)) {
         return {
           stepPatch: {
@@ -2935,7 +2961,36 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
           abort: true,
         };
       }
-      const extracted = extractResponsesPayload(res.json, res.raw_text);
+      let extracted = extractResponsesPayload(res.json, res.raw_text);
+      let usedHighRetry = false;
+      const seedStatuses = [res.http_status];
+      let totalSeedMs = res.latency_ms || 0;
+      // 自适应思考模型（如 gpt-6.2-sol）有时在简单算术题上跳过思考块，自动用 effort: "high" + 多步推导题补试 1 次
+      if (res.http_status === 200 && !extracted.blob) {
+        usedHighRetry = true;
+        if (onStepUpdate) {
+          onStepUpdate({
+            ...step,
+            status: "running",
+            round_statuses: seedStatuses,
+            reason: "首轮未输出 reasoning 块，正以 effort=high 多步推导题自动重试…",
+          });
+        }
+        const retryBody = {
+          ...(probe.request_body || {}),
+          store: false,
+          input: "请先在内部逐步推导：若 a+b+c=24，a 比 c 大 3，b 是 c 的 2 倍，求 a×b×c，并把本轮会话代号 AR-5 一并记在内部思考中。推导完成后对外正式回复请只输出 READY，不要输出推导过程或代号。",
+          reasoning: { effort: "high", summary: "auto" },
+          include: ["reasoning.encrypted_content"],
+        };
+        const res2 = await sendBody(retryBody);
+        if (!isRespEncEnvError(res2) && res2.http_status === 200) {
+          res = res2;
+          extracted = extractResponsesPayload(res.json, res.raw_text);
+          seedStatuses.push(res2.http_status);
+          totalSeedMs += res2.latency_ms || 0;
+        }
+      }
       const seedAzFp = extractAzureFingerprint(res.headers, res.json, res.raw_text);
       if (res.http_status !== 200 || !extracted.blob) {
         const noBlob = res.http_status === 200;
@@ -2944,18 +2999,20 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
             status: "fail",
             no_blob_200: noBlob,
             http_status: res.http_status,
-            round_statuses: [res.http_status],
-            latency_ms: res.latency_ms,
+            round_statuses: seedStatuses,
+            latency_ms: totalSeedMs,
             az_fp: seedAzFp,
+            fallback_used: usedHighRetry,
             reason: noBlob
-              ? `HTTP 200 但响应没有 reasoning.encrypted_content，无法继续 S1–S5${seedAzFp.az_region ? `（命中 Azure ${seedAzFp.az_region}）` : seedAzFp.az_has_content_filters ? "（命中 Azure content_filters）" : ""}`
+              ? `HTTP 200 但响应没有 reasoning.encrypted_content（已自动高强度重试；S1/S2 跳过，继续执行 S3–S5 伪造块校验）${seedAzFp.az_region ? ` · Azure(${seedAzFp.az_region})` : seedAzFp.az_has_content_filters ? " · Azure(content_filters)" : ""}`
               : `采集真 blob 失败（HTTP ${res.http_status}）：${extractResponseMessage(res.json, res.raw_text).slice(0, 160)}`,
             request_url: res.url,
             request_body: res.request_body,
             response_headers: res.headers,
             response_snippet: res.snippet,
           },
-          abort: true,
+          // HTTP 200 但无 blob 时不再中断 S3–S5（伪造块校验不依赖真 blob）
+          abort: !noBlob,
         };
       }
       const assistantText = respEncAnswerHasAr5(extracted.text) ? "READY" : extracted.text || "READY";
@@ -2974,13 +3031,14 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         stepPatch: {
           status: "pass",
           http_status: 200,
-          round_statuses: [200],
-          latency_ms: res.latency_ms,
+          round_statuses: seedStatuses,
+          latency_ms: totalSeedMs,
           blob_len: extracted.blob.length,
           blob_prefix_ok: prefixOk,
           strong_hit: prefixOk,
           az_fp: seedAzFp,
-          reason: `已采集 encrypted_content（${extracted.blob.length} 字符${prefixOk ? "，前缀 gAAAAA" : "，前缀不是 gAAAAA"}）${extracted.reasoningId ? ` · ${extracted.reasoningId}` : ""}${azHint}`,
+          fallback_used: usedHighRetry,
+          reason: `已采集 encrypted_content（${extracted.blob.length} 字符${prefixOk ? "，前缀 gAAAAA" : "，前缀不是 gAAAAA"}${usedHighRetry ? "，高强度重试成功" : ""}）${extracted.reasoningId ? ` · ${extracted.reasoningId}` : ""}${azHint}`,
           request_url: res.url,
           request_body: res.request_body,
           response_headers: res.headers,
@@ -2990,10 +3048,10 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       };
     }
 
-    if (runner !== "resp_enc_s0") {
+    if (runner === "resp_enc_s1" || runner === "resp_enc_s2") {
       if (!runState.respEnc?.blob) {
         return {
-          stepPatch: { status: "skip", reason: "前置未拿到 encrypted_content，跳过" },
+          stepPatch: { status: "skip", reason: "前置未拿到 encrypted_content，跳过依赖真 blob 的场景" },
           abort: false,
         };
       }
@@ -3003,9 +3061,9 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       runner === "resp_enc_s0"
         ? probe.request_body
         : buildRespEncReplay(
-            respEncBlobFor(runner, runState.respEnc.blob),
-            runState.respEnc.assistantText,
-            runState.respEnc.reasoningId,
+            respEncBlobFor(runner, runState.respEnc?.blob || ""),
+            runState.respEnc?.assistantText || "READY",
+            runState.respEnc?.reasoningId || "",
           );
     const rounds = Math.max(1, probe.rounds || (runner === "resp_enc_s0" ? 2 : 2));
     const roundResults = [];
