@@ -34,6 +34,24 @@ function createMockUpstream() {
         body = {};
       }
       res.setHeader("content-type", "application/json");
+      const isAzureMode = mode === "azure_cleaned" || mode === "azure_pure" || mode === "azure_no_blob";
+      if (isAzureMode) {
+        res.setHeader("apim-request-id", "591b8d58-fa2c-48c7-9187-25dbdc0c87f8");
+        res.setHeader("x-ms-region", "Sweden Central");
+        res.setHeader("x-ms-aoai-configured-data-retention-days", "30");
+        res.setHeader("x-ms-served-model", "gpt-6.2-sol-2026-11-17");
+      }
+      const azFilters = (text) =>
+        isAzureMode
+          ? {
+              content_filters: [
+                { source_type: "prompt", content_filter_results: { hate: { filtered: false, severity: "safe" } }, content_filter_offsets: { start_offset: 0, end_offset: 30, check_offset: 0 } },
+                { source_type: "completion", content_filter_results: { hate: { filtered: false, severity: "safe" } }, content_filter_offsets: { start_offset: 0, end_offset: text.length, check_offset: 0 } },
+              ],
+              input_transformations: [],
+              access_programs: null,
+            }
+          : {};
       if (mode === "throttle") {
         res.statusCode = 429;
         return res.end(JSON.stringify({ error: { message: "Rate limit exceeded", code: "rate_limit_exceeded" } }));
@@ -42,11 +60,12 @@ function createMockUpstream() {
       const isSeed = Boolean(body.reasoning) || (Array.isArray(body.include) && body.include.includes("reasoning.encrypted_content"));
       if (!Array.isArray(input)) {
         if (isSeed) {
-          if (mode === "no_blob") {
+          if (mode === "no_blob" || mode === "azure_no_blob") {
             res.statusCode = 200;
             return res.end(
               JSON.stringify({
                 id: "resp_seed",
+                ...azFilters("READY"),
                 output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "READY" }] }],
               }),
             );
@@ -55,6 +74,7 @@ function createMockUpstream() {
           return res.end(
             JSON.stringify({
               id: "resp_seed",
+              ...azFilters("READY"),
               output: [
                 { type: "reasoning", id: "rs_testblob", encrypted_content: REAL_BLOB, summary: [] },
                 { type: "message", role: "assistant", content: [{ type: "output_text", text: "READY" }] },
@@ -66,6 +86,7 @@ function createMockUpstream() {
         return res.end(
           JSON.stringify({
             id: "resp_s0",
+            ...azFilters("OK"),
             output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "OK" }] }],
           }),
         );
@@ -73,12 +94,14 @@ function createMockUpstream() {
 
       replays.push(body);
       const blob = input.find((item) => item?.type === "reasoning")?.encrypted_content || "";
-      if (mode === "swallow") {
+      if (mode === "swallow" || mode === "azure_cleaned") {
+        const reply = "没有可提供的会话代号。";
         res.statusCode = 200;
         return res.end(
           JSON.stringify({
             id: "resp_swallowed",
-            output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "hello" }] }],
+            ...azFilters(reply),
+            output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: reply }] }],
           }),
         );
       }
@@ -88,6 +111,7 @@ function createMockUpstream() {
         return res.end(
           JSON.stringify({
             id: "resp_s1",
+            ...azFilters(text),
             output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
           }),
         );
@@ -231,7 +255,7 @@ test("AZ GPT Responses encrypted_content S0–S5", async () => {
     assert.equal(channels.length, BUILTIN_CHANNELS.length);
     const az = channels.find((c) => c.code === "az_gpt");
     assert.equal(az.version, 2);
-    assert.equal(az.builtin_version, 2);
+    assert.equal(az.builtin_version, 3);
     assert.equal(az.protocol, "openai_responses");
     assert.equal(az.probe_count, 7);
     assert.equal(az.pass_ratio, 1);
@@ -239,6 +263,8 @@ test("AZ GPT Responses encrypted_content S0–S5", async () => {
     upstream.setMode("real");
     const real = await startRun(apiBase, baseUrl, "real");
     assert.equal(real.verdict, "authentic", real.summary);
+    assert.equal(real.steps.find((s) => s.id === "az_seed").request_body.store, false);
+    assert.equal(real.steps.find((s) => s.id === "az_s1").request_body.store, false);
     assert.deepEqual(real.steps.find((s) => s.id === "az_s0").round_statuses, [200, 200]);
     assert.equal(real.steps.find((s) => s.id === "az_seed").blob_prefix_ok, true);
     assert.equal(real.steps.find((s) => s.id === "az_s1").s1_ar5_ok, true);
@@ -251,6 +277,23 @@ test("AZ GPT Responses encrypted_content S0–S5", async () => {
     assert.equal(/AR-?5/.test(s1Body), false);
     assert.equal(real.steps.find((s) => s.id === "az_s4").request_body.input[0].encrypted_content, "AAAA");
     assert.equal(upstream.replays.some((b) => /AR-?5/.test(JSON.stringify(b.input))), false);
+
+    upstream.setMode("azure_pure");
+    const azPure = await startRun(apiBase, baseUrl, "azure-pure");
+    assert.equal(azPure.verdict, "authentic", azPure.summary);
+    assert.equal(azPure.score, 100);
+    assert.match(azPure.summary, /真 Azure 纯透传/);
+
+    upstream.setMode("azure_cleaned");
+    const azCleaned = await startRun(apiBase, baseUrl, "azure-cleaned");
+    assert.equal(azCleaned.verdict, "authentic", azCleaned.summary);
+    assert.equal(azCleaned.score, 88);
+    assert.match(azCleaned.summary, /多区中转已清洗 reasoning/);
+
+    upstream.setMode("azure_no_blob");
+    const azNoBlob = await startRun(apiBase, baseUrl, "azure-no-blob");
+    assert.equal(azNoBlob.verdict, "suspicious", azNoBlob.summary);
+    assert.match(azNoBlob.summary, /疑似真 Azure/);
 
     upstream.setMode("swallow");
     const swallowed = await startRun(apiBase, baseUrl, "swallow");

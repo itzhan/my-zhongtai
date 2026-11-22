@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const TIMEOUT_MS = 30_000;
+const TIMEOUT_MS = 60_000;
 const MAX_RUNS = 500;
 const MAX_BODY_SNIPPET = 2500;
 const PROTOCOLS = new Set(["gemini_native", "anthropic_messages", "openai_chat", "openai_responses"]);
@@ -91,32 +91,25 @@ const AS_GEMINI_METHODOLOGY_MD = `### 鉴定原理（AI Studio 真货确认方�
 - 只要出现任意 Vertex 特征文案或文档链接 → 直接判定为 **假（Vertex AI 或 Vertex 掺水）**。
 - **Gemini 3.6+ / 4 注意事项**：新一代 Gemini 3.6+/4 模型本身会忽略超界 \`temperature\` / \`topP\` 并返回 \`HTTP 200\`，因此本渠道判定**不会**因这两项返回 \`200\` 而误判为假，只要其它探针（如 \`candidateCount\` / \`logprobs\`）触发 \`service: generativelanguage.googleapis.com\` 且无 Vertex 特征，仍判定为真。`;
 
-const AZ_GPT_METHODOLOGY_MD = `### 鉴定原理（OpenAI / Azure Responses \`reasoning.encrypted_content\` S0–S5 校验）
+const AZ_GPT_METHODOLOGY_MD = `### 鉴定原理（Azure OpenAI 原生硬指纹 + Responses \`reasoning.encrypted_content\` S0–S5 双维校验）
 
-本方法论直接向 \`POST /v1/responses\` 发起探测（非 \`/v1/chat/completions\`），利用 GPT 5.x / 6.x / o 系列模型在 Responses API 下返回的加密思考块 \`encrypted_content\`（典型前缀 \`gAAAAA\`，长度约 1500–1700 字符），通过加密续接记忆与篡改/伪造拦截区分 **纯透传真源**、**清洗错误体网关** 与 **假/未校验上游**。
+本方法论向 \`POST /v1/responses\` 发起探测，结合 **「微软 Azure 原生硬指纹」** 与 **「无状态加密思考块（\`store: false\` + \`encrypted_content\`）S0–S5 矩阵」** 两个独立维度进行鉴定，避免把底层为真 Azure、仅因多区轮询中转清洗 \`encrypted_content\` 的站点误判为假：
 
-#### 采集与请求规范
-1. **先取真 blob**：首轮使用纯字符串 \`input\` + \`reasoning: { summary: "auto" }\` + \`include: ["reasoning.encrypted_content"]\`（实测纯字符串 \`input\` 比消息数组更稳定产出 reasoning 块），在思考中植入会话代号 **\`AR-5\`**。若拿不到 \`encrypted_content\`，则立即停止后续 S1–S5。
-2. **每场景默认连跑 2 轮**，排除 429 限流、余额不足与模型名不存在导致的误判。
-3. **勿与 AWSB S4 混淆**：AWSB 的 S4 期望为 \`200\`；本套 Responses 校验中 **S2–S5（含 S4="AAAA"）全部期望 \`400 invalid_encrypted_content\`**。
+#### 维度一：微软 Azure OpenAI 原生硬指纹（防套壳 / 区分真 Azure vs OpenAI 官方直连）
+1. **微软原生 HTTP 响应头**：\`apim-request-id\`、\`x-ms-region\`（如 \`East US 2\` / \`West US 3\` / \`Sweden Central\` / \`France Central\`）、\`x-ms-aoai-configured-data-retention-days\`、\`x-ms-served-model\`、\`x-ms-is-spilled-over\`。
+2. **Azure 独有响应体结构**：实时内容安全审查数组 \`content_filters\`（含 \`prompt\` / \`completion\` 双段 \`content_filter_results\` 与随输出长度动态变化的 \`content_filter_offsets\`）以及 \`input_transformations\`。
 
-#### S0–S5 测试矩阵
-
-| 场景 | 请求操作 | 真源期望 | 原理与防作假 |
-| --- | --- | --- | --- |
-| **S0** | 不带 \`reasoning\` 发送基础请求 | \`200\`（2 轮） | 确认 \`POST /v1/responses\` 基础可用 |
-| **Seed** | 纯字符串 \`input\` + \`include: ["reasoning.encrypted_content"]\` 记住 \`AR-5\` | \`200\` + \`gAAAAA...\` | 采集真实 \`rs_...\` 与 \`encrypted_content\` 密文块 |
-| **S1** | 明文历史不含 \`AR-5\`，原样回传真 \`encrypted_content\` | \`200\` 且答出 \`AR-5\`（2 轮） | 仅靠解密思考块续接记忆，防止「仅 HTTP 200 但普通对话乱答」 |
-| **S2** | 真 blob 中点翻转 1 个字符 | \`400 invalid_encrypted_content\` | 验证后端是否严格校验加密签名，防止单比特篡改不验 |
-| **S3** | \`encrypted_content: "x"\` | \`400 invalid_encrypted_content\` | 检测是否被网关/假源静默吞掉伪造思考块 |
-| **S4** | \`encrypted_content: "AAAA"\` | \`400 invalid_encrypted_content\` | 排除 Base64 伪块绕过或清洗重试 |
-| **S5** | 1500 字符随机 \`base64url\` 串 | \`400 invalid_encrypted_content\` | 防止按长度放行的浅层假校验 |
+#### 维度二：Responses \`reasoning.encrypted_content\` S0–S5（鉴别是否纯透传）
+1. **先取真 blob**：首轮使用 \`store: false\` + 纯字符串 \`input\` + \`reasoning: { summary: "auto" }\` + \`include: ["reasoning.encrypted_content"]\`，在思考中植入会话代号 **\`AR-5\`**，提取前缀 \`gAAAAA\` 的 Fernet 密文块。
+2. **S1–S5 矩阵**：均携带 \`store: false\`，验证真 blob 续接记忆（S1 答出 \`AR-5\`）及篡改/伪造拦截（S2 改 1 字符、S3 \`"x"\`、S4 \`"AAAA"\`、S5 1500 随机串均期望 \`400 invalid_encrypted_content\`）。
 
 #### 判定标准
-- **真（官方 OpenAI / 真 Azure 纯透传）**：\`S0=200\`、\`S1=200 且答出 AR-5\`、\`S2–S5 全部 400\`、客户端可见 \`code: "invalid_encrypted_content"\`（或 \`could not be decrypted or parsed\`），且真 blob 具备 \`gAAAAA\` 前缀。
-- **疑似（上游真源但网关清洗错误体，非纯透传）**：\`S0/S1(AR-5)\` 通过且 \`S2–S5\` 全返回 \`400\`，但客户端只收到 \`upstream_error\` / \`Upstream request failed\` 等被网关重写后的报错，未原样透传 \`invalid_encrypted_content\`（此类情况网关上游极可能为真源，可在渠道自身日志核对）。
-- **假 / 未校验**：\`S2–S5\` 任意一轮返回 \`HTTP 200\`（吞掉伪块或遇到 \`invalid_encrypted_content\` 自动清洗重试变 200）、或拿不到真 blob / \`S1\` 答不出 \`AR-5\`。
-- **无法判定**：限流、余额不足、账号鉴权失败或不支持 Responses reasoning 的旧模型错误。`;
+- **真（真 Azure 纯透传，100 分）**：命中 Azure 原生硬指纹，且 \`S0=200\`、\`S1=200 答出 AR-5\`、\`S2–S5 全部 400 invalid_encrypted_content\`，真 blob 前缀 \`gAAAAA\`。
+- **真（真 Azure · 多区中转网关已清洗 reasoning，80–88 分）**：命中多层 Azure 原生硬指纹（如 \`x-ms-*\` / \`apim-request-id\` + 动态 \`content_filters\`）并拿到真 \`gAAAAA\` 密文块，仅因上游多区/多订阅中转网关为防跨区解密报错而清洗了客户端回传的 \`encrypted_content\`，导致 S1–S5 返回 200（底层为正版微软 Azure，非纯透传）。
+- **真（官方 OpenAI / 纯透传 Responses，100 分，附提醒）**：完整通过 S0–S5 且拿齐 \`gAAAAA\` 与 \`invalid_encrypted_content\`，但全程未见 \`x-ms-*\` 与 \`content_filters\`（多为 OpenAI 官方直连或网关剥离了 Azure 标识）。
+- **疑似**：命中部分 Azure 指纹但未返回 \`encrypted_content\`，或 S2–S5 返回 400 但错误体被网关清洗改写。
+- **假 / 未校验**：既无 Azure 原生硬指纹，又拿不到 \`gAAAAA\` 或 S2–S5 被静默吞掉返回 200 / S1 答不出 \`AR-5\`。
+- **无法判定**：限流、超时、5xx、余额不足、账号鉴权失败或模型不支持 Responses reasoning。`;
 
 const AWSB_METHODOLOGY_MD = `### 鉴定原理（AWS Bedrock 纯透传黄金口径：S1–S8 Thinking 签名校验）
 
@@ -159,9 +152,9 @@ export const BUILTIN_CHANNELS = [
     platform_hint: "openai",
     protocol: "openai_responses",
     sort_order: 2,
-    builtin_version: 2,
+    builtin_version: 3,
     pass_ratio: 1,
-    summary: "通过 OpenAI Responses (/v1/responses) S0–S5 reasoning.encrypted_content 加密块续接（AR-5 记忆校验）与篡改拦截矩阵，鉴别官方 OpenAI / 真 Azure 纯透传、清洗网关与假源。",
+    summary: "结合微软 Azure 原生硬指纹（x-ms-* / apim-request-id / 动态 content_filters）与 Responses (/v1/responses) S0–S5 reasoning.encrypted_content 校验，精准区分真 Azure 纯透传、真 Azure 多区清洗中转、OpenAI 官转与假源。",
     methodology_md: AZ_GPT_METHODOLOGY_MD,
     probes: [
       {
@@ -171,7 +164,7 @@ export const BUILTIN_CHANNELS = [
         runner: "resp_enc_s0",
         rounds: 2,
         enabled: true,
-        request_desc: "向 POST /v1/responses 发送不带 reasoning 的最小纯字符串请求（连测 2 轮）",
+        request_desc: "向 POST /v1/responses 发送不带 reasoning 的最小纯字符串请求（连测 2 轮），同步采集 Azure 原生响应头与 content_filters 指纹",
         expect_desc: "两轮均返回 HTTP 200 且包含合法 Responses 输出结构",
         request_body: { input: "请只回复 OK 两个字母。" },
         fallback_on_200: null,
@@ -189,9 +182,10 @@ export const BUILTIN_CHANNELS = [
         runner: "resp_enc_seed",
         rounds: 1,
         enabled: true,
-        request_desc: "纯字符串 input + reasoning: { summary: \"auto\" } + include: [\"reasoning.encrypted_content\"]，在思考中记住会话代号 AR-5 并提取真 blob",
-        expect_desc: "HTTP 200 且拿到前缀为 gAAAAA、长度 1500+ 字符的 reasoning.encrypted_content（取不到即终止）",
+        request_desc: "store: false + 纯字符串 input + reasoning: { summary: \"auto\" } + include: [\"reasoning.encrypted_content\"]，在思考中记住会话代号 AR-5 并提取真 blob",
+        expect_desc: "HTTP 200 且拿到前缀为 gAAAAA、长度 1500+ 字符的 reasoning.encrypted_content（同步记录 Azure 原生指纹）",
         request_body: {
+          store: false,
           input: "请先思考并计算 137 × 29 的结果，同时在内部思考中牢记本轮会话代号 AR-5。思考完成后对外正式回复请只输出 READY，不要提及代号。",
           reasoning: { summary: "auto" },
           include: ["reasoning.encrypted_content"],
@@ -1566,11 +1560,120 @@ export function responseHasInvalidEnc(json, rawText) {
   return /invalid_encrypted_content|could not be decrypted or parsed/i.test(String(rawText || ""));
 }
 
+const AZURE_HEADER_KEYS = [
+  "apim-request-id",
+  "x-ms-region",
+  "x-ms-aoai-configured-data-retention-days",
+  "x-ms-served-model",
+  "x-ms-is-spilled-over",
+  "x-ms-rai-invoked",
+  "azureml-model-session",
+];
+
+export function extractAzureFingerprint(headers, json, rawText) {
+  const hdrs = headers && typeof headers === "object" ? headers : {};
+  const lowerHeaders = {};
+  for (const [k, v] of Object.entries(hdrs)) {
+    lowerHeaders[String(k).toLowerCase()] = String(v ?? "").trim();
+  }
+  const azHeaders = [];
+  for (const key of AZURE_HEADER_KEYS) {
+    if (lowerHeaders[key]) azHeaders.push(key);
+  }
+  const azRegion = lowerHeaders["x-ms-region"] || "";
+  const azServedModel = lowerHeaders["x-ms-served-model"] || "";
+
+  let hasContentFilters = false;
+  let completionOffset = null;
+  const cf = json && typeof json === "object" && Array.isArray(json.content_filters) ? json.content_filters : null;
+  if (cf && cf.length > 0) {
+    const validEntries = cf.filter(
+      (item) =>
+        item &&
+        typeof item === "object" &&
+        (item.source_type === "prompt" || item.source_type === "completion") &&
+        item.content_filter_results &&
+        typeof item.content_filter_results === "object",
+    );
+    if (validEntries.length > 0) {
+      hasContentFilters = true;
+      const comp = validEntries.find((item) => item.source_type === "completion");
+      const endOff = comp?.content_filter_offsets?.end_offset;
+      if (typeof endOff === "number" && Number.isFinite(endOff) && endOff > 0) {
+        completionOffset = endOff;
+      }
+    }
+  } else if (
+    !json &&
+    /"content_filters"\s*:\s*\[/.test(String(rawText || "")) &&
+    /"content_filter_results"\s*:/.test(String(rawText || "")) &&
+    /"content_filter_offsets"\s*:/.test(String(rawText || ""))
+  ) {
+    hasContentFilters = true;
+  }
+
+  const hasAzureBodyExtras = Boolean(
+    json && typeof json === "object" && (Array.isArray(json.input_transformations) || "access_programs" in json),
+  );
+  const parsed = extractResponsesPayload(json, rawText);
+  const textLen = parsed.text ? parsed.text.length : 0;
+  const offsetMatchesText =
+    completionOffset !== null && textLen > 0 && Math.abs(completionOffset - textLen) <= 6;
+
+  return {
+    az_headers: azHeaders,
+    az_region: azRegion,
+    az_served_model: azServedModel,
+    az_has_content_filters: hasContentFilters,
+    az_has_body_extras: hasAzureBodyExtras,
+    az_completion_offset: completionOffset,
+    az_offset_matches_text: offsetMatchesText,
+  };
+}
+
+function summarizeAzureEvidence(steps) {
+  const headerSet = new Set();
+  const regionSet = new Set();
+  const servedModels = new Set();
+  const compOffsets = new Set();
+  let cfSteps = 0;
+  let offsetMatched = false;
+
+  for (const s of steps) {
+    if (!s || typeof s !== "object") continue;
+    const fp = s.az_fp && typeof s.az_fp === "object" ? s.az_fp : extractAzureFingerprint(s.response_headers, null, s.response_snippet);
+    for (const h of fp.az_headers || []) headerSet.add(h);
+    if (fp.az_region) regionSet.add(fp.az_region);
+    if (fp.az_served_model) servedModels.add(fp.az_served_model);
+    if (fp.az_has_content_filters) cfSteps++;
+    if (fp.az_completion_offset != null) compOffsets.add(fp.az_completion_offset);
+    if (fp.az_offset_matches_text) offsetMatched = true;
+  }
+
+  const strongHeaders =
+    headerSet.size >= 2 || headerSet.has("x-ms-region") || headerSet.has("apim-request-id");
+  const dynamicCf = cfSteps >= 1 && (offsetMatched || compOffsets.size >= 2 || cfSteps >= 2);
+  const parts = [];
+  if (regionSet.size > 0) parts.push(`x-ms-region=${[...regionSet].join("/")}`);
+  if (headerSet.has("apim-request-id")) parts.push("apim-request-id");
+  if (servedModels.size > 0) parts.push(`x-ms-served-model=${[...servedModels][0]}`);
+  if (cfSteps > 0) parts.push(`content_filters(${cfSteps}步${offsetMatched || compOffsets.size >= 2 ? "·动态偏移" : ""})`);
+
+  return {
+    headerCount: headerSet.size,
+    strongHeaders,
+    cfSteps,
+    dynamicCf,
+    regions: [...regionSet],
+    summaryText: parts.join(" · "),
+  };
+}
+
 function isRespEncEnvError(res) {
   const msg = `${extractResponseMessage(res?.json, res?.raw_text)}\n${res?.raw_text || ""}`;
   if (/invalid_encrypted_content|could not be decrypted or parsed/i.test(msg)) return false;
   const status = res?.http_status;
-  if (status === 429 || status === 401 || status === 403) return true;
+  if (!status || status === 0 || status >= 500 || status === 429 || status === 401 || status === 403) return true;
   if (/insufficient_quota|exceeded your current quota|billing_hard_limit|rate[_ ]limit|too many requests|Too many tokens/i.test(msg)) {
     return true;
   }
@@ -1595,6 +1698,9 @@ export function computeRespEncVerdict({ steps, channelName = "az gpt" }) {
   const seed = byRunner.resp_enc_seed;
   const s1 = byRunner.resp_enc_s1;
   const tamper = ["resp_enc_s2", "resp_enc_s3", "resp_enc_s4", "resp_enc_s5"].map((k) => byRunner[k]).filter(Boolean);
+  const az = summarizeAzureEvidence(steps);
+  const hasRealBlob = Boolean(seed && seed.status === "pass" && seed.blob_len >= 100 && seed.blob_prefix_ok);
+  const hasAzureHardEvidence = (az.strongHeaders && az.cfSteps >= 1) || (az.dynamicCf && hasRealBlob);
 
   const envStep = steps.find((s) => s.env_error || s.throttled);
   if (envStep) {
@@ -1603,17 +1709,35 @@ export function computeRespEncVerdict({ steps, channelName = "az gpt" }) {
       score,
       matched_count: matched,
       total_probes: total,
-      summary: `无法判定（限流 / 鉴权 / 模型不支持 Responses reasoning）：${envStep.name || "探测"} — ${envStep.reason || "环境错误"}`,
+      summary: `无法判定（限流 / 超时 / 鉴权 / 模型不支持 Responses reasoning）：${envStep.name || "探测"} — ${envStep.reason || "环境错误"}`,
     };
   }
 
   if (seed?.no_blob_200 || (seed?.status === "fail" && seed.http_status === 200 && !seed.blob_len)) {
+    if (az.strongHeaders && az.cfSteps >= 1) {
+      return {
+        verdict: "suspicious",
+        score: 65,
+        matched_count: matched,
+        total_probes: total,
+        summary: `判定为疑似真 Azure（未返回 encrypted_content）：命中微软 Azure 原生指纹（${az.summaryText}），但 Seed 未返回 reasoning.encrypted_content（可能网关未透传 include 参数或模型未开启思考密文），无法完成 S1–S5 透传度校验。`,
+      };
+    }
+    if (az.dynamicCf) {
+      return {
+        verdict: "suspicious",
+        score: 55,
+        matched_count: matched,
+        total_probes: total,
+        summary: `判定为疑似真 Azure（未见 x-ms-* 头且未返回 encrypted_content）：响应体含 Azure ${az.summaryText}，但 Seed 未拿到 reasoning.encrypted_content，建议人工核对上游渠道。`,
+      };
+    }
     return {
       verdict: "fake",
       score: 0,
       matched_count: matched,
       total_probes: total,
-      summary: `判定为假（未拿到 reasoning.encrypted_content）：${seed.reason || "HTTP 200 但没有加密思考块"}`,
+      summary: `判定为假（未拿到 reasoning.encrypted_content 且无 Azure 原生指纹）：${seed.reason || "HTTP 200 但没有加密思考块"}`,
     };
   }
   if (seed && seed.status !== "pass") {
@@ -1626,23 +1750,53 @@ export function computeRespEncVerdict({ steps, channelName = "az gpt" }) {
     };
   }
 
+  const s0ok = !s0 || s0.status === "pass";
+  const s1ok = Boolean(s1 && s1.status === "pass" && s1.s1_ar5_ok);
+  const allTamper400 =
+    tamper.length === 4 && tamper.every((s) => (s.round_statuses || []).length > 0 && (s.round_statuses || []).every((c) => c === 400));
+  const allHaveCode = tamper.every((s) => s.has_invalid_enc_code);
+  const prefixOk = Boolean(seed?.blob_prefix_ok);
+
   const swallowed = tamper.filter((s) => s.any_200 || (s.round_statuses || []).some((c) => c === 200));
   if (swallowed.length > 0) {
+    if (s0ok && hasAzureHardEvidence) {
+      const cleanedScore = az.strongHeaders ? 88 : 80;
+      const modeNote = s1ok
+        ? "S1 答出 AR-5（单轮真密文可续接），但篡改场景被网关清洗重试为 200"
+        : "中转网关为多区/多订阅轮询容灾剥离了入站 encrypted_content，故 S1 无法续接且 S2–S5 返回 200";
+      return {
+        verdict: "authentic",
+        score: cleanedScore,
+        matched_count: matched,
+        total_probes: total,
+        summary: `判定为真（真 Azure · 多区中转已清洗 reasoning，非纯透传）：命中微软 Azure 原生指纹（${az.summaryText}）并采集到真 gAAAAA 加密思考块（${seed.blob_len} 字符）；${modeNote}。底层为正版 Azure，仅多轮复杂思考链可能无法跨轮续接。`,
+      };
+    }
     return {
       verdict: "fake",
       score,
       matched_count: matched,
       total_probes: total,
-      summary: `判定为假（未校验 encrypted_content）：「${swallowed.map((s) => s.name).join("、")}」返回 HTTP 200，伪造/篡改块被吞掉。`,
+      summary: `判定为假（未校验 encrypted_content 且无 Azure 原生硬指纹）：「${swallowed.map((s) => s.name).join("、")}」返回 HTTP 200，伪造/篡改块被吞掉。`,
     };
   }
+
   if (s1?.s1_wrong_answer || (s1?.status === "fail" && (s1.round_statuses || []).every((c) => c === 200) && !s1.s1_ar5_ok)) {
+    if (s0ok && hasAzureHardEvidence) {
+      return {
+        verdict: "authentic",
+        score: az.strongHeaders ? 85 : 78,
+        matched_count: matched,
+        total_probes: total,
+        summary: `判定为真（真 Azure · 网关清洗/跨区导致 S1 未续接）：命中微软 Azure 原生指纹（${az.summaryText}）并采集到真 gAAAAA 加密思考块（${seed.blob_len} 字符），但 S1 未答出 AR-5（多为多区池切区或网关剥离入站 reasoning）。`,
+      };
+    }
     return {
       verdict: "fake",
       score,
       matched_count: matched,
       total_probes: total,
-      summary: `判定为假（真 blob 回传后未答出 AR-5）：${s1.reason || "明文历史不含代号，上游没有解密续接"}`,
+      summary: `判定为假（真 blob 回传后未答出 AR-5 且无 Azure 原生硬指纹）：${s1.reason || "明文历史不含代号，上游没有解密续接"}`,
     };
   }
 
@@ -1653,7 +1807,7 @@ export function computeRespEncVerdict({ steps, channelName = "az gpt" }) {
       score,
       matched_count: matched,
       total_probes: total,
-      summary: `无法判定：「${unstable.map((s) => s.name).join("、")}」两轮状态不一致（${unstable.map((s) => (s.round_statuses || []).join("/")).join("；")}），疑似抖动或混池，请重试。`,
+      summary: `无法判定：「${unstable.map((s) => s.name).join("、")}」两轮状态不一致（${unstable.map((s) => (s.round_statuses || []).join("/")).join("；")}），疑似抖动或混池，请重试。${az.summaryText ? `（期间命中 Azure 特征：${az.summaryText}）` : ""}`,
     };
   }
 
@@ -1667,20 +1821,17 @@ export function computeRespEncVerdict({ steps, channelName = "az gpt" }) {
     };
   }
 
-  const s0ok = !s0 || s0.status === "pass";
-  const s1ok = Boolean(s1 && s1.status === "pass" && s1.s1_ar5_ok);
-  const allTamper400 =
-    tamper.length === 4 && tamper.every((s) => (s.round_statuses || []).length > 0 && (s.round_statuses || []).every((c) => c === 400));
-  const allHaveCode = tamper.every((s) => s.has_invalid_enc_code);
-  const prefixOk = Boolean(seed?.blob_prefix_ok);
-
   if (s0ok && s1ok && allTamper400 && allHaveCode && prefixOk) {
+    const azTag =
+      az.strongHeaders || az.cfSteps > 0
+        ? `真 Azure 纯透传（${az.summaryText}）`
+        : "官方 OpenAI / 纯透传 Responses（未见 Azure x-ms-* 与 content_filters，请核对是否为 OpenAI 官转）";
     return {
       verdict: "authentic",
       score: 100,
       matched_count: matched,
       total_probes: total,
-      summary: `判定为真（官方 OpenAI / 真 Azure 纯透传）：S0=200，S1=200 且答出 AR-5，S2–S5 全部 400 且带 invalid_encrypted_content，真 blob 前缀 gAAAAA（${seed.blob_len} 字符）。`,
+      summary: `判定为真（${azTag}）：S0=200，S1=200 且答出 AR-5，S2–S5 全部 400 且带 invalid_encrypted_content，真 blob 前缀 gAAAAA（${seed.blob_len} 字符）。`,
     };
   }
   if (s0ok && s1ok && allTamper400 && !allHaveCode) {
@@ -1689,7 +1840,7 @@ export function computeRespEncVerdict({ steps, channelName = "az gpt" }) {
       score: Math.max(score, 70),
       matched_count: matched,
       total_probes: total,
-      summary: `判定为疑似（上游像真源，但网关清洗了错误体）：S0/S1(AR-5) 通过且 S2–S5 全部 400，客户端未见 invalid_encrypted_content / could not be decrypted or parsed，只看到被改写的报错。请在渠道日志核对，不要据此判假。`,
+      summary: `判定为疑似（上游像真源，但网关清洗了错误体${az.summaryText ? ` · 命中 ${az.summaryText}` : ""}）：S0/S1(AR-5) 通过且 S2–S5 全部 400，客户端未见 invalid_encrypted_content / could not be decrypted or parsed，只看到被改写的报错。请在渠道日志核对，不要据此判假。`,
     };
   }
   if (s1ok && allTamper400 && allHaveCode && !prefixOk) {
@@ -2737,6 +2888,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     if (reasoningId) reasoning.id = reasoningId;
     const safeAssistant = respEncAnswerHasAr5(assistantText) ? "READY" : assistantText || "READY";
     return {
+      store: false,
       input: [
         reasoning,
         { role: "assistant", content: [{ type: "output_text", text: safeAssistant }] },
@@ -2784,6 +2936,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         };
       }
       const extracted = extractResponsesPayload(res.json, res.raw_text);
+      const seedAzFp = extractAzureFingerprint(res.headers, res.json, res.raw_text);
       if (res.http_status !== 200 || !extracted.blob) {
         const noBlob = res.http_status === 200;
         return {
@@ -2793,8 +2946,9 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
             http_status: res.http_status,
             round_statuses: [res.http_status],
             latency_ms: res.latency_ms,
+            az_fp: seedAzFp,
             reason: noBlob
-              ? "HTTP 200 但响应没有 reasoning.encrypted_content，无法继续 S1–S5"
+              ? `HTTP 200 但响应没有 reasoning.encrypted_content，无法继续 S1–S5${seedAzFp.az_region ? `（命中 Azure ${seedAzFp.az_region}）` : seedAzFp.az_has_content_filters ? "（命中 Azure content_filters）" : ""}`
               : `采集真 blob 失败（HTTP ${res.http_status}）：${extractResponseMessage(res.json, res.raw_text).slice(0, 160)}`,
             request_url: res.url,
             request_body: res.request_body,
@@ -2811,6 +2965,11 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         assistantText,
       };
       const prefixOk = extracted.blob.startsWith("gAAAAA");
+      const azHint = seedAzFp.az_region
+        ? ` · Azure(${seedAzFp.az_region}${seedAzFp.az_has_content_filters ? "+CF" : ""})`
+        : seedAzFp.az_has_content_filters
+          ? " · Azure(content_filters)"
+          : "";
       return {
         stepPatch: {
           status: "pass",
@@ -2820,7 +2979,8 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
           blob_len: extracted.blob.length,
           blob_prefix_ok: prefixOk,
           strong_hit: prefixOk,
-          reason: `已采集 encrypted_content（${extracted.blob.length} 字符${prefixOk ? "，前缀 gAAAAA" : "，前缀不是 gAAAAA"}）${extracted.reasoningId ? ` · ${extracted.reasoningId}` : ""}`,
+          az_fp: seedAzFp,
+          reason: `已采集 encrypted_content（${extracted.blob.length} 字符${prefixOk ? "，前缀 gAAAAA" : "，前缀不是 gAAAAA"}）${extracted.reasoningId ? ` · ${extracted.reasoningId}` : ""}${azHint}`,
           request_url: res.url,
           request_body: res.request_body,
           response_headers: res.headers,
@@ -2882,6 +3042,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
 
     const statuses = roundResults.map((r) => r.http_status);
     const last = roundResults[roundResults.length - 1];
+    const lastAzFp = extractAzureFingerprint(last.headers, last.json, last.raw_text);
     const totalMs = roundResults.reduce((sum, r) => sum + (r.latency_ms || 0), 0);
     const roundConflict = new Set(statuses).size > 1;
     const basePatch = {
@@ -2889,6 +3050,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       round_statuses: statuses,
       round_conflict: roundConflict,
       latency_ms: totalMs,
+      az_fp: lastAzFp,
       request_url: last.url,
       request_body: last.request_body,
       response_headers: last.headers,
@@ -2908,12 +3070,18 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
 
     if (runner === "resp_enc_s0") {
       const ok = statuses.every((c) => c === 200) && roundResults.every((r) => r.json && (r.json.id || r.json.output));
+      const azTag = lastAzFp.az_region
+        ? ` · Azure(${lastAzFp.az_region}${lastAzFp.az_has_content_filters ? "+CF" : ""})`
+        : lastAzFp.az_has_content_filters
+          ? " · Azure(content_filters)"
+          : "";
       return {
         stepPatch: {
           ...basePatch,
           status: ok ? "pass" : "fail",
+          strong_hit: Boolean(ok && (lastAzFp.az_headers.length > 0 || lastAzFp.az_has_content_filters)),
           reason: ok
-            ? `HTTP ${statuses.join(" / ")}，Responses 基础请求可用`
+            ? `HTTP ${statuses.join(" / ")}，Responses 基础请求可用${azTag}`
             : `S0 期望 HTTP 200 的 Responses 输出，实际 ${statuses.join(" / ")}：${extractResponseMessage(last.json, last.raw_text).slice(0, 140)}`,
         },
         abort: false,
@@ -3165,17 +3333,23 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     }
     try {
       const hasGenericBaseline = enabledProbes.some((p) => probeFamily(p) === "generic" && p.kind === "baseline");
+      const wave0 = [];
       const wave1 = [];
       const wave2 = [];
       for (let i = 0; i < enabledProbes.length; i++) {
         const probe = enabledProbes[i];
         const runner = String(probe.runner || "");
+        if (runner === "resp_enc_s0") {
+          wave0.push(i);
+          continue;
+        }
         const waitsForGate =
           (runner.startsWith("awsb_") && runner !== "awsb_seed") ||
-          (runner.startsWith("resp_enc_") && runner !== "resp_enc_seed" && runner !== "resp_enc_s0") ||
+          (runner.startsWith("resp_enc_") && runner !== "resp_enc_seed") ||
           (probeFamily(probe) === "generic" && probe.kind !== "baseline" && hasGenericBaseline);
         (waitsForGate ? wave2 : wave1).push(i);
       }
+      await mapPool(wave0, runProbeAt);
       await mapPool(wave1, runProbeAt);
       await mapPool(wave2, runProbeAt);
 
