@@ -379,8 +379,49 @@ export type ProxyItem = {
   port: number;
 };
 
+export type BasicTestProtocol = "auto" | "openai_chat" | "openai_responses" | "anthropic_messages" | "gemini_native";
+
+export type BasicModelResult = {
+  model: string;
+  status: "pending" | "running" | "pass" | "fail";
+  protocol_used: string;
+  fallback_used: boolean;
+  http_status: number | null;
+  latency_ms: number | null;
+  reason: string;
+  response_model: string;
+  request_url: string;
+  response_snippet: string;
+};
+
+export type BasicTestRun = {
+  id: string;
+  account_id: number;
+  account_name: string;
+  base_url: string;
+  sk_masked: string;
+  sk_source: string;
+  has_saved_key?: boolean;
+  protocol: BasicTestProtocol;
+  models_endpoint: string;
+  concurrency: number;
+  status: "running" | "done" | "error";
+  total_models: number;
+  completed_models: number;
+  passed_count: number;
+  failed_count: number;
+  passed_models: string[];
+  failed_models: string[];
+  summary: string;
+  started_at: string;
+  finished_at: string | null;
+  duration_ms: number;
+  results?: BasicModelResult[];
+};
+
 export type ManualVerifyQuickAddContext = {
   runId: string;
+  sourceType?: "verify" | "basic";
   baseUrl: string;
   apiKey?: string;
   skMasked?: string;
@@ -392,4 +433,8 @@ export type ManualVerifyQuickAddContext = {
   model: string;
   verdict: VerifyVerdict;
   availableModels?: string[];
+  presetModels?: string[];
+  passedCount?: number;
+  failedCount?: number;
+  totalCount?: number;
 };

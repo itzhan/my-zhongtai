@@ -9,6 +9,7 @@ import type {
   Account,
   AccountTemplate,
   Alert,
+  BasicTestRun,
   Customer,
   CustomerOverview,
   Group,
@@ -45,6 +46,8 @@ export const qk = {
   verifyInspectBatch: (ids: string) => ["ops", "verify-inspect", "batch", ids] as const,
   verifyRuns: (q: string) => ["ops", "verify-runs", q] as const,
   verifyRun: (id: string) => ["ops", "verify-run", id] as const,
+  basicRuns: ["ops", "basic-runs"] as const,
+  basicRun: (id: string) => ["ops", "basic-run", id] as const,
   accountTemplates: ["ops", "account-templates"] as const,
   proxies: ["ops", "proxies"] as const,
 };
@@ -165,6 +168,31 @@ export function useVerifyRun(runId: string | null) {
   useEffect(() => {
     if (status === "done" || status === "error") {
       void qc.invalidateQueries({ queryKey: ["ops", "verify-runs"] });
+    }
+  }, [status, qc]);
+  return q;
+}
+
+// 模型基础连通测试（非真假检测）
+export const useBasicTestRuns = () =>
+  useQuery({
+    queryKey: qk.basicRuns,
+    queryFn: () => get<BasicTestRun[]>("/verify/basic-runs"),
+    placeholderData: keepPreviousData,
+  });
+
+export function useBasicTestRun(runId: string | null) {
+  const qc = useQueryClient();
+  const q = useQuery({
+    queryKey: qk.basicRun(runId ?? ""),
+    queryFn: () => get<BasicTestRun>(`/verify/basic-runs/${runId}`),
+    enabled: Boolean(runId),
+    refetchInterval: (query) => (query.state.data?.status === "running" ? 600 : false),
+  });
+  const status = q.data?.status;
+  useEffect(() => {
+    if (status === "done" || status === "error") {
+      void qc.invalidateQueries({ queryKey: ["ops", "basic-runs"] });
     }
   }, [status, qc]);
   return q;

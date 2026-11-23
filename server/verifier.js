@@ -4306,5 +4306,6 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
 
   return {
     getManualRunKey: resolveManualRunKey,
+    resolveAccountContext,
   };
 }

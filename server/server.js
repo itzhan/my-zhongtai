@@ -13,6 +13,7 @@ import { registerMonitor } from "./monitor.js";
 import { registerSuppliers } from "./suppliers.js";
 import { registerTraffic } from "./traffic.js";
 import { registerVerifier } from "./verifier.js";
+import { registerBasicTester } from "./basic-tester.js";
 import { registerAccountTemplates } from "./account-templates.js";
 import ExcelJS from "exceljs";
 
@@ -1108,11 +1109,14 @@ async function s2WriteAccount(method, endpoint, b, creating) {
 }
 
 let verifierApi = null;
+let basicTesterApi = null;
 
 app.post("/api/accounts", wrap(async (req) => {
   const b = { ...(req.body || {}) };
-  if (!String(b.api_key || "").trim() && b.source_verify_run_id && verifierApi) {
-    const saved = verifierApi.getManualRunKey(b.source_verify_run_id, b.base_url);
+  if (!String(b.api_key || "").trim() && b.source_verify_run_id) {
+    const saved =
+      verifierApi?.getManualRunKey(b.source_verify_run_id, b.base_url) ||
+      basicTesterApi?.getManualRunKey(b.source_verify_run_id, b.base_url);
     if (saved) b.api_key = saved;
   }
   const { data: a, warnings } = await s2WriteAccount("POST", "/admin/accounts", b, true);
@@ -1429,6 +1433,7 @@ registerMonitor({ app, wrap, pool, getAccounts, httpError, ERROR_CLASS_SQL });
 registerSuppliers({ app, wrap, httpError, dataDir: DATA_DIR, jobs: !READONLY });
 registerTraffic({ app, wrap, httpError, dataDir: DATA_DIR, readonly: READONLY, mainKey: S2_KEY });
 verifierApi = registerVerifier({ app, wrap, httpError, dataDir: DATA_DIR, s2, pool, getAccounts, detector });
+basicTesterApi = registerBasicTester({ app, wrap, httpError, dataDir: DATA_DIR, verifierApi });
 registerAccountTemplates({ app, wrap, httpError, dataDir: DATA_DIR });
 
 app.get("/healthz", (req, res) => res.json({ ok: true }));

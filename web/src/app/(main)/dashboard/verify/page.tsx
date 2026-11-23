@@ -6,12 +6,14 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Embedded, PageHeader, useTabParam } from "@/modules/ops/components/shared";
 import type { VerifyPreset } from "@/modules/ops/types";
 import { AccountTemplatesView } from "@/modules/ops/views/account-templates-view";
+import { BasicTestView } from "@/modules/ops/views/basic-test-view";
 import { VerifyHistoryView } from "@/modules/ops/views/verify-history-view";
 import { VerifyMethodsView } from "@/modules/ops/views/verify-methods-view";
 import { VerifyRunView } from "@/modules/ops/views/verify-run-view";
 
 const TABS = [
   ["run", "开始鉴定"],
+  ["basic", "基础连通测试"],
   ["history", "鉴定记录"],
   ["templates", "录入模板"],
   ["methods", "方法论配置"],
@@ -27,7 +29,10 @@ function VerifyInner() {
 
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader title="渠道鉴定" description="渠道真伪检测 · URL 预检一键录入 · 录入模板与方法论配置" />
+      <PageHeader
+        title="渠道鉴定"
+        description="渠道真伪检测 · 全模型基础连通测试 · URL 预检一键录入 · 录入模板与方法论配置"
+      />
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           {TABS.map(([k, l]) => (
@@ -47,6 +52,8 @@ function VerifyInner() {
             }}
             onOpenTemplates={() => setTab("templates")}
           />
+        ) : tab === "basic" ? (
+          <BasicTestView onOpenTemplates={() => setTab("templates")} />
         ) : tab === "history" ? (
           <VerifyHistoryView
             onRerunPreset={(preset) => {

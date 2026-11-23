@@ -62,7 +62,26 @@ export type AccountFormInitialValues = {
   saved_key_masked?: string;
   platform?: string;
   notes?: string;
+  preset_models?: string[];
 };
+
+function buildPresetModelMapping(presetModels: string[], tplMapping?: Record<string, string>): [string, string][] {
+  const passedSet = new Set(presetModels);
+  const rows: [string, string][] = presetModels.map((m) => [m, m]);
+  const seenKeys = new Set(presetModels);
+  if (tplMapping && typeof tplMapping === "object") {
+    for (const [reqModel, upModel] of Object.entries(tplMapping)) {
+      const req = reqModel.trim();
+      const up = (upModel || reqModel).trim();
+      if (!req || !up || seenKeys.has(req)) continue;
+      if (passedSet.has(up)) {
+        rows.push([req, up]);
+        seenKeys.add(req);
+      }
+    }
+  }
+  return rows;
+}
 
 const KNOWN_CRED_KEYS = [
   "base_url",
@@ -151,12 +170,14 @@ export function ModelMappingEditor({
   mapping,
   onChange,
   availableModels,
+  availableModelsLabel,
   title = "模型映射",
   description = "左边是客户请求的模型，右边是发给上游的模型；相同则只是允许该模型",
 }: {
   mapping: [string, string][];
   onChange: (next: [string, string][]) => void;
   availableModels?: string[];
+  availableModelsLabel?: string;
   title?: string;
   description?: string;
 }) {
@@ -181,7 +202,7 @@ export function ModelMappingEditor({
           <CardAction className="flex flex-wrap gap-1">
             {availableModels && availableModels.length > 0 ? (
               <Button type="button" size="sm" variant="outline" onClick={() => addModels(availableModels)}>
-                ＋ 本次拉取模型 ({availableModels.length})
+                ＋ {availableModelsLabel || "本次拉取模型"} ({availableModels.length})
               </Button>
             ) : null}
             <Button type="button" size="sm" variant="outline" onClick={() => addModels(CLAUDE_MODELS)}>
@@ -461,8 +482,15 @@ export function AccountForm({
     other: JSON.stringify(stripKeys(c, KNOWN_CRED_KEYS), null, 2),
     extraOther: JSON.stringify(stripKeys(a?.extra, KNOWN_EXTRA_KEYS), null, 2),
   });
+  const rawPresetModels = initialValues?.preset_models;
+  const presetModels = useMemo(
+    () => (rawPresetModels ? [...new Set(rawPresetModels.map((m) => m.trim()).filter(Boolean))] : []),
+    [rawPresetModels],
+  );
   const [groupIds, setGroupIds] = useState<Set<number>>(new Set(a?.group_ids ?? (presetGroup ? [presetGroup] : [])));
-  const [mapping, setMapping] = useState<[string, string][]>(Object.entries(c.model_mapping || {}));
+  const [mapping, setMapping] = useState<[string, string][]>(() =>
+    a ? Object.entries(c.model_mapping || {}) : presetModels.length > 0 ? buildPresetModelMapping(presetModels) : [],
+  );
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>("none");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [showKey, setShowKey] = useState(false);
@@ -496,7 +524,7 @@ export function AccountForm({
         other: "{}",
         extraOther: "{}",
       }));
-      setMapping([]);
+      setMapping(presetModels.length > 0 ? buildPresetModelMapping(presetModels) : []);
       setGroupIds(new Set(presetGroup ? [presetGroup] : []));
       return;
     }
@@ -524,7 +552,11 @@ export function AccountForm({
       other: JSON.stringify(cfg.credentials_other || {}, null, 2),
       extraOther: JSON.stringify(cfg.extra_other || {}, null, 2),
     }));
-    setMapping(Object.entries(cfg.model_mapping || {}));
+    setMapping(
+      presetModels.length > 0
+        ? buildPresetModelMapping(presetModels, cfg.model_mapping)
+        : Object.entries(cfg.model_mapping || {}),
+    );
     const nextGroups = new Set<number>(
       (cfg.group_ids || []).filter((id) => validGroupIdSet.size === 0 || validGroupIdSet.has(id)),
     );
@@ -1029,8 +1061,11 @@ export function AccountForm({
                     </Badge>
                   ) : null}
                   {mapping.length > 0 ? (
-                    <Badge variant="outline" className="font-normal">
-                      模型映射 {mapping.length} 条
+                    <Badge
+                      variant="outline"
+                      className={cn("font-normal", presetModels.length > 0 && "border-success/40 text-success")}
+                    >
+                      {presetModels.length > 0 ? `仅通的模型 ${mapping.length} 条` : `模型映射 ${mapping.length} 条`}
                     </Badge>
                   ) : null}
                 </div>
@@ -1054,7 +1089,12 @@ export function AccountForm({
                 </CardContent>
               </Card>
 
-              <ModelMappingEditor mapping={mapping} onChange={setMapping} availableModels={availableModels} />
+              <ModelMappingEditor
+                mapping={mapping}
+                onChange={setMapping}
+                availableModels={availableModels}
+                availableModelsLabel={presetModels.length > 0 ? "本次测通模型" : undefined}
+              />
               {scheduleCard}
               {advancedCard}
             </CollapsibleContent>
@@ -1093,7 +1133,12 @@ export function AccountForm({
             </CardContent>
           </Card>
 
-          <ModelMappingEditor mapping={mapping} onChange={setMapping} availableModels={availableModels} />
+          <ModelMappingEditor
+            mapping={mapping}
+            onChange={setMapping}
+            availableModels={availableModels}
+            availableModelsLabel={presetModels.length > 0 ? "本次测通模型" : undefined}
+          />
           {scheduleCard}
           {advancedCard}
         </>
