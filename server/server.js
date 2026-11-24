@@ -166,6 +166,13 @@ async function getUserKeys(userId) {
 }
 
 // ---------- 鉴权 ----------
+const SESSION_TTL_DAYS = Math.max(1, Number(env("SESSION_TTL_DAYS", 30)) || 30);
+const SESSION_TTL_SEC = Math.round(SESSION_TTL_DAYS * 86400);
+const SESSION_TTL_MS = SESSION_TTL_SEC * 1000;
+// 滑动自动续签节流：剩余有效期低于 (30天 - 1小时) 即自动续签完整 30 天，
+// 既避免高频轮询重复下发 Set-Cookie，又兼容旧 12h 登录态在下次请求时自动无感升级为 30 天。
+const SESSION_RENEW_INTERVAL_MS = Math.min(3600_000, Math.floor(SESSION_TTL_MS / 2));
+
 function sign(payload) {
   const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const mac = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
@@ -187,6 +194,27 @@ function verify(token) {
 function readCookie(req, name) {
   const m = (req.headers.cookie || "").split(/;\s*/).find((c) => c.startsWith(name + "="));
   return m ? decodeURIComponent(m.slice(name.length + 1)) : null;
+}
+function isHttpsRequest(req) {
+  const proto = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  return proto === "https" || Boolean(req.secure);
+}
+function issueSessionCookie(req, res, user = "admin", now = Date.now()) {
+  const token = sign({ u: user, iat: now, exp: now + SESSION_TTL_MS });
+  const secureFlag = isHttpsRequest(req) ? "; Secure" : "";
+  res.append("Set-Cookie", `ops_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_SEC}${secureFlag}`);
+  return token;
+}
+function clearSessionCookie(req, res) {
+  const secureFlag = isHttpsRequest(req) ? "; Secure" : "";
+  res.append("Set-Cookie", `ops_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secureFlag}`);
+}
+function shouldRenewSession(session, now = Date.now()) {
+  if (!session || typeof session.exp !== "number") return false;
+  return session.exp - now < SESSION_TTL_MS - SESSION_RENEW_INTERVAL_MS;
 }
 // 登录经 Next 反代：X-Forwarded-For 最右侧才是代理看到的真实客户端；取左侧可被请求头伪造，限流形同虚设
 function clientIp(req) {
@@ -290,17 +318,19 @@ app.post("/api/login", (req, res) => {
   }
   if (totpRes.key) usedTotpCodes.set(totpRes.key, Date.now() + 90_000);
   loginAttempts.delete(ip);
-  const token = sign({ u: "admin", exp: Date.now() + 12 * 3600_000 });
-  const secureFlag = req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
-  res.setHeader("Set-Cookie", `ops_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${12 * 3600}${secureFlag}`);
+  issueSessionCookie(req, res, "admin");
   res.json({ ok: true });
 });
 app.post("/api/logout", (req, res) => {
-  res.setHeader("Set-Cookie", "ops_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+  clearSessionCookie(req, res);
   res.json({ ok: true });
 });
 app.use("/api", (req, res, next) => {
-  if (!verify(readCookie(req, "ops_session"))) return res.status(401).json({ error: "未登录", code: "SESSION_UNAUTHORIZED" });
+  const session = verify(readCookie(req, "ops_session"));
+  if (!session) return res.status(401).json({ error: "未登录", code: "SESSION_UNAUTHORIZED" });
+  if (shouldRenewSession(session)) {
+    issueSessionCookie(req, res, session.u || "admin");
+  }
   next();
 });
 
