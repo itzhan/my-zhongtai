@@ -52,16 +52,20 @@ function isResponsesPreferredModel(model) {
   return /^(gpt|o1|o3|o4|codex)/.test(m) && (m.includes("codex") || /(?:^|-)pro(?:-|$)/.test(m));
 }
 
-export function pickPrimaryProtocol(model, requestedProtocol = "auto", modelsEndpoint = "") {
+export function pickPrimaryProtocol(model, requestedProtocol = "auto", modelsEndpoint = "", preferProtocol = "") {
   if (requestedProtocol && requestedProtocol !== "auto" && VALID_PROTOCOLS.has(requestedProtocol)) {
     return requestedProtocol;
   }
   const m = String(model || "").trim().toLowerCase();
-  if (/(?:^|\/|\.)(claude|opus|sonnet|haiku)|claude-/.test(m)) {
+  if (/(?:^|\/|\.)(claude|opus|sonnet|haiku|fable)|claude-/.test(m)) {
     return "anthropic_messages";
   }
   if (/gemini/.test(m)) {
-    return /v1beta/i.test(modelsEndpoint) ? "gemini_native" : "openai_chat";
+    if (preferProtocol === "gemini_native" || /v1beta/i.test(modelsEndpoint)) return "gemini_native";
+    return "openai_chat";
+  }
+  if (preferProtocol === "openai_responses" && /^(gpt|o1|o3|o4|codex|chatgpt)/.test(m)) {
+    return "openai_responses";
   }
   if (isResponsesPreferredModel(m)) {
     return "openai_responses";
@@ -295,10 +299,11 @@ export async function testSingleModel({
   model,
   protocol = "auto",
   modelsEndpoint = "",
+  preferProtocol = "",
   fetchImpl = fetch,
   timeoutMs = MODEL_TIMEOUT_MS,
 }) {
-  const primary = pickPrimaryProtocol(model, protocol, modelsEndpoint);
+  const primary = pickPrimaryProtocol(model, protocol, modelsEndpoint, preferProtocol);
   let usedProtocol = primary;
   let fallbackUsed = false;
 

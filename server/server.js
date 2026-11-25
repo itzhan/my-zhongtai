@@ -13,7 +13,7 @@ import { registerMonitor } from "./monitor.js";
 import { registerSuppliers } from "./suppliers.js";
 import { registerTraffic } from "./traffic.js";
 import { registerVerifier } from "./verifier.js";
-import { registerBasicTester } from "./basic-tester.js";
+import { registerBasicTester, testSingleModel } from "./basic-tester.js";
 import { registerAccountTemplates } from "./account-templates.js";
 import ExcelJS from "exceljs";
 
@@ -1462,7 +1462,7 @@ app.get("/api/billing/export", async (req, res) => {
 registerMonitor({ app, wrap, pool, getAccounts, httpError, ERROR_CLASS_SQL });
 registerSuppliers({ app, wrap, httpError, dataDir: DATA_DIR, jobs: !READONLY });
 registerTraffic({ app, wrap, httpError, dataDir: DATA_DIR, readonly: READONLY, mainKey: S2_KEY });
-verifierApi = registerVerifier({ app, wrap, httpError, dataDir: DATA_DIR, s2, pool, getAccounts, detector });
+verifierApi = registerVerifier({ app, wrap, httpError, dataDir: DATA_DIR, s2, pool, getAccounts, detector, testSingleModel });
 basicTesterApi = registerBasicTester({ app, wrap, httpError, dataDir: DATA_DIR, verifierApi });
 registerAccountTemplates({ app, wrap, httpError, dataDir: DATA_DIR });
 

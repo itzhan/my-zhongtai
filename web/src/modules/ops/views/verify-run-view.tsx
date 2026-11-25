@@ -319,6 +319,8 @@ export function VerifyRunView({
   const [manualName, setManualName] = useState<string>(presetRun?.mode === "manual" ? presetRun.targetName : "");
 
   const [channelCode, setChannelCode] = useState<string>(presetRun?.channelCode ?? "vertex_gemini");
+  const [selectedProbeIds, setSelectedProbeIds] = useState<string[] | null>(null);
+  const [checkAllModels, setCheckAllModels] = useState<boolean>(true);
   const [model, setModel] = useState<string>(presetRun?.model ?? "");
   const [requestedModel, setRequestedModel] = useState<string>("");
   const [customSkOpen, setCustomSkOpen] = useState(false);
@@ -396,6 +398,30 @@ export function VerifyRunView({
     () => channels.find((c) => c.code === channelCode) ?? channels[0],
     [channels, channelCode],
   );
+  const enabledProbes = useMemo(
+    () => (selectedChannel?.probes ?? []).filter((p) => p.enabled !== false),
+    [selectedChannel],
+  );
+  const effectiveProbeIds = useMemo(() => {
+    const allIds = enabledProbes.map((p) => p.id);
+    if (selectedProbeIds === null) return allIds;
+    const valid = new Set(allIds);
+    return selectedProbeIds.filter((id) => valid.has(id));
+  }, [enabledProbes, selectedProbeIds]);
+  const isAllProbesSelected = enabledProbes.length > 0 && effectiveProbeIds.length === enabledProbes.length;
+  const isPartialProbeRun = enabledProbes.length > 0 && effectiveProbeIds.length > 0 && !isAllProbesSelected;
+
+  const selectedChannelCode = selectedChannel?.code;
+  useEffect(() => {
+    setSelectedProbeIds(null);
+  }, [selectedChannelCode]);
+
+  const toggleProbeSelection = (probeId: string) => {
+    const allIds = enabledProbes.map((p) => p.id);
+    const cur = selectedProbeIds === null ? allIds : effectiveProbeIds;
+    const next = cur.includes(probeId) ? cur.filter((id) => id !== probeId) : [...cur, probeId];
+    setSelectedProbeIds(next.length === allIds.length ? null : next);
+  };
 
   // 切换账号时同步重置模型与覆盖模型列表
   const handleSelectAccounts = (ids: number[]) => {
@@ -532,13 +558,18 @@ export function VerifyRunView({
     }
   };
 
-  const startVerify = async () => {
+  const startVerify = async (overrideProbeIds?: string[]) => {
     if (!selectedChannel) return toast.error("请选择渠道类型");
     if (!selectedChannel.ready) {
       return toast.error(`渠道「${selectedChannel.name}」尚未配置启用的特征探针，请先到「方法论配置」添加探针`);
     }
     const trimmedModel = model.trim();
     if (!trimmedModel) return toast.error("请选择或输入测试模型");
+    const chosenIds = overrideProbeIds ?? effectiveProbeIds;
+    if (!chosenIds.length) return toast.error("请至少选择 1 个探针");
+    const isSingleOrSubset = chosenIds.length < enabledProbes.length;
+    const probeIdsPayload = isSingleOrSubset ? chosenIds : undefined;
+    const checkModelsPayload = isSingleOrSubset ? false : checkAllModels;
 
     if (inputMode === "manual") {
       const url = manualUrl.trim();
@@ -556,6 +587,8 @@ export function VerifyRunView({
           target_name: manualName.trim() || undefined,
           channel_code: selectedChannel.code,
           model: trimmedModel,
+          probe_ids: probeIdsPayload,
+          check_models: checkModelsPayload,
         });
         const modelsList = manualModels.map((m) => m.id).filter(Boolean);
         setManualRunMap((prev) => ({
@@ -611,6 +644,8 @@ export function VerifyRunView({
             requested_model: requestedModel || undefined,
             api_key_override: useOverride || undefined,
             save_key: Boolean(useOverride && saveSk),
+            probe_ids: probeIdsPayload,
+            check_models: checkModelsPayload,
           });
           return r.id;
         }),
@@ -1013,28 +1048,154 @@ export function VerifyRunView({
             )}
           </div>
 
+          {/* Step 4: 选择检测探针（支持单测） */}
+          {selectedChannel && enabledProbes.length > 0 ? (
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <Label className="text-sm font-medium">
+                  4. 选择检测探针（默认全选，可勾选部分或点「单测」单独验证某一项）
+                </Label>
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="text-muted-foreground font-mono">
+                    已选 {effectiveProbeIds.length} / {enabledProbes.length}
+                  </span>
+                  {!isAllProbesSelected ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-2 text-xs"
+                      onClick={() => setSelectedProbeIds(null)}
+                    >
+                      全选
+                    </Button>
+                  ) : null}
+                  {effectiveProbeIds.length > 0 ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="text-muted-foreground h-6 px-2 text-xs"
+                      onClick={() => setSelectedProbeIds([])}
+                    >
+                      清空
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+              <div className="grid gap-1.5 rounded-lg border p-2.5 sm:grid-cols-2">
+                {enabledProbes.map((p) => {
+                  const checked = effectiveProbeIds.includes(p.id);
+                  return (
+                    <div
+                      key={p.id}
+                      className={cn(
+                        "flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-xs transition-colors",
+                        checked ? "border-primary/40 bg-primary/5" : "bg-muted/30 border-transparent opacity-75",
+                      )}
+                    >
+                      <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
+                        <Checkbox checked={checked} onCheckedChange={() => toggleProbeSelection(p.id)} />
+                        <span className="truncate font-medium" title={p.request_desc || p.name}>
+                          {p.name}
+                        </span>
+                        <Badge variant="outline" className="shrink-0 text-[10px] font-normal">
+                          {p.kind === "baseline" ? "基准" : "指纹"}
+                        </Badge>
+                      </label>
+                      <div className="flex shrink-0 items-center gap-1">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-1.5 text-[11px]"
+                          title={`仅勾选「${p.name}」`}
+                          onClick={() => setSelectedProbeIds([p.id])}
+                        >
+                          仅选
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-6 px-2 text-[11px]"
+                          disabled={starting || !targetReady || !selectedChannel.ready || !model.trim()}
+                          title={`立即单独运行「${p.name}」`}
+                          onClick={() => {
+                            setSelectedProbeIds([p.id]);
+                            void startVerify([p.id]);
+                          }}
+                        >
+                          <Play className="size-2.5" />
+                          单测
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
           <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
-            <div className="text-muted-foreground text-xs">
-              {selectedChannel ? (
-                <>
-                  将按「{selectedChannel.name}」v{selectedChannel.version} 方法论依次发送{" "}
-                  <b className="text-foreground">{selectedChannel.enabled_probe_count}</b> 条探测请求（产生极少 token
-                  消耗）。
-                </>
+            <div className="space-y-1.5 text-xs">
+              {!isPartialProbeRun ? (
+                <label className="flex cursor-pointer items-center gap-2 font-medium">
+                  <Checkbox checked={checkAllModels} onCheckedChange={(v) => setCheckAllModels(!!v)} />
+                  自动获取所有上游端点并并行测通模型，再对指定模型测试真实性（录入时仅写入可用模型 ID）
+                </label>
               ) : null}
+              <div className="text-muted-foreground">
+                {selectedChannel ? (
+                  effectiveProbeIds.length === 0 ? (
+                    <span className="text-warning">请至少勾选 1 个探针后再启动。</span>
+                  ) : effectiveProbeIds.length === 1 ? (
+                    <>
+                      单测模式：仅发送「
+                      <b className="text-foreground">
+                        {enabledProbes.find((p) => p.id === effectiveProbeIds[0])?.name || effectiveProbeIds[0]}
+                      </b>
+                      」1 条探针请求（跳过全量模型扫测，单步超时 5 分钟）。
+                    </>
+                  ) : isPartialProbeRun ? (
+                    <>
+                      自定义探针：将按「{selectedChannel.name}」v{selectedChannel.version} 仅发送已选的{" "}
+                      <b className="text-foreground">{effectiveProbeIds.length}</b> / {enabledProbes.length}{" "}
+                      条探测请求（单步超时 5 分钟）。
+                    </>
+                  ) : (
+                    <>
+                      {checkAllModels ? "阶段 1 并行检测全部上游模型可用性 → 阶段 2 按" : "将按"}「
+                      {selectedChannel.name}
+                      」v{selectedChannel.version} 方法论依次发送{" "}
+                      <b className="text-foreground">{enabledProbes.length}</b> 条真实性探针（单步超时 5 分钟）。
+                    </>
+                  )
+                ) : null}
+              </div>
             </div>
             <Button
               type="button"
               size="lg"
-              disabled={starting || !targetReady || !selectedChannel?.ready || !model.trim()}
-              onClick={startVerify}
+              disabled={
+                starting || !targetReady || !selectedChannel?.ready || !model.trim() || effectiveProbeIds.length === 0
+              }
+              onClick={() => void startVerify()}
             >
               <Play className="size-4" />
               {starting
                 ? "正在启动…"
-                : accountIds.length > 1 && inputMode === "account"
-                  ? `开始鉴定（${accountIds.length} 个账号）`
-                  : "开始渠道鉴定"}
+                : effectiveProbeIds.length === 1
+                  ? accountIds.length > 1 && inputMode === "account"
+                    ? `开始单测（${accountIds.length} 个账号）`
+                    : "开始单测（1 项探针）"
+                  : isPartialProbeRun
+                    ? accountIds.length > 1 && inputMode === "account"
+                      ? `开始检测（${accountIds.length} 个账号 · ${effectiveProbeIds.length} 项）`
+                      : `开始检测（${effectiveProbeIds.length} 项探针）`
+                    : accountIds.length > 1 && inputMode === "account"
+                      ? `开始鉴定（${accountIds.length} 个账号）`
+                      : "开始渠道鉴定"}
             </Button>
           </div>
         </CardContent>
@@ -1049,9 +1210,12 @@ export function VerifyRunView({
             addedAccount={addedByRunId[id] ?? null}
             onQuickAdd={
               snap
-                ? (run: VerifyRun) =>
+                ? (run: VerifyRun) => {
+                    const mc = run.models_check;
+                    const checked = Boolean(mc && mc.status === "done");
                     setQuickAddCtx({
                       runId: run.id,
+                      modelsChecked: checked,
                       baseUrl: run.base_url || snap.baseUrl,
                       apiKey: snap.apiKey,
                       skMasked: run.sk_masked || snap.skMasked,
@@ -1062,8 +1226,13 @@ export function VerifyRunView({
                       platformHint: snap.platformHint || run.platform || undefined,
                       model: run.model,
                       verdict: run.verdict,
-                      availableModels: snap.availableModels,
-                    })
+                      availableModels: checked ? mc?.passed_models : snap.availableModels,
+                      presetModels: checked ? mc?.passed_models : undefined,
+                      passedCount: checked ? mc?.passed_count : undefined,
+                      failedCount: checked ? mc?.failed_count : undefined,
+                      totalCount: checked ? mc?.total : undefined,
+                    });
+                  }
                 : undefined
             }
           />

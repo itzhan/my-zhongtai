@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const TIMEOUT_MS = 60_000;
+const TIMEOUT_MS = 5 * 60_000;
 const MAX_RUNS = 500;
 const MAX_BODY_SNIPPET = 2500;
 const PROTOCOLS = new Set(["gemini_native", "anthropic_messages", "openai_chat", "openai_responses"]);
@@ -1247,7 +1247,14 @@ function extractModelsFromPayload(json) {
   return out;
 }
 
-export async function fetchUpstreamModels({ baseUrl, apiKey, fetchImpl = fetch, timeoutMs = 15_000, httpError }) {
+export async function fetchUpstreamModels({
+  baseUrl,
+  apiKey,
+  fetchImpl = fetch,
+  timeoutMs = 15_000,
+  httpError,
+  fetchAllEndpoints = false,
+}) {
   const err = (status, msg) => (httpError ? httpError(status, msg) : Object.assign(new Error(msg), { status }));
   const cleanBase = normalizeUpstreamBase(baseUrl);
   if (!/^https?:\/\/[^/\s]+/i.test(cleanBase)) throw err(400, "上游站点 URL 需以 http:// 或 https:// 开头");
@@ -1283,9 +1290,7 @@ export async function fetchUpstreamModels({ baseUrl, apiKey, fetchImpl = fetch, 
     }
   }
 
-  let authFailed = false;
-  let lastError = "";
-  for (const c of candidates) {
+  const queryCandidate = async (c) => {
     const isOfficialGoogle = /googleapis\.com/i.test(c.url) || /^AIza/i.test(key);
     const isCandAzure = /\.(openai\.azure|cognitiveservices\.azure)\.com/i.test(c.url);
     const isJwt = /^eyJ[A-Za-z0-9_-]+\./.test(key);
@@ -1304,31 +1309,82 @@ export async function fetchUpstreamModels({ baseUrl, apiKey, fetchImpl = fetch, 
       const text = await res.text();
       const json = parseJsonSafe(text, null);
       if (res.status === 401 || res.status === 403) {
-        authFailed = true;
-        lastError = `HTTP ${res.status} ${redactSecret(extractResponseMessage(json, text), key).slice(0, 120)}`;
-        continue;
+        return {
+          ok: false,
+          authFailed: true,
+          error: `HTTP ${res.status} ${redactSecret(extractResponseMessage(json, text), key).slice(0, 120)}`,
+          tag: c.tag,
+        };
       }
       if (!res.ok) {
-        lastError = `HTTP ${res.status} ${redactSecret(extractResponseMessage(json, text), key).slice(0, 120)}`;
-        continue;
+        return {
+          ok: false,
+          authFailed: false,
+          error: `HTTP ${res.status} ${redactSecret(extractResponseMessage(json, text), key).slice(0, 120)}`,
+          tag: c.tag,
+        };
       }
       const ids = extractModelsFromPayload(json);
       if (ids && ids.length > 0) {
-        ids.sort((a, b) => a.localeCompare(b));
+        return { ok: true, ids, tag: c.tag };
+      }
+      return {
+        ok: false,
+        authFailed: false,
+        error: ids && ids.length === 0 ? `${c.tag} 返回模型列表为空` : `${c.tag} 返回格式不是标准的模型列表`,
+        tag: c.tag,
+      };
+    } catch (e) {
+      const aborted = e?.name === "TimeoutError" || e?.name === "AbortError";
+      return {
+        ok: false,
+        authFailed: false,
+        error: aborted ? "请求超时" : redactSecret(e?.cause?.message || e?.message || e, key),
+        tag: c.tag,
+      };
+    }
+  };
+
+  let authFailed = false;
+  let lastError = "";
+  if (fetchAllEndpoints) {
+    const outcomes = await Promise.all(candidates.map(queryCandidate));
+    const modelSourceMap = new Map();
+    const okEndpoints = [];
+    for (const o of outcomes) {
+      if (o.ok) {
+        okEndpoints.push(o.tag);
+        for (const id of o.ids) {
+          if (!modelSourceMap.has(id)) modelSourceMap.set(id, o.tag);
+        }
+      } else {
+        if (o.authFailed) authFailed = true;
+        if (o.error) lastError = o.error;
+      }
+    }
+    if (modelSourceMap.size > 0) {
+      const sortedIds = [...modelSourceMap.keys()].sort((a, b) => a.localeCompare(b));
+      return {
+        models: sortedIds.map((id) => ({ id, requested: id, label: id, source: modelSourceMap.get(id) })),
+        endpoint: okEndpoints.join(" + "),
+        endpoints: okEndpoints,
+        count: sortedIds.length,
+      };
+    }
+  } else {
+    for (const c of candidates) {
+      const o = await queryCandidate(c);
+      if (o.ok) {
+        const ids = [...o.ids].sort((a, b) => a.localeCompare(b));
         return {
-          models: ids.map((id) => ({ id, requested: id, label: id, source: c.tag })),
-          endpoint: c.tag,
+          models: ids.map((id) => ({ id, requested: id, label: id, source: o.tag })),
+          endpoint: o.tag,
+          endpoints: [o.tag],
           count: ids.length,
         };
       }
-      if (ids && ids.length === 0) {
-        lastError = `${c.tag} 返回模型列表为空`;
-      } else {
-        lastError = `${c.tag} 返回格式不是标准的模型列表`;
-      }
-    } catch (e) {
-      const aborted = e?.name === "TimeoutError" || e?.name === "AbortError";
-      lastError = aborted ? "请求超时" : redactSecret(e?.cause?.message || e?.message || e, key);
+      if (o.authFailed) authFailed = true;
+      if (o.error) lastError = o.error;
     }
   }
 
@@ -2481,6 +2537,7 @@ export function openVerifyDb(dataDir) {
       total_probes INTEGER NOT NULL DEFAULT 0,
       summary TEXT NOT NULL DEFAULT '',
       steps_json TEXT NOT NULL DEFAULT '[]',
+      models_check_json TEXT NOT NULL DEFAULT '',
       started_at TEXT NOT NULL,
       finished_at TEXT,
       duration_ms INTEGER NOT NULL DEFAULT 0
@@ -2488,6 +2545,9 @@ export function openVerifyDb(dataDir) {
     CREATE INDEX IF NOT EXISTS idx_verify_runs_started ON verify_runs(started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_verify_runs_account ON verify_runs(account_id, started_at DESC);
   `);
+  try {
+    db.exec("ALTER TABLE verify_runs ADD COLUMN models_check_json TEXT NOT NULL DEFAULT ''");
+  } catch {}
 
   const findCh = db.prepare("SELECT * FROM verify_channels WHERE code = ?");
   const insertCh = db.prepare(`
@@ -2568,6 +2628,25 @@ function channelView(row) {
 
 function runView(row, includeSteps = true, hasSavedKey = false) {
   const steps = parseJsonSafe(row.steps_json, []);
+  const rawModelsCheck = row.models_check_json ? parseJsonSafe(row.models_check_json, null) : null;
+  let modelsCheck = null;
+  if (rawModelsCheck && typeof rawModelsCheck === "object") {
+    modelsCheck = {
+      status: rawModelsCheck.status || "skipped",
+      endpoint: rawModelsCheck.endpoint || "",
+      error: rawModelsCheck.error || "",
+      total: Number(rawModelsCheck.total || 0),
+      completed: Number(rawModelsCheck.completed || 0),
+      passed_count: Number(rawModelsCheck.passed_count || 0),
+      failed_count: Number(rawModelsCheck.failed_count || 0),
+      passed_models: Array.isArray(rawModelsCheck.passed_models) ? rawModelsCheck.passed_models : [],
+      failed_models: Array.isArray(rawModelsCheck.failed_models) ? rawModelsCheck.failed_models : [],
+      duration_ms: Number(rawModelsCheck.duration_ms || 0),
+    };
+    if (includeSteps) {
+      modelsCheck.results = Array.isArray(rawModelsCheck.results) ? rawModelsCheck.results : [];
+    }
+  }
   const out = {
     id: row.id,
     account_id: row.account_id,
@@ -2588,6 +2667,7 @@ function runView(row, includeSteps = true, hasSavedKey = false) {
     matched_count: row.matched_count,
     total_probes: row.total_probes,
     summary: row.summary,
+    models_check: modelsCheck,
     started_at: row.started_at,
     finished_at: row.finished_at,
     duration_ms: row.duration_ms,
@@ -2602,7 +2682,18 @@ function parseCredsObject(raw) {
   return typeof raw === "object" ? raw : {};
 }
 
-export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getAccounts, detector, fetchImpl = fetch }) {
+export function registerVerifier({
+  app,
+  wrap,
+  httpError,
+  dataDir,
+  s2,
+  pool,
+  getAccounts,
+  detector,
+  fetchImpl = fetch,
+  testSingleModel = null,
+}) {
   const db = openVerifyDb(dataDir);
   const q = {
     allChannels: db.prepare("SELECT * FROM verify_channels ORDER BY sort_order ASC, created_at ASC"),
@@ -2852,8 +2943,15 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         rawText = await res.text();
         if (res.status !== 429) break;
       } catch (e) {
-        const aborted = e?.name === "TimeoutError" || e?.name === "AbortError";
-        const msg = aborted ? `请求超时 (>${TIMEOUT_MS / 1000}s)` : redactSecret(e?.cause?.message || e?.message || e, apiKey);
+        const causeCode = e?.cause?.code || e?.code || "";
+        const aborted =
+          e?.name === "TimeoutError" ||
+          e?.name === "AbortError" ||
+          causeCode === "UND_ERR_HEADERS_TIMEOUT" ||
+          causeCode === "UND_ERR_BODY_TIMEOUT";
+        const msg = aborted
+          ? `请求超时 (>${Math.round(TIMEOUT_MS / 1000)}s)`
+          : redactSecret(e?.cause?.message || e?.message || e, apiKey);
         return {
           url: redactSecret(reqSpec.url, apiKey),
           request_body: reqSpec.body,
@@ -2912,6 +3010,169 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     }
     args.push(runId);
     db.prepare(`UPDATE verify_runs SET ${fields.join(", ")} WHERE id = ?`).run(...args);
+  }
+
+  function saveModelsCheck(runId, modelsCheck, extra = {}) {
+    const fields = ["models_check_json = ?"];
+    const args = [JSON.stringify(modelsCheck)];
+    for (const [k, v] of Object.entries(extra)) {
+      fields.push(`${k} = ?`);
+      args.push(v);
+    }
+    args.push(runId);
+    db.prepare(`UPDATE verify_runs SET ${fields.join(", ")} WHERE id = ?`).run(...args);
+  }
+
+  let cachedTestSingleModel = testSingleModel;
+  async function getTestSingleModelFn() {
+    if (cachedTestSingleModel) return cachedTestSingleModel;
+    const mod = await import("./basic-tester.js");
+    cachedTestSingleModel = mod.testSingleModel;
+    return cachedTestSingleModel;
+  }
+
+  function summarizeModelsCheck(mc) {
+    const results = Array.isArray(mc.results) ? mc.results : [];
+    const passed = [];
+    const failed = [];
+    let completed = 0;
+    for (const r of results) {
+      if (r.status === "pass") {
+        completed++;
+        passed.push(r.model);
+      } else if (r.status === "fail") {
+        completed++;
+        failed.push(r.model);
+      }
+    }
+    mc.total = results.length;
+    mc.completed = completed;
+    mc.passed_count = passed.length;
+    mc.failed_count = failed.length;
+    mc.passed_models = passed;
+    mc.failed_models = failed;
+    return mc;
+  }
+
+  const MAX_MODELS_CHECK = 300;
+  const MODEL_CHECK_CONCURRENCY = 8;
+
+  async function runModelsAvailabilityPhase({ runId, ctx, channel, selectedModel }) {
+    const phaseStart = Date.now();
+    const mc = {
+      status: "fetching",
+      endpoint: "",
+      error: "",
+      total: 0,
+      completed: 0,
+      passed_count: 0,
+      failed_count: 0,
+      passed_models: [],
+      failed_models: [],
+      results: [],
+      duration_ms: 0,
+    };
+    saveModelsCheck(runId, mc, { summary: "阶段 1/2：正在自动获取所有上游端点模型列表…" });
+
+    let fetched;
+    try {
+      fetched = await fetchUpstreamModels({
+        baseUrl: ctx.base_url,
+        apiKey: ctx.api_key,
+        fetchImpl,
+        httpError,
+        fetchAllEndpoints: true,
+      });
+    } catch (e) {
+      mc.status = "error";
+      mc.error = redactSecret(e?.message || String(e), ctx.api_key);
+      mc.duration_ms = Date.now() - phaseStart;
+      saveModelsCheck(runId, mc, {
+        summary: `阶段 1/2 获取上游模型失败（${mc.error}），将继续用「${selectedModel}」测试渠道真实性…`,
+      });
+      return mc;
+    }
+
+    const rawModels = Array.isArray(fetched?.models) ? fetched.models : [];
+    let limited = rawModels.slice(0, MAX_MODELS_CHECK);
+    if (selectedModel && rawModels.some((m) => m.id === selectedModel) && !limited.some((m) => m.id === selectedModel)) {
+      limited = [...limited.slice(0, MAX_MODELS_CHECK - 1), rawModels.find((m) => m.id === selectedModel)];
+    }
+
+    mc.endpoint = fetched.endpoint || "";
+    mc.status = "running";
+    mc.results = limited.map((m) => ({
+      model: m.id,
+      source: m.source || fetched.endpoint || "",
+      status: "pending",
+      protocol_used: "",
+      fallback_used: false,
+      http_status: null,
+      latency_ms: null,
+      reason: "",
+      response_model: "",
+      request_url: "",
+      response_snippet: "",
+    }));
+    summarizeModelsCheck(mc);
+    saveModelsCheck(runId, mc, {
+      summary: `阶段 1/2：已获取 ${mc.total} 个上游模型（${mc.endpoint}），正在并行检测可用性…`,
+    });
+
+    const testModelFn = await getTestSingleModelFn();
+    let cursor = 0;
+    let lastFlush = 0;
+    const flush = (force = false) => {
+      const now = Date.now();
+      if (!force && mc.total > 20 && now - lastFlush < 250) return;
+      lastFlush = now;
+      summarizeModelsCheck(mc);
+      mc.duration_ms = now - phaseStart;
+      saveModelsCheck(runId, mc, {
+        summary: `阶段 1/2：正在并行检测上游模型可用性（${mc.completed}/${mc.total}，已通 ${mc.passed_count}）…`,
+      });
+    };
+
+    const workers = Math.min(MODEL_CHECK_CONCURRENCY, mc.results.length);
+    const worker = async () => {
+      for (;;) {
+        const idx = cursor++;
+        if (idx >= mc.results.length) return;
+        const item = mc.results[idx];
+        item.status = "running";
+        if (mc.total <= 20) flush(false);
+        try {
+          const out = await testModelFn({
+            baseUrl: ctx.base_url,
+            apiKey: ctx.api_key,
+            model: item.model,
+            protocol: "auto",
+            modelsEndpoint: item.source || mc.endpoint,
+            preferProtocol: channel.protocol,
+            fetchImpl,
+          });
+          mc.results[idx] = { ...item, ...out };
+        } catch (e) {
+          mc.results[idx] = {
+            ...item,
+            status: "fail",
+            http_status: 0,
+            latency_ms: 0,
+            reason: redactSecret(e?.message || String(e), ctx.api_key),
+          };
+        }
+        flush(false);
+      }
+    };
+    if (workers > 0) await Promise.all(Array.from({ length: workers }, () => worker()));
+
+    summarizeModelsCheck(mc);
+    mc.status = "done";
+    mc.duration_ms = Date.now() - phaseStart;
+    saveModelsCheck(runId, mc, {
+      summary: `阶段 2/2：模型可用性检测完成（通 ${mc.passed_count}/${mc.total}），正在用「${selectedModel}」测试渠道真实性…`,
+    });
+    return mc;
   }
 
   const OLD_ANTHROPIC_THINKING = /haiku-4-5|sonnet-4-5|opus-4-5|opus-4-1|opus-4-2|sonnet-4-2|claude-3/i;
@@ -3696,10 +3957,8 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
     };
   }
 
-  async function executeVerifyRun({ runId, ctx, channel, model }) {
-    const startedMs = Date.now();
-    const enabledProbes = channel.probes.filter((p) => p.enabled !== false);
-    const steps = enabledProbes.map((p) => ({
+  function buildInitialStepFromProbe(p) {
+    return {
       id: p.id,
       name: p.name,
       kind: p.kind,
@@ -3741,8 +4000,151 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       response_headers: {},
       response_snippet: "",
       fallback_used: false,
-    }));
+    };
+  }
+
+  function probeNeedsAwsbSeed(probe) {
+    const r = String(probe?.runner || "");
+    return r.startsWith("awsb_") && r !== "awsb_seed";
+  }
+
+  function probeNeedsRespEncSeed(probe) {
+    const r = String(probe?.runner || "");
+    return r === "resp_enc_s1" || r === "resp_enc_s2";
+  }
+
+  async function runSingleProbeBody({ probe, step, runState, ctx, channel, model, onStepUpdate }) {
+    const runner = String(probe.runner || "");
+    if (runner.startsWith("awsb_")) {
+      return runAwsbStep({ probe, step, runState, ctx, channel, model, onStepUpdate });
+    }
+    if (runner.startsWith("resp_enc_")) {
+      return runRespEncStep({ probe, step, runState, ctx, channel, model, onStepUpdate });
+    }
+
+    let attemptRes = await sendProbeOnce({
+      baseUrl: ctx.base_url,
+      apiKey: ctx.api_key,
+      protocol: channel.protocol,
+      model,
+      body: probe.request_body,
+    });
+    let usedFallback = false;
+    if (probe.kind === "fingerprint" && attemptRes.http_status === 200 && probe.fallback_on_200) {
+      usedFallback = true;
+      attemptRes = await sendProbeOnce({
+        baseUrl: ctx.base_url,
+        apiKey: ctx.api_key,
+        protocol: channel.protocol,
+        model,
+        body: probe.fallback_on_200,
+      });
+    }
+
+    const evalRes = evaluateProbeResponse({
+      probe,
+      protocol: channel.protocol,
+      httpStatus: attemptRes.http_status,
+      json: attemptRes.json,
+      rawText: attemptRes.raw_text,
+    });
+    const hasAsService = hasAiStudioService(attemptRes.json, attemptRes.raw_text);
+    const hasAsMulticand = /Multiple candidates is not enabled for this model/i.test(
+      String(attemptRes.raw_text || ""),
+    );
+
+    return {
+      stepPatch: {
+        status: evalRes.status,
+        http_status: attemptRes.http_status,
+        round_statuses: attemptRes.http_status != null ? [attemptRes.http_status] : [],
+        latency_ms: attemptRes.latency_ms,
+        reason: usedFallback
+          ? `首次请求返回 HTTP 200（模型支持该开关），已自动补发校验请求：${evalRes.reason}`
+          : evalRes.reason,
+        strong_hit: evalRes.strong_hit,
+        counter_hit: evalRes.counter_hit,
+        param_stripped: evalRes.param_stripped,
+        status_rewritten: evalRes.status_rewritten,
+        matched_patterns: evalRes.matched_patterns,
+        has_as_service: hasAsService,
+        has_as_multicand: hasAsMulticand,
+        request_url: attemptRes.url,
+        request_body: attemptRes.request_body,
+        response_headers: attemptRes.headers,
+        response_snippet: attemptRes.snippet,
+        fallback_used: usedFallback,
+      },
+      abort: probe.kind === "baseline" && evalRes.status === "fail",
+    };
+  }
+
+  async function ensureSilentPrerequisiteSeeds({ probes, runState, ctx, channel, model }) {
+    const hasAwsbSeedInBatch = probes.some((p) => String(p.runner || "") === "awsb_seed");
+    const needsAwsb = !hasAwsbSeedInBatch && probes.some(probeNeedsAwsbSeed);
+    if (needsAwsb && !runState.awsb) {
+      const seedProbe =
+        (channel.probes || []).find((p) => String(p.runner || "") === "awsb_seed") || {
+          id: "awsb_seed",
+          name: "采集真实 thinking + signature",
+          kind: "baseline",
+          runner: "awsb_seed",
+        };
+      const seedOut = await runAwsbStep({
+        probe: seedProbe,
+        step: buildInitialStepFromProbe(seedProbe),
+        runState,
+        ctx,
+        channel,
+        model,
+      });
+      if (!runState.awsb) {
+        runState.awsbSeedError = seedOut?.stepPatch?.reason || "前置 thinking 素材采集失败";
+      }
+    }
+
+    const hasRespEncSeedInBatch = probes.some((p) => String(p.runner || "") === "resp_enc_seed");
+    const needsRespEnc = !hasRespEncSeedInBatch && probes.some(probeNeedsRespEncSeed);
+    if (needsRespEnc && !runState.respEnc?.blob) {
+      const seedProbe =
+        (channel.probes || []).find((p) => String(p.runner || "") === "resp_enc_seed") || {
+          id: "resp_enc_seed",
+          name: "采集真实 encrypted_content",
+          kind: "baseline",
+          runner: "resp_enc_seed",
+          request_body: {
+            store: false,
+            input:
+              "若 a+b+c=24，a 比 c 大 3，b 是 c 的 2 倍，请先在内部逐步思考算出 a×b×c 的结果，同时在内部思考中牢记本轮会话代号 AR-5。正式回复请只输出计算结果数字，不要提及代号。",
+            reasoning: { effort: "medium", summary: "auto" },
+            include: ["reasoning.encrypted_content"],
+          },
+        };
+      const seedOut = await runRespEncStep({
+        probe: seedProbe,
+        step: buildInitialStepFromProbe(seedProbe),
+        runState,
+        ctx,
+        channel,
+        model,
+      });
+      if (!runState.respEnc?.blob) {
+        runState.respEncSeedError = seedOut?.stepPatch?.reason || "前置 encrypted_content 采集失败";
+      }
+    }
+  }
+
+  async function executeVerifyRun({ runId, ctx, channel, model, probeIds = null, checkModels = true }) {
+    const startedMs = Date.now();
+    const allEnabledProbes = channel.probes.filter((p) => p.enabled !== false);
+    const idFilter = Array.isArray(probeIds) && probeIds.length ? new Set(probeIds.map((x) => str(x, 60))) : null;
+    const enabledProbes = idFilter ? allEnabledProbes.filter((p) => idFilter.has(p.id)) : allEnabledProbes;
+    const steps = enabledProbes.map(buildInitialStepFromProbe);
     saveRunSteps(runId, steps);
+
+    if (checkModels) {
+      await runModelsAvailabilityPhase({ runId, ctx, channel, selectedModel: model });
+    }
 
     // 同一家族内：前置失败才跳过后续。不同家族互不影响。并发别开太高，避免把上游打进 429。
     const PROBE_CONCURRENCY = 6;
@@ -3787,113 +4189,42 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       steps[i].status = "running";
       saveRunSteps(runId, steps);
 
-      if (String(probe.runner || "").startsWith("awsb_")) {
-        const out = await runAwsbStep({
-          probe,
-          step: steps[i],
-          runState,
-          ctx,
-          channel,
-          model,
-          onStepUpdate: (updatedStep) => {
-            steps[i] = updatedStep;
-            saveRunSteps(runId, steps);
-          },
-        });
-        steps[i] = { ...steps[i], ...out.stepPatch };
-        if (out.abort) {
+      const out = await runSingleProbeBody({
+        probe,
+        step: steps[i],
+        runState,
+        ctx,
+        channel,
+        model,
+        onStepUpdate: (updatedStep) => {
+          steps[i] = updatedStep;
+          saveRunSteps(runId, steps);
+        },
+      });
+      steps[i] = { ...steps[i], ...out.stepPatch };
+      if (out.abort) {
+        if (family === "awsb") {
           noteAbort(
             "awsb",
             out.stepPatch.throttled ? "触发限流/日限额，终止后续场景" : "前置素材采集失败，跳过该场景",
           );
-        }
-        saveRunSteps(runId, steps);
-        return;
-      }
-
-      if (String(probe.runner || "").startsWith("resp_enc_")) {
-        const out = await runRespEncStep({
-          probe,
-          step: steps[i],
-          runState,
-          ctx,
-          channel,
-          model,
-          onStepUpdate: (updatedStep) => {
-            steps[i] = updatedStep;
-            saveRunSteps(runId, steps);
-          },
-        });
-        steps[i] = { ...steps[i], ...out.stepPatch };
-        if (out.abort) {
+        } else if (family === "resp_enc") {
           noteAbort(
             "resp_enc",
             out.stepPatch.env_error || out.stepPatch.throttled
               ? "限流/鉴权/模型不支持，终止后续场景"
               : "未采集到 encrypted_content，跳过后续场景",
           );
+        } else {
+          noteAbort("generic");
         }
-        saveRunSteps(runId, steps);
-        return;
       }
-
-      let attemptRes = await sendProbeOnce({
-        baseUrl: ctx.base_url,
-        apiKey: ctx.api_key,
-        protocol: channel.protocol,
-        model,
-        body: probe.request_body,
-      });
-      let usedFallback = false;
-      if (probe.kind === "fingerprint" && attemptRes.http_status === 200 && probe.fallback_on_200) {
-        usedFallback = true;
-        attemptRes = await sendProbeOnce({
-          baseUrl: ctx.base_url,
-          apiKey: ctx.api_key,
-          protocol: channel.protocol,
-          model,
-          body: probe.fallback_on_200,
-        });
-      }
-
-      const evalRes = evaluateProbeResponse({
-        probe,
-        protocol: channel.protocol,
-        httpStatus: attemptRes.http_status,
-        json: attemptRes.json,
-        rawText: attemptRes.raw_text,
-      });
-      const hasAsService = hasAiStudioService(attemptRes.json, attemptRes.raw_text);
-      const hasAsMulticand = /Multiple candidates is not enabled for this model/i.test(
-        String(attemptRes.raw_text || ""),
-      );
-
-      steps[i] = {
-        ...steps[i],
-        status: evalRes.status,
-        http_status: attemptRes.http_status,
-        round_statuses: attemptRes.http_status != null ? [attemptRes.http_status] : [],
-        latency_ms: attemptRes.latency_ms,
-        reason: usedFallback
-          ? `首次请求返回 HTTP 200（模型支持该开关），已自动补发校验请求：${evalRes.reason}`
-          : evalRes.reason,
-        strong_hit: evalRes.strong_hit,
-        counter_hit: evalRes.counter_hit,
-        param_stripped: evalRes.param_stripped,
-        status_rewritten: evalRes.status_rewritten,
-        matched_patterns: evalRes.matched_patterns,
-        has_as_service: hasAsService,
-        has_as_multicand: hasAsMulticand,
-        request_url: attemptRes.url,
-        request_body: attemptRes.request_body,
-        response_headers: attemptRes.headers,
-        response_snippet: attemptRes.snippet,
-        fallback_used: usedFallback,
-      };
-      if (probe.kind === "baseline" && evalRes.status === "fail") noteAbort("generic");
       saveRunSteps(runId, steps);
     }
     try {
+      if (idFilter) {
+        await ensureSilentPrerequisiteSeeds({ probes: enabledProbes, runState, ctx, channel, model });
+      }
       const hasGenericBaseline = enabledProbes.some((p) => probeFamily(p) === "generic" && p.kind === "baseline");
       const wave0 = [];
       const wave1 = [];
@@ -3936,6 +4267,91 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         status: "error",
         verdict: "inconclusive",
         summary: `检测执行异常：${redactSecret(e?.message || e, ctx.api_key)}`,
+        finished_at: nowIso(),
+        duration_ms: Date.now() - startedMs,
+      });
+    }
+  }
+
+  async function executeRetestProbes({ runId, ctx, channel, model, steps, targetIndexes, targetProbes }) {
+    const startedMs = Date.now();
+    const runState = {};
+    const PROBE_CONCURRENCY = 6;
+    async function mapPool(items, fn) {
+      let cursor = 0;
+      const workers = Math.min(PROBE_CONCURRENCY, items.length);
+      const worker = async () => {
+        for (;;) {
+          const n = cursor++;
+          if (n >= items.length) return;
+          await fn(items[n]);
+        }
+      };
+      if (workers > 0) await Promise.all(Array.from({ length: workers }, () => worker()));
+    }
+    try {
+      await ensureSilentPrerequisiteSeeds({ probes: targetProbes, runState, ctx, channel, model });
+      // 若本批同时包含 seed 和依赖 seed 的探针，先跑 seed 再跑依赖项
+      const firstWave = [];
+      const secondWave = [];
+      for (let k = 0; k < targetIndexes.length; k++) {
+        const probe = targetProbes[k];
+        const r = String(probe.runner || "");
+        if (r === "awsb_seed" || r === "resp_enc_seed" || probe.kind === "baseline") firstWave.push(k);
+        else secondWave.push(k);
+      }
+      const runOne = async (k) => {
+        const idx = targetIndexes[k];
+        const probe = targetProbes[k];
+        const freshStep = { ...buildInitialStepFromProbe(probe), status: "running", reason: "正在单测该探针…" };
+        steps[idx] = freshStep;
+        saveRunSteps(runId, steps);
+        const out = await runSingleProbeBody({
+          probe,
+          step: steps[idx],
+          runState,
+          ctx,
+          channel,
+          model,
+          onStepUpdate: (updatedStep) => {
+            steps[idx] = updatedStep;
+            saveRunSteps(runId, steps);
+          },
+        });
+        steps[idx] = { ...steps[idx], ...out.stepPatch };
+        if (steps[idx].status === "skip" && probeNeedsAwsbSeed(probe) && runState.awsbSeedError) {
+          steps[idx].status = "fail";
+          steps[idx].reason = `前置素材采集失败：${runState.awsbSeedError}`;
+        } else if (steps[idx].status === "skip" && probeNeedsRespEncSeed(probe) && runState.respEncSeedError) {
+          steps[idx].status = "fail";
+          steps[idx].reason = `前置密文采集失败：${runState.respEncSeedError}`;
+        }
+        saveRunSteps(runId, steps);
+      };
+      await mapPool(firstWave, runOne);
+      await mapPool(secondWave, runOne);
+
+      const final = computeRunVerdict({
+        steps,
+        passRatio: channel.pass_ratio,
+        channelName: channel.name,
+        channelCode: channel.code,
+      });
+      saveRunSteps(runId, steps, {
+        status: "done",
+        verdict: final.verdict,
+        score: final.score,
+        matched_count: final.matched_count,
+        total_probes: final.total_probes,
+        summary: final.summary,
+        finished_at: nowIso(),
+        duration_ms: Date.now() - startedMs,
+      });
+    } catch (e) {
+      saveRunSteps(runId, steps, {
+        status: "error",
+        verdict: "inconclusive",
+        summary: `单测执行异常：${redactSecret(e?.message || e, ctx.api_key)}`,
         finished_at: nowIso(),
         duration_ms: Date.now() - startedMs,
       });
@@ -4088,6 +4504,7 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
         apiKey: manualKey,
         fetchImpl,
         httpError,
+        fetchAllEndpoints: true,
       });
     }),
   );
@@ -4165,8 +4582,24 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       const b = req.body || {};
       const channelRow = mustChannel(b.channel_code);
       const channel = channelView(channelRow);
-      const enabledFp = channel.probes.filter((p) => p.kind !== "baseline" && p.enabled !== false);
-      if (!enabledFp.length) {
+      const allEnabled = channel.probes.filter((p) => p.enabled !== false);
+      const requestedProbeIds = Array.isArray(b.probe_ids)
+        ? [...new Set(b.probe_ids.map((x) => str(x, 60)).filter(Boolean))]
+        : null;
+      const selectedProbes =
+        requestedProbeIds && requestedProbeIds.length
+          ? allEnabled.filter((p) => requestedProbeIds.includes(p.id))
+          : allEnabled;
+      if (!selectedProbes.length) {
+        throw httpError(
+          400,
+          requestedProbeIds?.length
+            ? "未匹配到可执行的探针，请重新选择"
+            : `渠道「${channel.name}」尚未配置启用的探针，请先在「方法论配置」中添加探针`,
+        );
+      }
+      const enabledFp = selectedProbes.filter((p) => p.kind !== "baseline");
+      if (!requestedProbeIds?.length && !enabledFp.length) {
         throw httpError(400, `渠道「${channel.name}」尚未配置启用的特征探针，请先在「方法论配置」中添加探针`);
       }
 
@@ -4250,9 +4683,277 @@ export function registerVerifier({ app, wrap, httpError, dataDir, s2, pool, getA
       ).run();
       db.prepare("DELETE FROM verify_manual_keys WHERE run_id NOT IN (SELECT id FROM verify_runs)").run();
 
-      // 异步执行各探针，立即返回 runId 给前端轮询实时进度
-      void executeVerifyRun({ runId, ctx, channel, model: upstreamModel });
+      // 默认全量渠道鉴定时自动先执行「阶段 1：获取全部上游端点并并行测通模型」，再执行「阶段 2：渠道真实性探针」；
+      // 单测/部分探针模式默认跳过全量模型扫描以保持快速（可通过 check_models: true 显式开启）。
+      const shouldCheckModels =
+        typeof b.check_models === "boolean" ? b.check_models : !(requestedProbeIds && requestedProbeIds.length > 0);
+
+      // 异步执行各阶段，立即返回 runId 给前端轮询实时进度
+      void executeVerifyRun({
+        runId,
+        ctx,
+        channel,
+        model: upstreamModel,
+        probeIds: requestedProbeIds?.length ? selectedProbes.map((p) => p.id) : null,
+        checkModels: shouldCheckModels,
+      });
       return runView(q.run.get(runId), true, isManual && Boolean(ctx.api_key));
+    }),
+  );
+
+  // 单测 / 重测报告中的指定探针（支持单条探针或全部失败/跳过项）
+  async function handleRetestRunProbes(req, explicitProbeId = "") {
+    const runId = str(req.params.id, 40);
+    const row = q.run.get(runId);
+    if (!row) throw httpError(404, "检测报告不存在");
+    if (row.status === "running") {
+      throw httpError(409, "当前报告正在检测中，请等待本轮完成后再单测");
+    }
+
+    const steps = parseJsonSafe(row.steps_json, []);
+    if (!Array.isArray(steps) || !steps.length) {
+      throw httpError(400, "该报告暂无可单测的探针步骤");
+    }
+
+    const channelRow = mustChannel(row.channel_code);
+    const channel = channelView(channelRow);
+    const probeById = new Map((channel.probes || []).map((p) => [p.id, p]));
+
+    const b = req.body || {};
+    let requestedIds = explicitProbeId
+      ? [str(explicitProbeId, 60)]
+      : Array.isArray(b.probe_ids)
+        ? [...new Set(b.probe_ids.map((x) => str(x, 60)).filter(Boolean))]
+        : [];
+    if (!requestedIds.length && b.only_failed) {
+      requestedIds = steps.filter((s) => s.status === "fail" || s.status === "skip").map((s) => s.id);
+      if (!requestedIds.length) throw httpError(400, "当前报告没有失败或跳过的探针");
+    }
+    if (!requestedIds.length) {
+      throw httpError(400, "请指定需要单测的探针 ID");
+    }
+
+    const targetIndexes = [];
+    const targetProbes = [];
+    for (const pid of requestedIds) {
+      const idx = steps.findIndex((s) => s.id === pid);
+      if (idx < 0) continue;
+      const step = steps[idx];
+      const probeDef = probeById.get(pid) || {
+        id: step.id,
+        name: step.name,
+        kind: step.kind || "fingerprint",
+        runner: step.runner || "",
+        rounds: step.rounds || 1,
+        request_desc: step.request_desc || "",
+        expect_desc: step.expect_desc || "",
+        request_body: step.request_body || {},
+        fallback_on_200: null,
+        expect_status: Array.isArray(step.expect_status) ? step.expect_status : [400],
+        match_mode: step.match_mode || "all",
+        must_match: Array.isArray(step.must_match) ? step.must_match : [],
+        strong_match: Array.isArray(step.strong_match) ? step.strong_match : [],
+        counter_match: Array.isArray(step.counter_match) ? step.counter_match : [],
+      };
+      targetIndexes.push(idx);
+      targetProbes.push(probeDef);
+    }
+    if (!targetIndexes.length) {
+      throw httpError(404, "未在该报告中找到对应的探针");
+    }
+
+    let ctx;
+    if (row.account_id > 0) {
+      const apiKeyOverride = str(b.api_key || b.api_key_override, 1000);
+      ctx = await resolveAccountContext(row.account_id, apiKeyOverride);
+      if (!ctx.supported) throw httpError(400, ctx.unsupported_reason);
+      if (!ctx.has_sk) throw httpError(400, "未能读取该账号的测试 SK，请在发起页面重新指定 SK");
+    } else {
+      const cleanBaseUrl = normalizeUpstreamBase(row.base_url);
+      let manualKey = str(b.api_key || b.api_key_override, 1000);
+      if (!manualKey) {
+        manualKey = resolveManualRunKey(row.id, cleanBaseUrl);
+      }
+      if (!manualKey) {
+        throw httpError(400, "该手动记录未保存测试 Key，请前往「开始鉴定」重新填入 Key");
+      }
+      ctx = {
+        account: { id: 0, name: row.account_name, platform: row.platform || channel.platform_hint || "" },
+        base_url: cleanBaseUrl,
+        api_key: manualKey,
+        sk_masked: row.sk_masked || maskSecret(manualKey),
+        sk_source: row.sk_source || "saved_manual",
+        model_mapping: {},
+      };
+    }
+
+    for (let k = 0; k < targetIndexes.length; k++) {
+      const idx = targetIndexes[k];
+      steps[idx] = {
+        ...steps[idx],
+        status: "running",
+        http_status: null,
+        round_statuses: [],
+        latency_ms: null,
+        reason: "正在重新单测该探针…",
+      };
+    }
+    saveRunSteps(runId, steps, {
+      status: "running",
+      summary:
+        targetProbes.length === 1
+          ? `正在单测探针「${targetProbes[0].name}」…`
+          : `正在重测 ${targetProbes.length} 项探针…`,
+    });
+
+    void executeRetestProbes({
+      runId,
+      ctx,
+      channel,
+      model: row.model,
+      steps,
+      targetIndexes,
+      targetProbes,
+    });
+    return runView(q.run.get(runId), true, Boolean(q.manualKey.get(runId)));
+  }
+
+  app.post(
+    "/api/verify/runs/:id/retest-probes",
+    wrap(async (req) => handleRetestRunProbes(req)),
+  );
+  app.post(
+    "/api/verify/runs/:id/probes/:probeId/retest",
+    wrap(async (req) => handleRetestRunProbes(req, req.params.probeId)),
+  );
+
+  // 重测报告阶段 1 中的失败模型（或指定模型列表）
+  app.post(
+    "/api/verify/runs/:id/retest-models",
+    wrap(async (req) => {
+      const runId = str(req.params.id, 40);
+      const row = q.run.get(runId);
+      if (!row) throw httpError(404, "检测报告不存在");
+      if (row.status === "running") {
+        throw httpError(409, "当前报告正在检测中，请等待本轮完成后再重测模型");
+      }
+      const mc = row.models_check_json ? parseJsonSafe(row.models_check_json, null) : null;
+      if (!mc || !Array.isArray(mc.results) || !mc.results.length) {
+        throw httpError(400, "该报告暂无模型可用性测试记录");
+      }
+
+      const b = req.body || {};
+      let targetModels = Array.isArray(b.models)
+        ? [...new Set(b.models.map((x) => str(x, 150)).filter(Boolean))]
+        : [];
+      if (!targetModels.length && b.only_failed) {
+        targetModels = mc.results.filter((r) => r.status === "fail").map((r) => r.model);
+        if (!targetModels.length) throw httpError(400, "当前没有不通的模型需要重测");
+      }
+      if (!targetModels.length) throw httpError(400, "请指定需要重测的模型");
+
+      const targetIndexes = targetModels
+        .map((m) => mc.results.findIndex((r) => r.model === m))
+        .filter((idx) => idx >= 0);
+      if (!targetIndexes.length) throw httpError(404, "未在该报告中找到对应模型");
+
+      const channelRow = mustChannel(row.channel_code);
+      const channel = channelView(channelRow);
+
+      let ctx;
+      if (row.account_id > 0) {
+        const apiKeyOverride = str(b.api_key || b.api_key_override, 1000);
+        ctx = await resolveAccountContext(row.account_id, apiKeyOverride);
+        if (!ctx.supported) throw httpError(400, ctx.unsupported_reason);
+        if (!ctx.has_sk) throw httpError(400, "未能读取该账号的测试 SK");
+      } else {
+        const cleanBaseUrl = normalizeUpstreamBase(row.base_url);
+        const manualKey = str(b.api_key || b.api_key_override, 1000) || resolveManualRunKey(row.id, cleanBaseUrl);
+        if (!manualKey) throw httpError(400, "该手动记录未保存测试 Key，请前往「开始鉴定」重新填入 Key");
+        ctx = {
+          account: { id: 0, name: row.account_name, platform: row.platform || channel.platform_hint || "" },
+          base_url: cleanBaseUrl,
+          api_key: manualKey,
+          sk_masked: row.sk_masked || maskSecret(manualKey),
+          sk_source: row.sk_source || "saved_manual",
+          model_mapping: {},
+        };
+      }
+
+      const prevSummary = row.summary;
+      for (const idx of targetIndexes) {
+        mc.results[idx] = {
+          ...mc.results[idx],
+          status: "running",
+          http_status: null,
+          latency_ms: null,
+          reason: "正在重新检测…",
+        };
+      }
+      mc.status = "running";
+      summarizeModelsCheck(mc);
+      saveModelsCheck(runId, mc, {
+        status: "running",
+        summary: `正在重测 ${targetIndexes.length} 个模型可用性…`,
+      });
+
+      void (async () => {
+        const phaseStart = Date.now();
+        try {
+          const testModelFn = await getTestSingleModelFn();
+          let cursor = 0;
+          const workers = Math.min(MODEL_CHECK_CONCURRENCY, targetIndexes.length);
+          const worker = async () => {
+            for (;;) {
+              const n = cursor++;
+              if (n >= targetIndexes.length) return;
+              const idx = targetIndexes[n];
+              const item = mc.results[idx];
+              try {
+                const out = await testModelFn({
+                  baseUrl: ctx.base_url,
+                  apiKey: ctx.api_key,
+                  model: item.model,
+                  protocol: "auto",
+                  modelsEndpoint: item.source || mc.endpoint,
+                  preferProtocol: channel.protocol,
+                  fetchImpl,
+                });
+                mc.results[idx] = { ...item, ...out };
+              } catch (e) {
+                mc.results[idx] = {
+                  ...item,
+                  status: "fail",
+                  http_status: 0,
+                  latency_ms: 0,
+                  reason: redactSecret(e?.message || String(e), ctx.api_key),
+                };
+              }
+              summarizeModelsCheck(mc);
+              saveModelsCheck(runId, mc);
+            }
+          };
+          if (workers > 0) await Promise.all(Array.from({ length: workers }, () => worker()));
+          summarizeModelsCheck(mc);
+          mc.status = "done";
+          mc.duration_ms = (mc.duration_ms || 0) + (Date.now() - phaseStart);
+          saveModelsCheck(runId, mc, {
+            status: "done",
+            summary: prevSummary,
+            finished_at: nowIso(),
+          });
+        } catch (e) {
+          mc.status = "done";
+          summarizeModelsCheck(mc);
+          saveModelsCheck(runId, mc, {
+            status: "done",
+            summary: prevSummary || `模型重测异常：${redactSecret(e?.message || e, ctx.api_key)}`,
+            finished_at: nowIso(),
+          });
+        }
+      })();
+
+      return runView(q.run.get(runId), true, Boolean(q.manualKey.get(runId)));
     }),
   );
 

@@ -5,7 +5,19 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
-import { ChevronDown, ChevronRight, Eye, EyeOff, FileCode2, Search, Settings2, Sparkles, X } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  Download,
+  Eye,
+  EyeOff,
+  FileCode2,
+  Loader2,
+  Search,
+  Settings2,
+  Sparkles,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -24,7 +36,7 @@ import { post, put } from "../api";
 import { CLAUDE_MODELS, GEMINI_MODELS, OPENAI_MODELS, readErr } from "../format";
 import { useAccountTemplates, useInvalidate, useProxies } from "../hooks";
 import { useOps } from "../provider";
-import type { AccountPlatform, AccountTemplate, AccountTemplateConfig, Group } from "../types";
+import type { AccountPlatform, AccountTemplate, AccountTemplateConfig, Group, VerifyFetchModelsResp } from "../types";
 
 import { PlatformBadge, Tag } from "./badges";
 import { ResponsiveDialog, useConfirm } from "./shared";
@@ -171,6 +183,9 @@ export function ModelMappingEditor({
   onChange,
   availableModels,
   availableModelsLabel,
+  onFetchUpstream,
+  fetchingUpstream = false,
+  canFetchUpstream = false,
   title = "模型映射",
   description = "左边是客户请求的模型，右边是发给上游的模型；相同则只是允许该模型",
 }: {
@@ -178,6 +193,9 @@ export function ModelMappingEditor({
   onChange: (next: [string, string][]) => void;
   availableModels?: string[];
   availableModelsLabel?: string;
+  onFetchUpstream?: () => void;
+  fetchingUpstream?: boolean;
+  canFetchUpstream?: boolean;
   title?: string;
   description?: string;
 }) {
@@ -200,6 +218,18 @@ export function ModelMappingEditor({
           <CardTitle>{title}</CardTitle>
           <CardDescription>{description}</CardDescription>
           <CardAction className="flex flex-wrap gap-1">
+            {onFetchUpstream ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={fetchingUpstream || !canFetchUpstream}
+                onClick={onFetchUpstream}
+              >
+                {fetchingUpstream ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
+                {fetchingUpstream ? "拉取中…" : "拉取上游模型"}
+              </Button>
+            ) : null}
             {availableModels && availableModels.length > 0 ? (
               <Button type="button" size="sm" variant="outline" onClick={() => addModels(availableModels)}>
                 ＋ {availableModelsLabel || "本次拉取模型"} ({availableModels.length})
@@ -422,8 +452,11 @@ export function AccountForm({
   account: a,
   presetGroup,
   initialValues,
+  presetModelsLabel,
+  presetModelsSyncVersion = 0,
   defaultChannelCode,
   availableModels,
+  submitDisabled = false,
   submitLabel,
   onSuccess,
   onCancel,
@@ -432,8 +465,11 @@ export function AccountForm({
   account: AccountFull | null;
   presetGroup?: number | null;
   initialValues?: AccountFormInitialValues;
+  presetModelsLabel?: string;
+  presetModelsSyncVersion?: number;
   defaultChannelCode?: string;
   availableModels?: string[];
+  submitDisabled?: boolean;
   submitLabel?: string;
   onSuccess?: (created: { id: number; name: string }) => void;
   onCancel?: () => void;
@@ -495,7 +531,17 @@ export function AccountForm({
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [showKey, setShowKey] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [fetchingUpstreamModels, setFetchingUpstreamModels] = useState(false);
+  const [fetchedUpstreamList, setFetchedUpstreamList] = useState<string[]>([]);
   const autoAppliedRef = useRef(false);
+  const userEditedMappingRef = useRef(false);
+  const lastPresetSigRef = useRef(presetModels.join("\n"));
+  const lastSyncVersionRef = useRef(presetModelsSyncVersion);
+
+  const handleMappingChange = (next: [string, string][]) => {
+    userEditedMappingRef.current = true;
+    setMapping(next);
+  };
 
   const set = (p: Partial<typeof v>) => setV((x) => ({ ...x, ...p }));
 
@@ -579,6 +625,74 @@ export function AccountForm({
     () => (selectedTemplateId === "none" ? null : (templates.find((t) => String(t.id) === selectedTemplateId) ?? null)),
     [selectedTemplateId, templates],
   );
+
+  // 异步自动拉取到上游模型（或弹窗内点击「重新拉取」）后，同步填入模型映射且不丢用户输入
+  useEffect(() => {
+    if (!creating) return;
+    const sig = presetModels.join("\n");
+    const force = presetModelsSyncVersion !== lastSyncVersionRef.current;
+    if (!force && sig === lastPresetSigRef.current) return;
+    lastPresetSigRef.current = sig;
+    lastSyncVersionRef.current = presetModelsSyncVersion;
+    if (!presetModels.length) return;
+    if (force || !userEditedMappingRef.current) {
+      userEditedMappingRef.current = false;
+      setMapping(buildPresetModelMapping(presetModels, activeTemplate?.config.model_mapping));
+    }
+  }, [creating, presetModels, presetModelsSyncVersion, activeTemplate]);
+
+  const canFetchUpstream = Boolean(
+    creating
+      ? /^https?:\/\/[^/\s]+/i.test(v.base_url.trim()) && (v.api_key.trim() || initialValues?.source_verify_run_id)
+      : a?.id,
+  );
+
+  const fetchUpstreamIntoMapping = async () => {
+    if (fetchingUpstreamModels) return;
+    setFetchingUpstreamModels(true);
+    try {
+      const payload = creating
+        ? {
+            base_url: v.base_url.trim(),
+            api_key: v.api_key.trim() || undefined,
+            source_run_id: !v.api_key.trim() ? initialValues?.source_verify_run_id : undefined,
+          }
+        : {
+            account_id: a.id,
+            api_key_override: v.api_key.trim() || undefined,
+          };
+      const r = await post<VerifyFetchModelsResp>("/verify/fetch-models", payload);
+      const upstreamModels = (r.models || []).filter((m) => m.source !== "模型映射");
+      const ids = [
+        ...new Set((upstreamModels.length ? upstreamModels : r.models || []).map((m) => m.id.trim()).filter(Boolean)),
+      ];
+      setFetchedUpstreamList(ids);
+      if (!ids.length) {
+        toast.warning("上游返回的模型列表为空");
+        return;
+      }
+      userEditedMappingRef.current = true;
+      setMapping((prev) => {
+        const cleanPrev = prev.filter(([k]) => k.trim());
+        if (!cleanPrev.length) {
+          return buildPresetModelMapping(ids, activeTemplate?.config.model_mapping);
+        }
+        const have = new Set(cleanPrev.map(([k]) => k.trim()));
+        const added = ids.filter((id) => !have.has(id)).map((id) => [id, id] as [string, string]);
+        return [...cleanPrev, ...added];
+      });
+      toast.success(`已从上游 ${r.endpoint} 获取 ${ids.length} 个模型 ID 并写入模型映射`);
+    } catch (err) {
+      toast.error(readErr(err));
+    } finally {
+      setFetchingUpstreamModels(false);
+    }
+  };
+
+  const mergedAvailableModels = useMemo(() => {
+    const list = [...(availableModels ?? []), ...fetchedUpstreamList];
+    return [...new Set(list.map((m) => m.trim()).filter(Boolean))];
+  }, [availableModels, fetchedUpstreamList]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1065,9 +1179,15 @@ export function AccountForm({
                       variant="outline"
                       className={cn("font-normal", presetModels.length > 0 && "border-success/40 text-success")}
                     >
-                      {presetModels.length > 0 ? `仅通的模型 ${mapping.length} 条` : `模型映射 ${mapping.length} 条`}
+                      {presetModels.length > 0
+                        ? `${presetModelsLabel || "上游模型"} ${mapping.length} 条`
+                        : `模型映射 ${mapping.length} 条`}
                     </Badge>
-                  ) : null}
+                  ) : (
+                    <Badge variant="outline" className="border-warning/40 text-warning font-normal">
+                      未限模型（全放行）
+                    </Badge>
+                  )}
                 </div>
               </button>
             </CollapsibleTrigger>
@@ -1091,9 +1211,12 @@ export function AccountForm({
 
               <ModelMappingEditor
                 mapping={mapping}
-                onChange={setMapping}
-                availableModels={availableModels}
-                availableModelsLabel={presetModels.length > 0 ? "本次测通模型" : undefined}
+                onChange={handleMappingChange}
+                availableModels={mergedAvailableModels}
+                availableModelsLabel={presetModels.length > 0 ? presetModelsLabel || "上游模型" : undefined}
+                onFetchUpstream={() => void fetchUpstreamIntoMapping()}
+                fetchingUpstream={fetchingUpstreamModels}
+                canFetchUpstream={canFetchUpstream}
               />
               {scheduleCard}
               {advancedCard}
@@ -1135,9 +1258,12 @@ export function AccountForm({
 
           <ModelMappingEditor
             mapping={mapping}
-            onChange={setMapping}
-            availableModels={availableModels}
-            availableModelsLabel={presetModels.length > 0 ? "本次测通模型" : undefined}
+            onChange={handleMappingChange}
+            availableModels={mergedAvailableModels}
+            availableModelsLabel={presetModels.length > 0 ? presetModelsLabel || "上游模型" : undefined}
+            onFetchUpstream={() => void fetchUpstreamIntoMapping()}
+            fetchingUpstream={fetchingUpstreamModels}
+            canFetchUpstream={canFetchUpstream}
           />
           {scheduleCard}
           {advancedCard}
@@ -1145,7 +1271,7 @@ export function AccountForm({
       )}
 
       <div className="flex gap-2">
-        <Button type="submit" disabled={busy}>
+        <Button type="submit" disabled={busy || submitDisabled}>
           {busy ? "提交中…" : (submitLabel ?? (creating ? "创建账号" : "保存修改"))}
         </Button>
         {onCancel ? (

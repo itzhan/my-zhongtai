@@ -42,8 +42,11 @@ function toPreset(r: VerifyRun): VerifyPreset {
 
 function toQuickAddCtx(r: VerifyRun): ManualVerifyQuickAddContext {
   const isDefaultAutoName = /^手动检测\s*\(/.test(r.account_name || "");
+  const mc = r.models_check;
+  const checked = Boolean(mc && mc.status === "done");
   return {
     runId: r.id,
+    modelsChecked: checked,
     baseUrl: r.base_url,
     skMasked: r.sk_masked,
     hasSavedKey: r.has_saved_key,
@@ -53,6 +56,11 @@ function toQuickAddCtx(r: VerifyRun): ManualVerifyQuickAddContext {
     platformHint: r.platform || undefined,
     model: r.model,
     verdict: r.verdict,
+    availableModels: checked ? mc?.passed_models : undefined,
+    presetModels: checked ? mc?.passed_models : undefined,
+    passedCount: checked ? mc?.passed_count : undefined,
+    failedCount: checked ? mc?.failed_count : undefined,
+    totalCount: checked ? mc?.total : undefined,
   };
 }
 

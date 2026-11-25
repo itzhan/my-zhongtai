@@ -289,6 +289,34 @@ export type VerifyStep = {
   fallback_used: boolean;
 };
 
+export type VerifyModelCheckItem = {
+  model: string;
+  source?: string;
+  status: "pending" | "running" | "pass" | "fail";
+  protocol_used: string;
+  fallback_used: boolean;
+  http_status: number | null;
+  latency_ms: number | null;
+  reason: string;
+  response_model: string;
+  request_url: string;
+  response_snippet: string;
+};
+
+export type VerifyModelsCheck = {
+  status: "skipped" | "fetching" | "running" | "done" | "error";
+  endpoint: string;
+  error: string;
+  total: number;
+  completed: number;
+  passed_count: number;
+  failed_count: number;
+  passed_models: string[];
+  failed_models: string[];
+  duration_ms: number;
+  results?: VerifyModelCheckItem[];
+};
+
 export type VerifyRun = {
   id: string;
   account_id: number;
@@ -309,6 +337,7 @@ export type VerifyRun = {
   matched_count: number;
   total_probes: number;
   summary: string;
+  models_check?: VerifyModelsCheck | null;
   started_at: string;
   finished_at: string | null;
   duration_ms: number;
@@ -422,6 +451,7 @@ export type BasicTestRun = {
 export type ManualVerifyQuickAddContext = {
   runId: string;
   sourceType?: "verify" | "basic";
+  modelsChecked?: boolean;
   baseUrl: string;
   apiKey?: string;
   skMasked?: string;

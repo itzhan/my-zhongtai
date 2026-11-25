@@ -4,6 +4,7 @@ import { useState } from "react";
 
 import Link from "next/link";
 
+import { useQueryClient } from "@tanstack/react-query";
 import {
   Check,
   CheckCircle2,
@@ -14,6 +15,7 @@ import {
   ExternalLink,
   Loader2,
   MinusCircle,
+  Play,
   PlusCircle,
   RotateCw,
   ShieldAlert,
@@ -31,9 +33,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 
-import { ms, time } from "../format";
-import { useVerifyRun } from "../hooks";
-import type { VerifyRun, VerifyStep, VerifyVerdict } from "../types";
+import { post } from "../api";
+import { ms, readErr, time } from "../format";
+import { qk, useVerifyRun } from "../hooks";
+import type { VerifyModelCheckItem, VerifyModelsCheck, VerifyRun, VerifyStep, VerifyVerdict } from "../types";
 
 import { Tag, type Tone } from "./badges";
 import { ResponsiveDialog } from "./shared";
@@ -108,6 +111,11 @@ function buildMarkdownReport(run: VerifyRun): string {
     `- **测试模型**：${run.model}${run.requested_model && run.requested_model !== run.model ? `（映射自 ${run.requested_model}）` : ""}`,
     `- **方法论版本**：v${run.methodology_version}`,
     `- **检测时间**：${time(run.started_at)} · 耗时 ${ms(run.duration_ms)}`,
+    ...(run.models_check && run.models_check.status === "done"
+      ? [
+          `- **上游模型可用性**：通 ${run.models_check.passed_count} / 共 ${run.models_check.total}（排除 ${run.models_check.failed_count} 个不通 · 端点 ${run.models_check.endpoint || "-"}）`,
+        ]
+      : []),
     "",
     `> **综合研判**：${run.summary}`,
     "",
@@ -170,9 +178,20 @@ function formatStepStatusLabel(step: VerifyStep): { text: string; ok: boolean } 
   return null;
 }
 
-function StepRow({ step }: { step: VerifyStep }) {
+function StepRow({
+  step,
+  disableRetest,
+  retesting,
+  onRetest,
+}: {
+  step: VerifyStep;
+  disableRetest: boolean;
+  retesting: boolean;
+  onRetest: (probeId: string) => void;
+}) {
   const [open, setOpen] = useState(false);
   const statusTag = formatStepStatusLabel(step);
+  const busy = step.status === "running" || retesting;
   return (
     <>
       <TableRow
@@ -242,10 +261,29 @@ function StepRow({ step }: { step: VerifyStep }) {
             <span>{step.reason || "-"}</span>
           )}
         </TableCell>
+        <TableCell
+          className="w-20 text-right whitespace-nowrap"
+          onClick={(e) => {
+            e.stopPropagation();
+          }}
+        >
+          <Button
+            type="button"
+            size="sm"
+            variant={step.status === "fail" || step.status === "skip" ? "outline" : "ghost"}
+            className="h-7 px-2 text-xs"
+            disabled={disableRetest}
+            title={`单独重测「${step.name}」`}
+            onClick={() => onRetest(step.id)}
+          >
+            {busy ? <Loader2 className="size-3 animate-spin" /> : <Play className="size-3" />}
+            单测
+          </Button>
+        </TableCell>
       </TableRow>
       {open ? (
         <TableRow className="bg-muted/30 hover:bg-muted/30">
-          <TableCell colSpan={5} className="p-4 whitespace-normal">
+          <TableCell colSpan={6} className="p-4 whitespace-normal">
             <div className="space-y-3 text-xs">
               <div>
                 <div className="text-muted-foreground mb-1 font-medium">判定标准</div>
@@ -304,6 +342,235 @@ function VerdictBannerIcon({ verdict, running }: { verdict: VerifyVerdict; runni
   return <ShieldQuestion className="text-muted-foreground size-6" />;
 }
 
+function ModelsCheckPanel({
+  mc,
+  runRunning,
+  retestingKey,
+  onRetestModels,
+}: {
+  mc: VerifyModelsCheck;
+  runRunning: boolean;
+  retestingKey: string | null;
+  onRetestModels: (opts: { models?: string[]; onlyFailed?: boolean; key: string; label: string }) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [filter, setFilter] = useState<"all" | "pass" | "fail">("all");
+  const results: VerifyModelCheckItem[] = mc.results ?? [];
+  const pct = mc.total > 0 ? Math.round((mc.completed / mc.total) * 100) : 0;
+
+  if (mc.status === "skipped") return null;
+
+  const shown = results.filter((r) => (filter === "all" ? true : r.status === filter));
+
+  return (
+    <div className="space-y-2.5 rounded-lg border p-3.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-sm font-medium">阶段 1：上游模型并行可用性测试</span>
+          {mc.status === "fetching" ? (
+            <Tag tone="info" className="gap-1">
+              <Loader2 className="size-3 animate-spin" />
+              正在获取全部上游端点…
+            </Tag>
+          ) : mc.status === "running" ? (
+            <Tag tone="info" className="gap-1">
+              <Loader2 className="size-3 animate-spin" />
+              并行检测中 {mc.completed}/{mc.total}
+            </Tag>
+          ) : mc.status === "error" ? (
+            <Tag tone="warn">拉取失败</Tag>
+          ) : (
+            <>
+              <Tag tone="ok">可用 {mc.passed_count}</Tag>
+              {mc.failed_count > 0 ? <Tag tone="bad">不通 {mc.failed_count}（录入自动排除）</Tag> : null}
+              <span className="text-muted-foreground font-mono">
+                共 {mc.total} 个{mc.endpoint ? ` · ${mc.endpoint}` : ""}
+                {mc.duration_ms > 0 ? ` · ${ms(mc.duration_ms)}` : ""}
+              </span>
+            </>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {!runRunning && mc.status === "done" && mc.failed_count > 0 ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 px-2.5 text-xs"
+              disabled={Boolean(retestingKey)}
+              onClick={() =>
+                onRetestModels({
+                  onlyFailed: true,
+                  key: "__failed_models__",
+                  label: `重测 ${mc.failed_count} 个不通模型`,
+                })
+              }
+            >
+              <RotateCw className={cn("size-3", retestingKey === "__failed_models__" && "animate-spin")} />
+              重测不通模型 ({mc.failed_count})
+            </Button>
+          ) : null}
+          {results.length > 0 ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="h-7 px-2 text-xs"
+              onClick={() => setExpanded((v) => !v)}
+            >
+              {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+              {expanded ? "收起模型明细" : `查看全部 ${results.length} 个模型`}
+            </Button>
+          ) : null}
+        </div>
+      </div>
+
+      {mc.status === "running" ? (
+        <div className="space-y-1.5">
+          <div className="text-muted-foreground flex items-center justify-between text-xs">
+            <span>
+              已通 <b className="text-success">{mc.passed_count}</b> · 不通{" "}
+              <b className="text-danger">{mc.failed_count}</b>
+            </span>
+            <span className="font-mono">
+              {mc.completed} / {mc.total} ({pct}%)
+            </span>
+          </div>
+          <Progress value={pct} />
+        </div>
+      ) : null}
+
+      {mc.status === "error" ? (
+        <p className="text-warning text-xs">
+          自动获取上游模型列表失败（{mc.error || "接口不可用"}），已自动跳过阶段 1 并继续进行渠道真实性检测。
+        </p>
+      ) : null}
+
+      {mc.status === "done" && !expanded && results.length > 0 ? (
+        <div className="flex flex-wrap gap-1.5">
+          {mc.passed_models.slice(0, 24).map((m) => (
+            <Badge
+              key={m}
+              variant="outline"
+              className="border-success/40 bg-success/5 text-foreground font-mono text-[11px] font-normal"
+            >
+              <CheckCircle2 className="text-success size-3" />
+              {m}
+            </Badge>
+          ))}
+          {mc.passed_models.length > 24 ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 text-[11px]"
+              onClick={() => setExpanded(true)}
+            >
+              +{mc.passed_models.length - 24} 个可用模型…
+            </Button>
+          ) : null}
+          {mc.passed_models.length === 0 ? (
+            <span className="text-danger text-xs">
+              全部 {mc.total} 个上游模型均未通过连通检测，点击右侧展开查看原因。
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+
+      {expanded && results.length > 0 ? (
+        <div className="space-y-2 border-t pt-2.5">
+          <div className="flex flex-wrap items-center gap-1.5 text-xs">
+            <Button
+              type="button"
+              size="sm"
+              variant={filter === "all" ? "default" : "outline"}
+              className="h-6 px-2 text-[11px]"
+              onClick={() => setFilter("all")}
+            >
+              全部 ({results.length})
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={filter === "pass" ? "default" : "outline"}
+              className="h-6 px-2 text-[11px]"
+              onClick={() => setFilter("pass")}
+            >
+              可用 ({mc.passed_count})
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={filter === "fail" ? "default" : "outline"}
+              className="h-6 px-2 text-[11px]"
+              onClick={() => setFilter("fail")}
+            >
+              不通 ({mc.failed_count})
+            </Button>
+          </div>
+          <div className="grid max-h-72 gap-1.5 overflow-y-auto sm:grid-cols-2">
+            {shown.map((r) => (
+              <div
+                key={r.model}
+                className={cn(
+                  "flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-xs",
+                  r.status === "pass" && "border-success/30 bg-success/5",
+                  r.status === "fail" && "border-danger/30 bg-danger/5",
+                  r.status === "running" && "border-primary/30 bg-primary/5",
+                )}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    {r.status === "pass" ? (
+                      <CheckCircle2 className="text-success size-3.5 shrink-0" />
+                    ) : r.status === "fail" ? (
+                      <XCircle className="text-danger size-3.5 shrink-0" />
+                    ) : r.status === "running" ? (
+                      <Loader2 className="text-primary size-3.5 shrink-0 animate-spin" />
+                    ) : (
+                      <Clock className="text-muted-foreground size-3.5 shrink-0" />
+                    )}
+                    <span className="truncate font-mono font-medium" title={r.model}>
+                      {r.model}
+                    </span>
+                  </div>
+                  <p className="text-muted-foreground mt-0.5 truncate pl-5 text-[11px]" title={r.reason}>
+                    {r.status === "pending"
+                      ? "排队等待中…"
+                      : r.status === "running"
+                        ? "检测中…"
+                        : `${r.latency_ms != null ? `${ms(r.latency_ms)} · ` : ""}${r.reason || "-"}`}
+                  </p>
+                </div>
+                {!runRunning && r.status !== "running" ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 shrink-0 px-1.5 text-[11px]"
+                    disabled={Boolean(retestingKey)}
+                    title={`重测模型「${r.model}」`}
+                    onClick={() =>
+                      onRetestModels({
+                        models: [r.model],
+                        key: `model:${r.model}`,
+                        label: `重测模型「${r.model}」`,
+                      })
+                    }
+                  >
+                    <Play className="size-2.5" />
+                    重测
+                  </Button>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function VerifyReportCard({
   run,
   onRerun,
@@ -317,12 +584,60 @@ export function VerifyReportCard({
   onQuickAdd?: () => void;
   addedAccount?: { id: number; name: string } | null;
 }) {
+  const qc = useQueryClient();
   const [copied, setCopied] = useState(false);
+  const [retestingKey, setRetestingKey] = useState<string | null>(null);
   const running = run.status === "running";
   const steps = run.steps ?? [];
+  const mc = run.models_check ?? null;
   const doneCount = steps.filter((s) => s.status === "pass" || s.status === "fail" || s.status === "skip").length;
-  const pct = steps.length ? Math.round((doneCount / steps.length) * 100) : 0;
+  const failedSteps = steps.filter((s) => s.status === "fail" || s.status === "skip");
+  const inModelsStage = running && Boolean(mc && (mc.status === "fetching" || mc.status === "running"));
+  const pct = inModelsStage
+    ? mc && mc.total > 0
+      ? Math.round((mc.completed / mc.total) * 100)
+      : 5
+    : steps.length
+      ? Math.round((doneCount / steps.length) * 100)
+      : 0;
   const activeStep = steps.find((s) => s.status === "running");
+  const checkedPassedCount = mc && mc.status === "done" ? mc.passed_count : null;
+
+  const triggerRetest = async (opts: { probeIds?: string[]; onlyFailed?: boolean; key: string; label: string }) => {
+    if (running || retestingKey) return;
+    setRetestingKey(opts.key);
+    try {
+      const updated = await post<VerifyRun>(`/verify/runs/${encodeURIComponent(run.id)}/retest-probes`, {
+        probe_ids: opts.probeIds,
+        only_failed: opts.onlyFailed,
+      });
+      qc.setQueryData(qk.verifyRun(run.id), updated);
+      void qc.invalidateQueries({ queryKey: ["ops", "verify-runs"] });
+      toast.success(`已发起${opts.label}`);
+    } catch (e) {
+      toast.error(readErr(e));
+    } finally {
+      setRetestingKey(null);
+    }
+  };
+
+  const triggerRetestModels = async (opts: { models?: string[]; onlyFailed?: boolean; key: string; label: string }) => {
+    if (running || retestingKey) return;
+    setRetestingKey(opts.key);
+    try {
+      const updated = await post<VerifyRun>(`/verify/runs/${encodeURIComponent(run.id)}/retest-models`, {
+        models: opts.models,
+        only_failed: opts.onlyFailed,
+      });
+      qc.setQueryData(qk.verifyRun(run.id), updated);
+      void qc.invalidateQueries({ queryKey: ["ops", "verify-runs"] });
+      toast.success(`已发起${opts.label}`);
+    } catch (e) {
+      toast.error(readErr(e));
+    } finally {
+      setRetestingKey(null);
+    }
+  };
 
   const copyReport = async () => {
     try {
@@ -379,7 +694,11 @@ export function VerifyReportCard({
                 onClick={onQuickAdd}
               >
                 <PlusCircle className="size-3.5" />
-                {addedAccount ? "再次录入" : "一键添加供应商"}
+                {addedAccount
+                  ? "再次录入"
+                  : checkedPassedCount != null
+                    ? `一键添加供应商（${checkedPassedCount} 个可用模型）`
+                    : "一键添加供应商"}
               </Button>
             </>
           ) : null}
@@ -399,9 +718,19 @@ export function VerifyReportCard({
         {running ? (
           <div className="space-y-2 rounded-lg border p-3.5">
             <div className="flex items-center justify-between text-xs">
-              <span className="font-medium">{activeStep ? `正在执行：${activeStep.name}` : "正在准备探针请求…"}</span>
+              <span className="font-medium">
+                {inModelsStage
+                  ? mc?.status === "fetching"
+                    ? "阶段 1/2：正在自动获取全部上游端点模型…"
+                    : `阶段 1/2：正在并行检测上游模型可用性（已通 ${mc?.passed_count ?? 0} / 不通 ${mc?.failed_count ?? 0}）`
+                  : activeStep
+                    ? `${mc ? "阶段 2/2：" : ""}正在执行真实性探针「${activeStep.name}」`
+                    : "正在准备探针请求…"}
+              </span>
               <span className="text-muted-foreground font-mono">
-                {doneCount} / {steps.length || run.total_probes} ({pct}%)
+                {inModelsStage
+                  ? `${mc?.completed ?? 0} / ${mc?.total ?? 0} (${pct}%)`
+                  : `${doneCount} / ${steps.length || run.total_probes} (${pct}%)`}
               </span>
             </div>
             <Progress value={pct} />
@@ -478,17 +807,51 @@ export function VerifyReportCard({
               ) : (
                 <Button size="sm" variant={run.verdict === "authentic" ? "default" : "outline"} onClick={onQuickAdd}>
                   <PlusCircle className="size-3.5" />
-                  一键添加到系统
+                  {checkedPassedCount != null ? `仅录入 ${checkedPassedCount} 个可用模型` : "一键添加到系统"}
                 </Button>
               )}
             </div>
           ) : null}
         </div>
 
+        {mc ? (
+          <ModelsCheckPanel
+            mc={mc}
+            runRunning={running}
+            retestingKey={retestingKey}
+            onRetestModels={(opts) => void triggerRetestModels(opts)}
+          />
+        ) : null}
+
         <div className="space-y-2">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-medium">探针逐步检测情况（点击任意行展开请求与原始响应）</h3>
-            <span className="text-muted-foreground text-xs">共 {steps.length} 步</span>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-medium">
+              {mc
+                ? "阶段 2：渠道真实性探针检测（点击任意行展开请求与原始响应，支持单项单测）"
+                : "探针逐步检测情况（点击任意行展开请求与原始响应，支持单项单测）"}
+            </h3>
+            <div className="flex items-center gap-2">
+              {!running && failedSteps.length > 0 ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-7 px-2.5 text-xs"
+                  disabled={Boolean(retestingKey)}
+                  onClick={() =>
+                    void triggerRetest({
+                      onlyFailed: true,
+                      key: "__failed__",
+                      label: `重测 ${failedSteps.length} 项失败/跳过探针`,
+                    })
+                  }
+                >
+                  <RotateCw className={cn("size-3", retestingKey === "__failed__" && "animate-spin")} />
+                  重测失败项 ({failedSteps.length})
+                </Button>
+              ) : null}
+              <span className="text-muted-foreground text-xs">共 {steps.length} 步</span>
+            </div>
           </div>
           <div className="overflow-x-auto rounded-md border">
             <Table>
@@ -499,14 +862,29 @@ export function VerifyReportCard({
                   <TableHead>状态码</TableHead>
                   <TableHead>耗时</TableHead>
                   <TableHead>判定结果</TableHead>
+                  <TableHead className="w-20 text-right">单测</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {steps.length ? (
-                  steps.map((s) => <StepRow key={s.id} step={s} />)
+                  steps.map((s) => (
+                    <StepRow
+                      key={s.id}
+                      step={s}
+                      disableRetest={running || Boolean(retestingKey)}
+                      retesting={retestingKey === s.id}
+                      onRetest={(probeId) =>
+                        void triggerRetest({
+                          probeIds: [probeId],
+                          key: probeId,
+                          label: `单测「${s.name}」`,
+                        })
+                      }
+                    />
+                  ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={5} className="text-muted-foreground py-8 text-center text-sm">
+                    <TableCell colSpan={6} className="text-muted-foreground py-8 text-center text-sm">
                       暂无探针执行记录
                     </TableCell>
                   </TableRow>
